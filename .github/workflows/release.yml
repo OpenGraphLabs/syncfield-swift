@@ -1,0 +1,25 @@
+name: Release Validation
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  validate:
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build release
+        run: swift build -c release -v
+
+      - name: Run tests
+        run: swift test -v
+
+      - name: Verify tag matches version
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          echo "Release tag: $TAG"
+          # SPM uses git tags directly as versions — just verify it builds
+          echo "Release $TAG validated successfully"

@@ -1,0 +1,35 @@
+# Swift / SPM
+.build/
+Packages/
+Package.resolved
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+
+# Xcode
+DerivedData/
+xcuserdata/
+*.xcscmblueprint
+*.xccheckout
+
+# SwiftPM / Xcode integration
+.swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata
+.swiftpm/xcode/xcshareddata/
+.swiftpm/configuration/
+
+# Testing
+.build/debug/
+.build/release/
+*.xcresult
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Credentials
+.netrc
