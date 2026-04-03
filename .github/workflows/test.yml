@@ -9,15 +9,12 @@ on:
 jobs:
   test:
     runs-on: macos-latest
-    strategy:
-      matrix:
-        xcode: ["15.4", "16.0"]
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Select Xcode ${{ matrix.xcode }}
-        run: sudo xcode-select -s /Applications/Xcode_${{ matrix.xcode }}.app
+      - name: Swift version
+        run: swift --version
 
       - name: Build
         run: swift build -v
