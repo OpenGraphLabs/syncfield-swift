@@ -3,12 +3,39 @@
 //  syncfield-swift integration example — iPhone + Insta360 Go 3S wrist camera
 //
 //  Captures:
-//    - iPhone back camera  (AVFoundation, H.264 mp4)
+//    - iPhone back camera  (AVFoundation, H.264 mp4 with mic audio track)
 //    - CoreMotion IMU      (100 Hz)
-//    - Insta360 Go 3S      (BLE remote trigger; file downloaded over WiFi in `ingest()`)
+//    - Insta360 Go 3S      (BLE remote trigger + automatic WiFi download in ingest())
 //
-//  Requires the Insta360 SDK (INSCameraSDK.xcframework) in your app bundle.
+//  Prerequisites in the host app:
+//    - INSCameraServiceSDK.xcframework linked (Embed & Sign)
+//    - Capability: Hotspot Configuration
+//    - Info.plist: NSBluetoothAlwaysUsageDescription, NSCameraUsageDescription,
+//      NSMicrophoneUsageDescription, NSMotionUsageDescription,
+//      NSLocationWhenInUseUsageDescription
 //
+
+// MARK: - At a glance — the entire SDK contract in 12 lines
+//
+//     let session = SessionOrchestrator(hostId: "iphone_rig", outputDirectory: episodesDir)
+//     try session.add(iPhoneCameraStream(streamId: "cam_ego"))
+//     try session.add(iPhoneMotionStream(streamId: "imu"))
+//     try session.add(Insta360CameraStream(streamId: "cam_wrist"))
+//
+//     try await session.connect()             // opens devices; BLE-pairs the Insta360
+//     try await session.startRecording()      // atomic: iPhone AVAssetWriter + Insta360 BLE trigger
+//     _ = try await session.stopRecording()   // closes iPhone file; stops Insta360 remote recording
+//     _ = try await session.ingest { p in     // switches to camera WiFi, downloads mp4, restores WiFi
+//         print("\(p.streamId): \(Int(p.fraction * 100))%")
+//     }
+//     try await session.disconnect()          // tears everything down
+//
+//     // session.episodeDirectory now contains:
+//     //   cam_ego.mp4, cam_ego.timestamps.jsonl, cam_wrist.mp4, cam_wrist.anchor.json,
+//     //   imu.jsonl, sync_point.json, manifest.json, session.log
+//     //
+//     // Ship that directory to your own storage (S3/GCS/your API). Upload is intentionally
+//     // left to the host app — the SDK does not manage network transfer to your backend.
 
 #if os(iOS)
 
@@ -19,104 +46,55 @@ import SyncFieldInsta360
 
 final class EgoWristViewController: UIViewController {
 
-    // MARK: Streams
+    // Streams
+    private let cam    = iPhoneCameraStream(streamId: "cam_ego")
+    private let imu    = iPhoneMotionStream(streamId: "imu", rateHz: 100)
+    private let wrist  = Insta360CameraStream(streamId: "cam_wrist")
 
-    private let cameraStream = iPhoneCameraStream(streamId: "cam_ego")
-    private let motionStream = iPhoneMotionStream(streamId: "imu", rateHz: 100)
-    private let wristStream  = Insta360CameraStream(streamId: "cam_wrist")
-
-    // MARK: Session
-
-    private let session: SessionOrchestrator = {
-        let docs = FileManager.default
+    // Session
+    private let session = SessionOrchestrator(
+        hostId: "iphone_rig",
+        outputDirectory: FileManager.default
             .urls(for: .documentDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("episodes", isDirectory: true)
-        return SessionOrchestrator(hostId: "iphone_rig", outputDirectory: docs)
-    }()
+            .appendingPathComponent("episodes", isDirectory: true))
 
-    // MARK: UI
-
-    private lazy var preview = SyncFieldPreviewView(stream: cameraStream)
-    private let progressBar  = UIProgressView(progressViewStyle: .default)
-
-    // MARK: Lifecycle
+    // Camera preview (optional convenience from SyncFieldUIKit)
+    private lazy var preview = SyncFieldPreviewView(stream: cam)
 
     override func viewDidLoad() {
         super.viewDidLoad()
         view.addSubview(preview)
-        view.addSubview(progressBar)
-        Task { await prepare() }
-        observeHealth()
-    }
+        preview.frame = view.bounds
+        preview.autoresizingMask = [.flexibleWidth, .flexibleHeight]
 
-    private func prepare() async {
-        do {
-            try session.add(cameraStream)
-            try session.add(motionStream)
-            try session.add(wristStream)         // BLE pairing happens in connect()
+        Task {
+            try session.add(cam)
+            try session.add(imu)
+            try session.add(wrist)
             try await session.connect()
-        } catch {
-            presentError(error)
         }
     }
 
-    private func observeHealth() {
-        Task { @MainActor in
-            for await event in session.healthEvents {
-                switch event {
-                case .streamConnected(let id):          log("✅ \(id) connected")
-                case .streamDisconnected(let id, let r): log("⚠️ \(id) disconnected: \(r)")
-                case .samplesDropped(let id, let n):     log("⚠️ \(id) dropped \(n)")
-                case .ingestFailed(let id, let e):       log("❌ \(id) ingest failed: \(e)")
-                default: break
-                }
-            }
-        }
+    @objc func record() {
+        Task { try await session.startRecording() }
     }
 
-    // MARK: Actions
-
-    @objc private func recordTapped() {
+    @objc func stop() {
         Task {
-            do { _ = try await session.startRecording() }  // atomic: BLE trigger + iPhone record
-            catch { presentError(error) }
-        }
-    }
-
-    @objc private func stopTapped() {
-        Task {
-            do {
-                _ = try await session.stopRecording()   // iPhone file closes; Insta360 BLE stop
-
-                // Insta360: switch to camera's WiFi AP, download mp4, copy into episode dir.
-                let report = try await session.ingest { [progressBar] progress in
-                    Task { @MainActor in
-                        progressBar.setProgress(Float(progress.fraction), animated: true)
-                    }
-                }
-
-                // Even if Insta360 download failed, iPhone streams are usable.
-                if case .failure(let err) = report.streamResults["cam_wrist"] ?? .success(.init()) {
-                    log("wrist download failed — episode still usable without it: \(err)")
-                }
-
-                let episode = session.episodeDirectory
-                try await session.disconnect()
-                await uploadEpisode(episode)
-            } catch {
-                presentError(error)
+            _ = try await session.stopRecording()
+            _ = try await session.ingest { p in
+                print("\(p.streamId): \(Int(p.fraction * 100))%")
             }
+            try await session.disconnect()
+
+            // Hand the episode directory off to your own uploader.
+            await uploadEpisode(session.episodeDirectory)
         }
     }
 
-    // MARK: Your upload logic
-
-    private func uploadEpisode(_ directory: URL) async { /* customer-owned */ }
-
-    // MARK: Helpers
-
-    private func log(_ s: String) { print("[sync] \(s)") }
-    private func presentError(_ e: Error) { /* UIAlertController omitted */ }
+    private func uploadEpisode(_ directory: URL) async {
+        // Your storage (S3 / GCS / internal API). The SDK does not upload.
+    }
 }
 
 #endif
