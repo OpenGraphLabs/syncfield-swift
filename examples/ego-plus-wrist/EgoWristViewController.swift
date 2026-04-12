@@ -39,62 +39,62 @@
 
 #if os(iOS)
 
-import UIKit
-import SyncField
-import SyncFieldUIKit
-import SyncFieldInsta360
+    import UIKit
+    import SyncField
+    import SyncFieldUIKit
+    import SyncFieldInsta360
 
-final class EgoWristViewController: UIViewController {
+    final class EgoWristViewController: UIViewController {
 
-    // Streams
-    private let cam    = iPhoneCameraStream(streamId: "cam_ego")
-    private let imu    = iPhoneMotionStream(streamId: "imu", rateHz: 100)
-    private let wrist  = Insta360CameraStream(streamId: "cam_wrist")
+        // Streams
+        private let cam = iPhoneCameraStream(streamId: "cam_ego")
+        private let imu = iPhoneMotionStream(streamId: "imu", rateHz: 100)
+        private let wrist = Insta360CameraStream(streamId: "cam_wrist")
 
-    // Session
-    private let session = SessionOrchestrator(
-        hostId: "iphone_rig",
-        outputDirectory: FileManager.default
-            .urls(for: .documentDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("episodes", isDirectory: true))
+        // Session
+        private let session = SessionOrchestrator(
+            hostId: "iphone_rig",
+            outputDirectory: FileManager.default
+                .urls(for: .documentDirectory, in: .userDomainMask)[0]
+                .appendingPathComponent("episodes", isDirectory: true))
 
-    // Camera preview (optional convenience from SyncFieldUIKit)
-    private lazy var preview = SyncFieldPreviewView(stream: cam)
+        // Camera preview (optional convenience from SyncFieldUIKit)
+        private lazy var preview = SyncFieldPreviewView(stream: cam)
 
-    override func viewDidLoad() {
-        super.viewDidLoad()
-        view.addSubview(preview)
-        preview.frame = view.bounds
-        preview.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        override func viewDidLoad() {
+            super.viewDidLoad()
+            view.addSubview(preview)
+            preview.frame = view.bounds
+            preview.autoresizingMask = [.flexibleWidth, .flexibleHeight]
 
-        Task {
-            try session.add(cam)
-            try session.add(imu)
-            try session.add(wrist)
-            try await session.connect()
-        }
-    }
-
-    @objc func record() {
-        Task { try await session.startRecording() }
-    }
-
-    @objc func stop() {
-        Task {
-            _ = try await session.stopRecording()
-            _ = try await session.ingest { p in
-                print("\(p.streamId): \(Int(p.fraction * 100))%")
+            Task {
+                try session.add(cam)
+                try session.add(imu)
+                try session.add(wrist)
+                try await session.connect()
             }
-            try await session.disconnect()
+        }
 
-            // Hand the episode directory off to your own uploader.
-            await uploadEpisode(session.episodeDirectory)
+        @objc func record() {
+            Task { try await session.startRecording() }
+        }
+
+        @objc func stop() {
+            Task {
+                _ = try await session.stopRecording()
+                _ = try await session.ingest { p in
+                    print("\(p.streamId): \(Int(p.fraction * 100))%")
+                }
+                try await session.disconnect()
+
+                // Hand the episode directory off to your own uploader.
+                await uploadEpisode(session.episodeDirectory)
+            }
+        }
+
+        private func uploadEpisode(_ directory: URL) async {
+            // Your storage (S3 / GCS / internal API). The SDK does not upload.
         }
     }
-
-    private func uploadEpisode(_ directory: URL) async {
-        // Your storage (S3 / GCS / internal API). The SDK does not upload.
-    }
-}
 
 #endif
