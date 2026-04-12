@@ -4,7 +4,7 @@ import Foundation
 import AVFoundation
 #endif
 
-public final class iPhoneCameraStream: NSObject, SyncField.Stream, @unchecked Sendable {
+public final class iPhoneCameraStream: NSObject, SyncFieldStream, @unchecked Sendable {
     public nonisolated let streamId: String
     public nonisolated let capabilities = StreamCapabilities(
         requiresIngest: false, producesFile: true, supportsPreciseTimestamps: true)

@@ -14,7 +14,7 @@ public actor SessionOrchestrator {
 
     public var healthEvents: AsyncStream<HealthEvent> { bus.subscribe() }
 
-    public func add(_ stream: any SyncField.Stream) throws {
+    public func add(_ stream: any SyncFieldStream) throws {
         guard state == .idle else {
             throw SessionError.invalidTransition(from: state, to: state)
         }
@@ -29,7 +29,7 @@ public actor SessionOrchestrator {
         guard !streams.isEmpty else { throw SessionError.noStreamsRegistered }
 
         sessionId = String(UUID().uuidString.prefix(12).lowercased())
-        var connected: [any SyncField.Stream] = []
+        var connected: [any SyncFieldStream] = []
         for s in streams {
             do {
                 try await s.prepare()
@@ -152,7 +152,7 @@ public actor SessionOrchestrator {
 
     private let hostId: String
     private let baseDir: URL
-    private var streams: [any SyncField.Stream] = []
+    private var streams: [any SyncFieldStream] = []
     private var sessionId: String = ""
     private var activeClock: SessionClock?
     private var logWriter: SessionLogWriter?

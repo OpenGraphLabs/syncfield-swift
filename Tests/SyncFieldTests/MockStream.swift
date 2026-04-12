@@ -4,10 +4,8 @@ import Foundation
 
 enum TestError: Error { case boom }
 
-private typealias SFStream = SyncField.Stream
-
-actor MockStream: SFStream {
-    // Stream protocol requires these nonisolated
+actor MockStream: SyncFieldStream {
+    // SyncFieldStream protocol requires these nonisolated
     nonisolated let streamId: String
     nonisolated let capabilities: StreamCapabilities
 

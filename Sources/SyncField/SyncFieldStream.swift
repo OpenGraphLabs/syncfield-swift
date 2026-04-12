@@ -1,4 +1,4 @@
-// Sources/SyncField/Stream.swift
+// Sources/SyncField/SyncFieldStream.swift
 import Foundation
 
 public struct StreamConnectContext: Sendable {
@@ -33,7 +33,7 @@ public struct StreamIngestReport: Sendable {
 
 /// Custom adapter contract. Implemented by `iPhoneCameraStream`,
 /// `iPhoneMotionStream`, `TactileStream`, `Insta360CameraStream`, etc.
-public protocol Stream: Sendable {
+public protocol SyncFieldStream: Sendable {
     nonisolated var streamId: String { get }
     nonisolated var capabilities: StreamCapabilities { get }
 

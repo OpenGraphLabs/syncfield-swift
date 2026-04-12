@@ -1,7 +1,7 @@
 // Sources/SyncField/Writers/WriterFactory.swift
 import Foundation
 
-/// Injected into `Stream.startRecording` so the stream creates writers
+/// Injected into `SyncFieldStream.startRecording` so the stream creates writers
 /// rooted at the episode directory, without knowing the directory path.
 public struct WriterFactory: Sendable {
     public let episodeDirectory: URL

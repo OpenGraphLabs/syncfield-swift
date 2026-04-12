@@ -4,7 +4,7 @@ import Foundation
 import CoreMotion
 #endif
 
-public final class iPhoneMotionStream: SyncField.Stream, @unchecked Sendable {
+public final class iPhoneMotionStream: SyncFieldStream, @unchecked Sendable {
     public nonisolated let streamId: String
     public nonisolated let capabilities = StreamCapabilities(
         requiresIngest: false, producesFile: false, supportsPreciseTimestamps: true)
