@@ -3,12 +3,32 @@
 //  syncfield-swift integration example — iPhone-only recording
 //
 //  Captures:
-//    - iPhone back camera  (AVFoundation, H.264 mp4)
+//    - iPhone back camera  (AVFoundation, H.264 mp4 with mic audio track)
 //    - CoreMotion IMU      (100 Hz accelerometer + gyroscope + magnetometer)
 //
-//  Copy this file into your app, wire the Record / Stop buttons,
-//  and plug your own upload logic into `uploadEpisode(_:)`.
+//  Prerequisites in the host app:
+//    - Info.plist: NSCameraUsageDescription, NSMicrophoneUsageDescription,
+//      NSMotionUsageDescription
 //
+
+// MARK: - At a glance — the entire SDK contract in 10 lines
+//
+//     let session = SessionOrchestrator(hostId: "iphone_ego", outputDirectory: episodesDir)
+//     try session.add(iPhoneCameraStream(streamId: "cam_ego"))
+//     try session.add(iPhoneMotionStream(streamId: "imu"))
+//
+//     try await session.connect()             // opens camera + IMU; preview is live
+//     try await session.startRecording()      // atomic start of both streams
+//     _ = try await session.stopRecording()   // closes AVAssetWriter + CoreMotion
+//     _ = try await session.ingest { _ in }   // no-op for native streams
+//     try await session.disconnect()          // tears everything down
+//
+//     // session.episodeDirectory now contains:
+//     //   cam_ego.mp4, cam_ego.timestamps.jsonl, imu.jsonl,
+//     //   sync_point.json, manifest.json, session.log
+//     //
+//     // Ship that directory to your own storage (S3/GCS/your API). Upload is intentionally
+//     // left to the host app — the SDK does not manage network transfer to your backend.
 
 #if os(iOS)
 
@@ -18,95 +38,50 @@ import SyncFieldUIKit
 
 final class EgocentricViewController: UIViewController {
 
-    // MARK: Streams
+    // Streams
+    private let cam = iPhoneCameraStream(streamId: "cam_ego")
+    private let imu = iPhoneMotionStream(streamId: "imu", rateHz: 100)
 
-    private let cameraStream = iPhoneCameraStream(streamId: "cam_ego")
-    private let motionStream = iPhoneMotionStream(streamId: "imu", rateHz: 100)
-
-    // MARK: Session
-
-    private let session: SessionOrchestrator = {
-        let docs = FileManager.default
+    // Session
+    private let session = SessionOrchestrator(
+        hostId: "iphone_ego",
+        outputDirectory: FileManager.default
             .urls(for: .documentDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("episodes", isDirectory: true)
-        return SessionOrchestrator(hostId: "iphone_ego", outputDirectory: docs)
-    }()
+            .appendingPathComponent("episodes", isDirectory: true))
 
-    // MARK: UI
-
-    private lazy var preview = SyncFieldPreviewView(stream: cameraStream)
-    private let recordButton = UIButton(type: .system)
-    private let stopButton = UIButton(type: .system)
-
-    // MARK: Lifecycle
+    // Camera preview (optional convenience from SyncFieldUIKit)
+    private lazy var preview = SyncFieldPreviewView(stream: cam)
 
     override func viewDidLoad() {
         super.viewDidLoad()
-        layoutUI()
-        Task { await prepareSession() }
-    }
-
-    private func prepareSession() async {
-        do {
-            try session.add(cameraStream)
-            try session.add(motionStream)
-            try await session.connect()   // camera + IMU ready, preview live
-        } catch {
-            presentError(error)
-        }
-    }
-
-    // MARK: Actions
-
-    @objc private func recordTapped() {
-        Task {
-            do { _ = try await session.startRecording() }
-            catch { presentError(error) }
-        }
-    }
-
-    @objc private func stopTapped() {
-        Task {
-            do {
-                _ = try await session.stopRecording()
-                _ = try await session.ingest { _ in }   // no-op (all native)
-                let episode = session.episodeDirectory
-                try await session.disconnect()
-                await uploadEpisode(episode)
-            } catch {
-                presentError(error)
-            }
-        }
-    }
-
-    // MARK: Your upload logic goes here
-
-    private func uploadEpisode(_ directory: URL) async {
-        // Ship `directory` to S3/GCS/your internal API and enqueue a
-        // sync job against the syncfield server. The SDK intentionally
-        // does not bundle an uploader.
-    }
-
-    // MARK: Boilerplate
-
-    private func layoutUI() {
+        view.addSubview(preview)
         preview.frame = view.bounds
         preview.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-        view.addSubview(preview)
 
-        recordButton.setTitle("Record", for: .normal)
-        stopButton.setTitle("Stop", for: .normal)
-        recordButton.addTarget(self, action: #selector(recordTapped), for: .touchUpInside)
-        stopButton.addTarget(self, action: #selector(stopTapped), for: .touchUpInside)
-        // ... add to view, Auto Layout omitted for brevity ...
+        Task {
+            try session.add(cam)
+            try session.add(imu)
+            try await session.connect()
+        }
     }
 
-    private func presentError(_ error: Error) {
-        let alert = UIAlertController(title: "SyncField error",
-                                      message: String(describing: error),
-                                      preferredStyle: .alert)
-        alert.addAction(.init(title: "OK", style: .default))
-        present(alert, animated: true)
+    @objc func record() {
+        Task { try await session.startRecording() }
+    }
+
+    @objc func stop() {
+        Task {
+            _ = try await session.stopRecording()
+            _ = try await session.ingest { _ in }
+            try await session.disconnect()
+
+            // Hand the episode directory off to your own uploader.
+            await uploadEpisode(session.episodeDirectory)
+        }
+    }
+
+    private func uploadEpisode(_ directory: URL) async {
+        // Your storage (S3 / GCS / internal API). The SDK does not upload.
     }
 }
 

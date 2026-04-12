@@ -3,11 +3,37 @@
 //  syncfield-swift integration example — iPhone + Oglo tactile gloves (L + R)
 //
 //  Captures:
-//    - iPhone back camera  (AVFoundation, H.264 mp4)
+//    - iPhone back camera  (AVFoundation, H.264 mp4 with mic audio track)
 //    - CoreMotion IMU      (100 Hz)
 //    - Tactile glove Left  (BLE, 100 Hz, 5 FSR channels + device hw timestamp)
 //    - Tactile glove Right (BLE, 100 Hz, 5 FSR channels + device hw timestamp)
 //
+//  Prerequisites in the host app:
+//    - Info.plist: NSCameraUsageDescription, NSMicrophoneUsageDescription,
+//      NSMotionUsageDescription, NSBluetoothAlwaysUsageDescription
+//
+
+// MARK: - At a glance — the entire SDK contract in 12 lines
+//
+//     let session = SessionOrchestrator(hostId: "iphone_tactile", outputDirectory: episodesDir)
+//     try session.add(iPhoneCameraStream(streamId: "cam_ego"))
+//     try session.add(iPhoneMotionStream(streamId: "imu"))
+//     try session.add(TactileStream(streamId: "tactile_left",  side: .left))
+//     try session.add(TactileStream(streamId: "tactile_right", side: .right))
+//
+//     try await session.connect()             // BLE scans + pairs both gloves
+//     try await session.startRecording()      // atomic start of all four streams
+//     _ = try await session.stopRecording()   // closes files; BLE stays connected
+//     _ = try await session.ingest { _ in }   // no-op — BLE samples are captured live
+//     try await session.disconnect()          // unpairs gloves, closes camera + IMU
+//
+//     // session.episodeDirectory now contains:
+//     //   cam_ego.mp4, cam_ego.timestamps.jsonl, imu.jsonl,
+//     //   tactile_left.jsonl, tactile_right.jsonl,
+//     //   sync_point.json, manifest.json, session.log
+//     //
+//     // Ship that directory to your own storage (S3/GCS/your API). Upload is intentionally
+//     // left to the host app — the SDK does not manage network transfer to your backend.
 
 #if os(iOS)
 
@@ -17,79 +43,55 @@ import SyncFieldUIKit
 
 final class EgoTactileViewController: UIViewController {
 
-    // MARK: Streams
+    // Streams
+    private let cam   = iPhoneCameraStream(streamId: "cam_ego")
+    private let imu   = iPhoneMotionStream(streamId: "imu", rateHz: 100)
+    private let left  = TactileStream(streamId: "tactile_left",  side: .left)
+    private let right = TactileStream(streamId: "tactile_right", side: .right)
 
-    private let cameraStream = iPhoneCameraStream(streamId: "cam_ego")
-    private let motionStream = iPhoneMotionStream(streamId: "imu", rateHz: 100)
-    private let leftGlove    = TactileStream(streamId: "tactile_left",  side: .left)
-    private let rightGlove   = TactileStream(streamId: "tactile_right", side: .right)
-
-    // MARK: Session
-
-    private let session: SessionOrchestrator = {
-        let docs = FileManager.default
+    // Session
+    private let session = SessionOrchestrator(
+        hostId: "iphone_tactile",
+        outputDirectory: FileManager.default
             .urls(for: .documentDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("episodes", isDirectory: true)
-        return SessionOrchestrator(hostId: "iphone_tactile", outputDirectory: docs)
-    }()
+            .appendingPathComponent("episodes", isDirectory: true))
 
-    // MARK: UI
-
-    private lazy var preview = SyncFieldPreviewView(stream: cameraStream)
-    private let statusLabel  = UILabel()
-
-    // MARK: Lifecycle
+    // Camera preview (optional convenience from SyncFieldUIKit)
+    private lazy var preview = SyncFieldPreviewView(stream: cam)
 
     override func viewDidLoad() {
         super.viewDidLoad()
         view.addSubview(preview)
-        view.addSubview(statusLabel)
-        Task { await prepare() }
-        observeHealth()
-    }
+        preview.frame = view.bounds
+        preview.autoresizingMask = [.flexibleWidth, .flexibleHeight]
 
-    private func prepare() async {
-        do {
-            try session.add(cameraStream)
-            try session.add(motionStream)
-            try session.add(leftGlove)    // BLE scan + connect inside connect()
-            try session.add(rightGlove)
-            try await session.connect()
-        } catch {
-            presentError(error)
-        }
-    }
-
-    private func observeHealth() {
-        Task { @MainActor in
-            for await event in session.healthEvents {
-                if case .streamConnected(let id) = event      { statusLabel.text = "\(id) ready" }
-                if case .streamDisconnected(let id, _) = event { statusLabel.text = "\(id) lost" }
-            }
-        }
-    }
-
-    // MARK: Actions
-
-    @objc private func recordTapped() {
-        Task { try? await session.startRecording() }
-    }
-
-    @objc private func stopTapped() {
         Task {
-            _ = try? await session.stopRecording()
-            _ = try? await session.ingest { _ in }   // BLE data is live → no-op
-            let episode = session.episodeDirectory
-            try? await session.disconnect()
-            await uploadEpisode(episode)
+            try session.add(cam)
+            try session.add(imu)
+            try session.add(left)
+            try session.add(right)
+            try await session.connect()
         }
     }
 
-    // MARK: Your upload logic
+    @objc func record() {
+        Task { try await session.startRecording() }
+    }
 
-    private func uploadEpisode(_ directory: URL) async { /* customer-owned */ }
+    @objc func stop() {
+        Task {
+            _ = try await session.stopRecording()
+            _ = try await session.ingest { _ in }
+            try await session.disconnect()
 
-    private func presentError(_ e: Error) { /* UIAlertController omitted */ }
+            // Hand the episode directory off to your own uploader.
+            await uploadEpisode(session.episodeDirectory)
+        }
+    }
+
+    private func uploadEpisode(_ directory: URL) async {
+        // Your storage (S3 / GCS / internal API). The SDK does not upload.
+    }
 }
 
 #endif
