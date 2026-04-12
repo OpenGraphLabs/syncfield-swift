@@ -10,6 +10,8 @@
 //  and plug your own upload logic into `uploadEpisode(_:)`.
 //
 
+#if os(iOS)
+
 import UIKit
 import SyncField
 import SyncFieldUIKit
@@ -107,3 +109,5 @@ final class EgocentricViewController: UIViewController {
         present(alert, animated: true)
     }
 }
+
+#endif

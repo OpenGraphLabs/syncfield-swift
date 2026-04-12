@@ -9,6 +9,8 @@
 //    - Tactile glove Right (BLE, 100 Hz, 5 FSR channels + device hw timestamp)
 //
 
+#if os(iOS)
+
 import UIKit
 import SyncField
 import SyncFieldUIKit
@@ -89,3 +91,5 @@ final class EgoTactileViewController: UIViewController {
 
     private func presentError(_ e: Error) { /* UIAlertController omitted */ }
 }
+
+#endif

@@ -10,6 +10,8 @@
 //  Requires the Insta360 SDK (INSCameraSDK.xcframework) in your app bundle.
 //
 
+#if os(iOS)
+
 import UIKit
 import SyncField
 import SyncFieldUIKit
@@ -116,3 +118,5 @@ final class EgoWristViewController: UIViewController {
     private func log(_ s: String) { print("[sync] \(s)") }
     private func presentError(_ e: Error) { /* UIAlertController omitted */ }
 }
+
+#endif
