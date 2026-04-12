@@ -1,0 +1,49 @@
+// Tests/SyncFieldTests/SyncPointTests.swift
+import XCTest
+@testable import SyncField
+
+final class SyncPointTests: XCTestCase {
+    func test_round_trip_json_preserves_all_fields() throws {
+        let sp = SyncPoint(
+            sdkVersion: "0.2.0",
+            monotonicNs: 12_345_678,
+            wallClockNs: 1_700_000_000_000_000_000,
+            hostId: "iphone_ego",
+            isoDatetime: "2026-04-11T15:29:30Z"
+        )
+        let data = try JSONEncoder().encode(sp)
+        let decoded = try JSONDecoder().decode(SyncPoint.self, from: data)
+        XCTAssertEqual(decoded, sp)
+    }
+
+    func test_json_keys_match_server_contract() throws {
+        let sp = SyncPoint(sdkVersion: "0.2.0", monotonicNs: 1, wallClockNs: 2,
+                           hostId: "h", isoDatetime: "d")
+        let dict = try JSONSerialization.jsonObject(
+            with: JSONEncoder().encode(sp)) as! [String: Any]
+        XCTAssertEqual(Set(dict.keys), ["sdk_version", "monotonic_ns",
+                                        "wall_clock_ns", "host_id", "iso_datetime"])
+    }
+
+    func test_chirp_fields_are_omitted_when_nil() throws {
+        let sp = SyncPoint(sdkVersion: "0.2.0", monotonicNs: 1, wallClockNs: 2,
+                           hostId: "h", isoDatetime: "d")
+        let dict = try JSONSerialization.jsonObject(
+            with: JSONEncoder().encode(sp)) as! [String: Any]
+        XCTAssertFalse(dict.keys.contains("chirp_start_ns"))
+        XCTAssertFalse(dict.keys.contains("chirp_spec"))
+    }
+
+    func test_chirp_fields_are_present_when_set() throws {
+        var sp = SyncPoint(sdkVersion: "0.2.0", monotonicNs: 1, wallClockNs: 2,
+                           hostId: "h", isoDatetime: "d")
+        sp.chirpStartNs = 100
+        sp.chirpStartSource = .hardware
+        sp.chirpSpec = ChirpSpec.defaultStart
+        let dict = try JSONSerialization.jsonObject(
+            with: JSONEncoder().encode(sp)) as! [String: Any]
+        XCTAssertEqual(dict["chirp_start_ns"] as? UInt64, 100)
+        XCTAssertEqual(dict["chirp_start_source"] as? String, "hardware")
+        XCTAssertNotNil(dict["chirp_spec"])
+    }
+}
