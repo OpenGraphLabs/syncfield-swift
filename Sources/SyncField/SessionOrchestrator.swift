@@ -4,9 +4,20 @@ import Foundation
 public actor SessionOrchestrator {
     // MARK: Public API
 
-    public init(hostId: String, outputDirectory: URL) {
+    public init(hostId: String,
+                outputDirectory: URL,
+                chirpPlayer: ChirpPlayer? = nil,
+                startChirp: ChirpSpec? = .defaultStart,
+                stopChirp: ChirpSpec? = .defaultStop,
+                postStartStabilizationMs: Double = 200,
+                preStopTailMarginMs: Double = 200) {
         self.hostId = hostId
         self.baseDir = outputDirectory
+        self.chirpPlayer = chirpPlayer ?? Self.defaultChirpPlayer()
+        self.startChirpSpec = startChirp
+        self.stopChirpSpec = stopChirp
+        self.postStartStabilizationMs = postStartStabilizationMs
+        self.preStopTailMarginMs = preStopTailMarginMs
     }
 
     public private(set) var state: SessionState = .idle
@@ -93,11 +104,48 @@ public actor SessionOrchestrator {
         }
 
         state = .recording
+
+        // Chirp: wait for audio pipeline to stabilize, then emit
+        if let spec = startChirpSpec {
+            if postStartStabilizationMs > 0 {
+                try? await Task.sleep(nanoseconds: UInt64(postStartStabilizationMs * 1_000_000))
+            }
+            self.startEmission = await chirpPlayer.play(spec)
+        }
+
+        // Update the on-disk sync_point.json with the chirp emission
+        if let emission = startEmission {
+            var sp = anchor
+            sp.chirpStartNs = emission.bestNs
+            sp.chirpStartSource = emission.source
+            sp.chirpSpec = startChirpSpec
+            try writeSyncPoint(sp)
+            self.currentSyncPoint = sp
+        } else {
+            self.currentSyncPoint = anchor
+        }
+
         return anchor
     }
 
     public func stopRecording() async throws -> StopReport {
         try require(state: .recording, next: .stopping)
+
+        // Stop chirp: emit first, wait for tail to be captured
+        if let spec = stopChirpSpec {
+            self.stopEmission = await chirpPlayer.play(spec)
+            let waitMs = spec.durationMs + preStopTailMarginMs
+            try? await Task.sleep(nanoseconds: UInt64(waitMs * 1_000_000))
+
+            // Update sync_point.json with stop chirp
+            if var sp = currentSyncPoint, let em = stopEmission {
+                sp.chirpStopNs = em.bestNs
+                sp.chirpStopSource = em.source
+                try writeSyncPoint(sp)
+                self.currentSyncPoint = sp
+            }
+        }
+
         var reports: [StreamStopReport] = []
         for s in streams {
             do { reports.append(try await s.stopRecording()) }
@@ -157,6 +205,24 @@ public actor SessionOrchestrator {
     private var activeClock: SessionClock?
     private var logWriter: SessionLogWriter?
     private let bus = HealthBus()
+
+    // Chirp state
+    private let chirpPlayer: ChirpPlayer
+    private let startChirpSpec: ChirpSpec?
+    private let stopChirpSpec: ChirpSpec?
+    private let postStartStabilizationMs: Double
+    private let preStopTailMarginMs: Double
+    private var startEmission: ChirpEmission?
+    private var stopEmission: ChirpEmission?
+    private var currentSyncPoint: SyncPoint?
+
+    private static func defaultChirpPlayer() -> ChirpPlayer {
+        #if canImport(AVFoundation) && os(iOS)
+        return AVAudioEngineChirpPlayer()
+        #else
+        return SilentChirpPlayer()
+        #endif
+    }
 
     private func require(state expected: SessionState, next: SessionState) throws {
         let allowed: [(from: SessionState, to: SessionState)] = [

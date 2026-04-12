@@ -24,4 +24,26 @@ final class SyncPointTests: XCTestCase {
         XCTAssertEqual(Set(dict.keys), ["sdk_version", "monotonic_ns",
                                         "wall_clock_ns", "host_id", "iso_datetime"])
     }
+
+    func test_chirp_fields_are_omitted_when_nil() throws {
+        let sp = SyncPoint(sdkVersion: "0.2.0", monotonicNs: 1, wallClockNs: 2,
+                           hostId: "h", isoDatetime: "d")
+        let dict = try JSONSerialization.jsonObject(
+            with: JSONEncoder().encode(sp)) as! [String: Any]
+        XCTAssertFalse(dict.keys.contains("chirp_start_ns"))
+        XCTAssertFalse(dict.keys.contains("chirp_spec"))
+    }
+
+    func test_chirp_fields_are_present_when_set() throws {
+        var sp = SyncPoint(sdkVersion: "0.2.0", monotonicNs: 1, wallClockNs: 2,
+                           hostId: "h", isoDatetime: "d")
+        sp.chirpStartNs = 100
+        sp.chirpStartSource = .hardware
+        sp.chirpSpec = ChirpSpec.defaultStart
+        let dict = try JSONSerialization.jsonObject(
+            with: JSONEncoder().encode(sp)) as! [String: Any]
+        XCTAssertEqual(dict["chirp_start_ns"] as? UInt64, 100)
+        XCTAssertEqual(dict["chirp_start_source"] as? String, "hardware")
+        XCTAssertNotNil(dict["chirp_spec"])
+    }
 }
