@@ -7,15 +7,19 @@ import AVFoundation
 public final class iPhoneCameraStream: NSObject, SyncFieldStream, @unchecked Sendable {
     public nonisolated let streamId: String
     public nonisolated let capabilities = StreamCapabilities(
-        requiresIngest: false, producesFile: true, supportsPreciseTimestamps: true)
+        requiresIngest: false, producesFile: true,
+        supportsPreciseTimestamps: true,
+        providesAudioTrack: true)
 
     #if canImport(AVFoundation)
     public let captureSession = AVCaptureSession()
     private let videoQueue = DispatchQueue(label: "syncfield.camera", qos: .userInitiated)
     private let videoOutput = AVCaptureVideoDataOutput()
+    private let audioOutput = AVCaptureAudioDataOutput()
 
     private var assetWriter: AVAssetWriter?
     private var assetWriterInput: AVAssetWriterInput?
+    private var assetWriterAudioInput: AVAssetWriterInput?
     private var isRecording = false
 
     private var stampWriter: StreamWriter?
@@ -71,6 +75,17 @@ public final class iPhoneCameraStream: NSObject, SyncFieldStream, @unchecked Sen
         videoOutput.setSampleBufferDelegate(self, queue: videoQueue)
         if captureSession.canAddOutput(videoOutput) { captureSession.addOutput(videoOutput) }
 
+        if let audioDevice = AVCaptureDevice.default(for: .audio),
+           let audioInput = try? AVCaptureDeviceInput(device: audioDevice),
+           captureSession.canAddInput(audioInput) {
+            captureSession.addInput(audioInput)
+            audioOutput.setSampleBufferDelegate(self, queue: videoQueue)
+            if captureSession.canAddOutput(audioOutput) {
+                captureSession.addOutput(audioOutput)
+            }
+        }
+        // If mic is unavailable (permissions, hardware) we fall through without audio.
+
         captureSession.commitConfiguration()
     }
     #endif
@@ -95,6 +110,19 @@ public final class iPhoneCameraStream: NSObject, SyncFieldStream, @unchecked Sen
         input.expectsMediaDataInRealTime = true
         writer.add(input)
 
+        let audioSettings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatMPEG4AAC,
+            AVNumberOfChannelsKey: 1,
+            AVSampleRateKey: 44100,
+            AVEncoderBitRateKey: 64000,
+        ]
+        let audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
+        audioInput.expectsMediaDataInRealTime = true
+        if writer.canAdd(audioInput) {
+            writer.add(audioInput)
+            assetWriterAudioInput = audioInput
+        }
+
         assetWriter = writer
         assetWriterInput = input
         isRecording = true
@@ -105,6 +133,7 @@ public final class iPhoneCameraStream: NSObject, SyncFieldStream, @unchecked Sen
     public func stopRecording() async throws -> StreamStopReport {
         #if canImport(AVFoundation)
         isRecording = false
+        assetWriterAudioInput?.markAsFinished()
         assetWriterInput?.markAsFinished()
         if let w = assetWriter {
             await withCheckedContinuation { cont in
@@ -113,7 +142,7 @@ public final class iPhoneCameraStream: NSObject, SyncFieldStream, @unchecked Sen
         }
         try await stampWriter?.close()
         let n = frameCount
-        stampWriter = nil; assetWriter = nil; assetWriterInput = nil
+        stampWriter = nil; assetWriter = nil; assetWriterInput = nil; assetWriterAudioInput = nil
         return StreamStopReport(streamId: streamId, frameCount: n, kind: "video")
         #else
         return StreamStopReport(streamId: streamId, frameCount: 0, kind: "video")
@@ -146,10 +175,20 @@ public final class iPhoneCameraStream: NSObject, SyncFieldStream, @unchecked Sen
 }
 
 #if canImport(AVFoundation)
-extension iPhoneCameraStream: AVCaptureVideoDataOutputSampleBufferDelegate {
+extension iPhoneCameraStream: AVCaptureVideoDataOutputSampleBufferDelegate,
+                              AVCaptureAudioDataOutputSampleBufferDelegate {
     public func captureOutput(_ output: AVCaptureOutput,
                               didOutput sampleBuffer: CMSampleBuffer,
                               from connection: AVCaptureConnection) {
+        // Audio path
+        if output is AVCaptureAudioDataOutput {
+            guard isRecording,
+                  let audioInput = assetWriterAudioInput,
+                  audioInput.isReadyForMoreMediaData else { return }
+            audioInput.append(sampleBuffer)
+            return
+        }
+
         // Frame processor (throttled)
         if let processor = frameProcessor {
             let now = CFAbsoluteTimeGetCurrent()
