@@ -33,6 +33,14 @@ public final class AVAudioEngineChirpPlayer: ChirpPlayer, @unchecked Sendable {
         engine.attach(player)
         engine.connect(player, to: engine.mainMixerNode, format: format)
 
+        #if os(iOS)
+        do {
+            try AVAudioSession.sharedInstance().setCategory(.playAndRecord,
+                                                            options: .mixWithOthers)
+            try AVAudioSession.sharedInstance().setActive(true)
+        } catch { /* ignore session errors; engine.start() will fail gracefully below */ }
+        #endif
+
         do { try engine.start() } catch {
             return ChirpEmission(softwareNs: currentMonotonicNs(),
                                  hardwareNs: nil, source: .softwareFallback)
