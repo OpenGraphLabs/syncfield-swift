@@ -123,10 +123,25 @@ public final class iPhoneCameraStream: NSObject, SyncFieldStream, @unchecked Sen
             assetWriterAudioInput = audioInput
         }
 
+        // Start writing BEFORE flipping isRecording. If we flipped first the
+        // sample-buffer delegate (running on videoQueue) could race ahead and
+        // call `writer.startSession(atSourceTime:)` while the writer is still
+        // in status .unknown (0), which aborts with:
+        //   "*** -[AVAssetWriter startSessionAtSourceTime:] Cannot call
+        //    method when status is 0"
+        guard writer.startWriting() else {
+            let reason = writer.error?.localizedDescription ?? "unknown"
+            throw StreamError(
+                streamId: streamId,
+                underlying: NSError(
+                    domain: "SyncField.Camera", code: -2,
+                    userInfo: [NSLocalizedDescriptionKey:
+                        "AVAssetWriter.startWriting() failed: \(reason)"]))
+        }
+
         assetWriter = writer
         assetWriterInput = input
         isRecording = true
-        writer.startWriting()
         #endif
     }
 
@@ -180,9 +195,17 @@ extension iPhoneCameraStream: AVCaptureVideoDataOutputSampleBufferDelegate,
     public func captureOutput(_ output: AVCaptureOutput,
                               didOutput sampleBuffer: CMSampleBuffer,
                               from connection: AVCaptureConnection) {
-        // Audio path
+        // Audio path — only forward once the writer is actually in .writing
+        // AND the session has begun (startSession has stamped a source time
+        // via the first video frame). Audio buffers that arrive before the
+        // first video frame are dropped on purpose; otherwise the writer
+        // would record audio with no corresponding video track at the same
+        // time-origin.
         if output is AVCaptureAudioDataOutput {
             guard isRecording,
+                  let writer = assetWriter,
+                  writer.status == .writing,
+                  startPTS != .zero,
                   let audioInput = assetWriterAudioInput,
                   audioInput.isReadyForMoreMediaData else { return }
             audioInput.append(sampleBuffer)
@@ -199,9 +222,14 @@ extension iPhoneCameraStream: AVCaptureVideoDataOutputSampleBufferDelegate,
             }
         }
 
-        // Recording
+        // Recording — only write once the writer is fully in .writing. A
+        // brief window exists between `startRecording` flipping `isRecording`
+        // and `startWriting()` returning; this guard plus the explicit
+        // startWriting-before-isRecording ordering in `startRecording`
+        // together eliminate the "status is 0" crash we saw in the wild.
         guard isRecording,
               let writer = assetWriter,
+              writer.status == .writing,
               let input = assetWriterInput else { return }
 
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
