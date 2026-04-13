@@ -94,8 +94,6 @@ public final class iPhoneCameraStream: NSObject, SyncFieldStream, @unchecked Sen
                                writerFactory: WriterFactory) async throws {
         #if canImport(AVFoundation)
         self.clock = clock
-        self.frameCount = 0
-        self.startPTS = .zero
         self.stampWriter = try writerFactory.makeStreamWriter(streamId: streamId)
 
         let url = writerFactory.videoURL(streamId: streamId)
@@ -118,32 +116,69 @@ public final class iPhoneCameraStream: NSObject, SyncFieldStream, @unchecked Sen
         ]
         let audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
         audioInput.expectsMediaDataInRealTime = true
-        if writer.canAdd(audioInput) {
-            writer.add(audioInput)
-            assetWriterAudioInput = audioInput
+        let newAudioInput: AVAssetWriterInput? =
+            writer.canAdd(audioInput) ? { writer.add(audioInput); return audioInput }() : nil
+
+        // Transition the writer to .writing BEFORE publishing state to the
+        // sample-buffer delegate. Doing this on the writer's configuration
+        // thread is fine — startWriting is synchronous and status flips before
+        // it returns.
+        guard writer.startWriting() else {
+            let reason = writer.error?.localizedDescription ?? "unknown"
+            throw StreamError(
+                streamId: streamId,
+                underlying: NSError(
+                    domain: "SyncField.Camera", code: -2,
+                    userInfo: [NSLocalizedDescriptionKey:
+                        "AVAssetWriter.startWriting() failed: \(reason)"]))
         }
 
-        assetWriter = writer
-        assetWriterInput = input
-        isRecording = true
-        writer.startWriting()
+        // Publish all recording state to the delegate in one go, ON videoQueue.
+        // The delegate runs on this queue, so any callback dispatched here is
+        // serialised with our setup — eliminating the write-order race that
+        // produced:
+        //   *** -[AVAssetWriter startSessionAtSourceTime:]
+        //       Cannot call method when status is 0
+        videoQueue.sync {
+            self.frameCount = 0
+            self.startPTS = .zero
+            self.assetWriter = writer
+            self.assetWriterInput = input
+            self.assetWriterAudioInput = newAudioInput
+            self.isRecording = true
+        }
         #endif
     }
 
     public func stopRecording() async throws -> StreamStopReport {
         #if canImport(AVFoundation)
-        isRecording = false
-        assetWriterAudioInput?.markAsFinished()
-        assetWriterInput?.markAsFinished()
-        if let w = assetWriter {
+        // Flip isRecording off on videoQueue so any in-flight delegate call
+        // either sees it true and completes cleanly, or sees it false and
+        // returns — never a torn read between isRecording and the writer.
+        var capturedWriter: AVAssetWriter?
+        var capturedAudioInput: AVAssetWriterInput?
+        var capturedVideoInput: AVAssetWriterInput?
+        var capturedCount = 0
+        videoQueue.sync {
+            self.isRecording = false
+            capturedWriter = self.assetWriter
+            capturedAudioInput = self.assetWriterAudioInput
+            capturedVideoInput = self.assetWriterInput
+            capturedCount = self.frameCount
+            self.assetWriter = nil
+            self.assetWriterInput = nil
+            self.assetWriterAudioInput = nil
+        }
+        capturedAudioInput?.markAsFinished()
+        capturedVideoInput?.markAsFinished()
+        if let w = capturedWriter, w.status == .writing {
             await withCheckedContinuation { cont in
                 w.finishWriting { cont.resume() }
             }
         }
         try await stampWriter?.close()
-        let n = frameCount
-        stampWriter = nil; assetWriter = nil; assetWriterInput = nil; assetWriterAudioInput = nil
-        return StreamStopReport(streamId: streamId, frameCount: n, kind: "video")
+        stampWriter = nil
+        return StreamStopReport(streamId: streamId, frameCount: capturedCount, kind: "video")
         #else
         return StreamStopReport(streamId: streamId, frameCount: 0, kind: "video")
         #endif
@@ -180,16 +215,28 @@ extension iPhoneCameraStream: AVCaptureVideoDataOutputSampleBufferDelegate,
     public func captureOutput(_ output: AVCaptureOutput,
                               didOutput sampleBuffer: CMSampleBuffer,
                               from connection: AVCaptureConnection) {
-        // Audio path
+        // This delegate fires on videoQueue, same queue we publish state on.
+        // Any observed state here was fully visible after startRecording's
+        // videoQueue.sync block returned. No need for additional locks.
+
+        // Audio path — only forward once the writer is actually in .writing
+        // AND the session has begun (first video frame stamped the source
+        // time). Audio buffers that arrive before the first video frame are
+        // dropped on purpose; otherwise appending audio before startSession
+        // traps with the same "status is 0" exception as video.
         if output is AVCaptureAudioDataOutput {
             guard isRecording,
+                  let writer = assetWriter,
+                  writer.status == .writing,
+                  startPTS != .zero,
                   let audioInput = assetWriterAudioInput,
                   audioInput.isReadyForMoreMediaData else { return }
             audioInput.append(sampleBuffer)
             return
         }
 
-        // Frame processor (throttled)
+        // Frame processor (throttled) — runs whether or not we're recording
+        // so previews keep working during preview-only phases.
         if let processor = frameProcessor {
             let now = CFAbsoluteTimeGetCurrent()
             let interval = throttleHz > 0 ? 1.0 / throttleHz : 0
@@ -199,13 +246,22 @@ extension iPhoneCameraStream: AVCaptureVideoDataOutputSampleBufferDelegate,
             }
         }
 
-        // Recording
+        // Recording path — guard on writer.status explicitly. Even though
+        // state publishing is serialised on this same queue, a second call
+        // could flip isRecording off between `isRecording` and
+        // `writer.startSession` reads if cancellation lands. The status
+        // check catches that without risking the startSession crash.
         guard isRecording,
               let writer = assetWriter,
+              writer.status == .writing,
               let input = assetWriterInput else { return }
 
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         if startPTS == .zero {
+            // Belt-and-braces: re-check status immediately before the call
+            // that failed in the wild. A release-mode reader could have
+            // been reordered otherwise.
+            guard writer.status == .writing else { return }
             startPTS = pts
             writer.startSession(atSourceTime: pts)
         }
