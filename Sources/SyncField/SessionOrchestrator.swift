@@ -25,8 +25,16 @@ public actor SessionOrchestrator {
 
     public var healthEvents: AsyncStream<HealthEvent> { bus.subscribe() }
 
+    /// Register a stream with the session.
+    ///
+    /// Allowed in `.idle` (the usual pre-connect setup) and in `.connected`
+    /// (a stream that was prepared externally — e.g. an `Insta360CameraStream`
+    /// paired via `pairStandalone` by a host-app bridge before the user
+    /// starts recording). Streams added post-connect do NOT have
+    /// `connect(context:)` invoked by the orchestrator — the caller is
+    /// responsible for ensuring the stream is already connected.
     public func add(_ stream: any SyncFieldStream) throws {
-        guard state == .idle else {
+        guard state == .idle || state == .connected else {
             throw SessionError.invalidTransition(from: state, to: state)
         }
         if streams.contains(where: { $0.streamId == stream.streamId }) {
