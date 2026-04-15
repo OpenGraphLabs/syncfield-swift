@@ -47,6 +47,38 @@ public final class AVAudioEngineChirpPlayer: ChirpPlayer, @unchecked Sendable {
         }
 
         let softwareStart = currentMonotonicNs()
+
+        // Warmup: let the engine run for a render cycle so
+        // `player.lastRenderTime` populates with a valid `AVAudioTime`.
+        // Without this, the very first `player.scheduleBuffer(..., at: nil, ...)`
+        // traps internally with:
+        //   "required condition is false: nodeTime == nil ||
+        //    nodeTime.sampleTimeValid || nodeTime.hostTimeValid"
+        // because AVAudioEngine's scheduleBuffer touches the player's
+        // internal nodeTime (not ours — iOS's), and that nodeTime is
+        // invalid immediately after `engine.start()` when the audio
+        // session is in a degraded state (which is the norm while
+        // AVCaptureSession is actively recording audio on the ego
+        // camera).
+        try? await Task.sleep(nanoseconds: 50_000_000)
+
+        // Pre-flight: if after the warmup the engine still has no valid
+        // timing, bail out BEFORE touching scheduleBuffer — calling it
+        // in this state crashes the process with an uncatchable
+        // NSException and takes `stopRecording` down with it.
+        // Software-only emission is the right graceful fallback: no
+        // audible chirp, but the recording stops cleanly and the
+        // software-clock anchor in sync_point.json is still correct
+        // for post-hoc alignment.
+        guard let preflightRenderTime = player.lastRenderTime,
+              (preflightRenderTime.isHostTimeValid
+               || preflightRenderTime.isSampleTimeValid)
+        else {
+            engine.stop()
+            return ChirpEmission(softwareNs: softwareStart,
+                                 hardwareNs: nil, source: .softwareFallback)
+        }
+
         var hardwareStart: UInt64? = nil
 
         return await withCheckedContinuation { (cont: CheckedContinuation<ChirpEmission, Never>) in
@@ -56,23 +88,12 @@ public final class AVAudioEngineChirpPlayer: ChirpPlayer, @unchecked Sendable {
                 DispatchQueue.global(qos: .utility).async { engine.stop() }
             }
 
-            // Capture AVAudioTime.hostTime *after* scheduling, before play.
-            // lastRenderTime is non-nil once the engine has started.
-            //
-            // IMPORTANT: `AVAudioTime.hostTime` asserts the underlying time
-            // is valid. When the audio session configuration is in a bad
-            // state (e.g. AVAudioSession.setActive failed, app backgrounded
-            // mid-render, or the engine hasn't produced any samples yet),
-            // `lastRenderTime` can be non-nil but its `hostTimeValid` flag
-            // is false, and touching `.hostTime` traps with:
-            //   "required condition is false: nodeTime == nil ||
-            //    nodeTime.sampleTimeValid || nodeTime.hostTimeValid"
-            // Gate on `hostTimeValid` (falling back to software time) so
-            // chirp playback can't take down `stopRecording` with an NSException.
+            // Extract host time for sync anchoring when available. The
+            // pre-flight above gated on validity; re-fetch lastRenderTime
+            // in case the engine's clock advanced between then and now.
             if let lastRenderTime = player.lastRenderTime,
                let nodeTime = player.playerTime(forNodeTime: lastRenderTime),
                nodeTime.isHostTimeValid {
-                // hostTime on iOS is mach_absolute_time ticks
                 var tb = mach_timebase_info_data_t()
                 mach_timebase_info(&tb)
                 let hostTime = nodeTime.hostTime
