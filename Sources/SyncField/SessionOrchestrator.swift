@@ -154,15 +154,40 @@ public actor SessionOrchestrator {
             }
         }
 
+        // Run each stream's stopRecording concurrently. Rationale:
+        // - iPhoneCameraStream / iPhoneMotionStream / TactileStream are
+        //   independent of each other, sequential or parallel is fine.
+        // - Insta360CameraStream issues BLE `stopCapture` per device; the
+        //   underlying Insta360 SDK maintains per-camera state, and
+        //   back-to-back serial calls on sibling cameras have been
+        //   observed to fail the second with "msg execute err" in the
+        //   field. Firing them in parallel sidesteps that and matches the
+        //   v0.1 `stopCaptureAll` pattern that worked in production.
+        //
+        // Errors are collected rather than short-circuited so that a
+        // failing BLE camera doesn't cancel a healthy stream's finalise
+        // (AVAssetWriter commit etc).
         var reports: [StreamStopReport] = []
-        for s in streams {
-            do { reports.append(try await s.stopRecording()) }
-            catch { throw StreamError(streamId: s.streamId, underlying: error) }
+        var firstError: Error?
+        await withTaskGroup(of: (StreamStopReport?, Error?).self) { group in
+            for s in streams {
+                group.addTask { [s] in
+                    do { return (try await s.stopRecording(), nil) }
+                    catch {
+                        return (nil, StreamError(streamId: s.streamId, underlying: error))
+                    }
+                }
+            }
+            for await (report, error) in group {
+                if let report = report { reports.append(report) }
+                if let error = error, firstError == nil { firstError = error }
+            }
         }
         if let writer = logWriter {
             try await writer.append(kind: "state", detail: "recording->stopping")
         }
         state = .stopping
+        if let error = firstError { throw error }
         return StopReport(streamReports: reports)
     }
 
