@@ -58,8 +58,20 @@ public final class AVAudioEngineChirpPlayer: ChirpPlayer, @unchecked Sendable {
 
             // Capture AVAudioTime.hostTime *after* scheduling, before play.
             // lastRenderTime is non-nil once the engine has started.
+            //
+            // IMPORTANT: `AVAudioTime.hostTime` asserts the underlying time
+            // is valid. When the audio session configuration is in a bad
+            // state (e.g. AVAudioSession.setActive failed, app backgrounded
+            // mid-render, or the engine hasn't produced any samples yet),
+            // `lastRenderTime` can be non-nil but its `hostTimeValid` flag
+            // is false, and touching `.hostTime` traps with:
+            //   "required condition is false: nodeTime == nil ||
+            //    nodeTime.sampleTimeValid || nodeTime.hostTimeValid"
+            // Gate on `hostTimeValid` (falling back to software time) so
+            // chirp playback can't take down `stopRecording` with an NSException.
             if let lastRenderTime = player.lastRenderTime,
-               let nodeTime = player.playerTime(forNodeTime: lastRenderTime) {
+               let nodeTime = player.playerTime(forNodeTime: lastRenderTime),
+               nodeTime.isHostTimeValid {
                 // hostTime on iOS is mach_absolute_time ticks
                 var tb = mach_timebase_info_data_t()
                 mach_timebase_info(&tb)
