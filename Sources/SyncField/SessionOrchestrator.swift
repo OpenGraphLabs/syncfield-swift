@@ -186,6 +186,24 @@ public actor SessionOrchestrator {
         if let writer = logWriter {
             try await writer.append(kind: "state", detail: "recording->stopping")
         }
+
+        // Write manifest.json at stop time (not only at ingest time).
+        // Host apps that skip the orchestrator's `ingest()` phase — e.g.
+        // egonaut's Phase-C "pull wrist videos later" flow — would
+        // otherwise end up with an episode directory missing the
+        // manifest that downstream sync pipelines require. Each entry
+        // is derived from the stream-stop report when the stream has
+        // already closed its file, falling back to the conventional
+        // `<streamId>.jsonl` path for sensor streams.
+        let manifestResults: [String: Result<StreamIngestReport, Error>] =
+            Dictionary(uniqueKeysWithValues: reports.map { r in
+                (r.streamId, .success(StreamIngestReport(
+                    streamId: r.streamId,
+                    filePath: nil,
+                    frameCount: r.frameCount)))
+            })
+        try? writeManifest(from: manifestResults)
+
         state = .stopping
         if let error = firstError { throw error }
         return StopReport(streamReports: reports)
