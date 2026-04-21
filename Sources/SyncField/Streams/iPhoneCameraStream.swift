@@ -4,12 +4,61 @@ import Foundation
 import AVFoundation
 #endif
 
+/// Video codec the iPhone camera stream encodes into. Exposed as a plain enum
+/// so callers don't need to pull `AVFoundation` into their build when they're
+/// constructing a `VideoSettings` literal.
+public enum VideoCodec: String, Sendable {
+    /// H.264 / AVC — broadly compatible, software-decoded on older devices.
+    case h264 = "avc1"
+    /// HEVC / H.265 — ~40 % smaller than H.264 at matched quality, requires
+    /// hardware support on the decode side (standard on iOS 11+).
+    case hevc = "hvc1"
+}
+
+/// Output-file settings for `iPhoneCameraStream`.
+///
+/// Defaults reproduce the v0.2.9 behaviour (1920×1080 H.264). The struct is
+/// backward-compatible — existing call sites that pass nothing still get the
+/// same output they did before v0.2.10.
+public struct VideoSettings: Sendable {
+    public let width: Int
+    public let height: Int
+    public let codec: VideoCodec
+    /// Optional average bitrate in bits-per-second. `nil` lets the encoder
+    /// pick the default for the codec/size, which is usually fine. Set an
+    /// explicit value when you need predictable file sizes.
+    public let bitrate: Int?
+
+    public init(
+        width: Int,
+        height: Int,
+        codec: VideoCodec = .h264,
+        bitrate: Int? = nil
+    ) {
+        self.width = width
+        self.height = height
+        self.codec = codec
+        self.bitrate = bitrate
+    }
+
+    /// 1280 × 720 H.264 — smaller file than `.fullHD`, plenty of detail for
+    /// hand-tracked egocentric capture. Roughly half the bytes of 1080p at
+    /// matched visual quality.
+    public static let hd720 = VideoSettings(width: 1280, height: 720)
+    /// 1920 × 1080 H.264 — legacy default used before v0.2.10.
+    public static let fullHD = VideoSettings(width: 1920, height: 1080)
+    /// 3840 × 2160 H.264 — only on devices that expose a UHD back camera.
+    public static let uhd4K = VideoSettings(width: 3840, height: 2160)
+}
+
 public final class iPhoneCameraStream: NSObject, SyncFieldStream, @unchecked Sendable {
     public nonisolated let streamId: String
     public nonisolated let capabilities = StreamCapabilities(
         requiresIngest: false, producesFile: true,
         supportsPreciseTimestamps: true,
         providesAudioTrack: true)
+
+    private let videoSettings: VideoSettings
 
     #if canImport(AVFoundation)
     public let captureSession = AVCaptureSession()
@@ -34,8 +83,15 @@ public final class iPhoneCameraStream: NSObject, SyncFieldStream, @unchecked Sen
     private var lastProcessorCall: CFAbsoluteTime = 0
     #endif
 
-    public init(streamId: String) {
+    /// Create a stream with the legacy 1080p output. Kept as an explicit
+    /// convenience so existing call sites don't have to import `VideoSettings`.
+    public convenience init(streamId: String) {
+        self.init(streamId: streamId, videoSettings: .fullHD)
+    }
+
+    public init(streamId: String, videoSettings: VideoSettings) {
         self.streamId = streamId
+        self.videoSettings = videoSettings
         super.init()
     }
 
@@ -51,9 +107,24 @@ public final class iPhoneCameraStream: NSObject, SyncFieldStream, @unchecked Sen
     }
 
     #if canImport(AVFoundation)
+    /// Map the configured output size to the closest `AVCaptureSession.Preset`
+    /// so the camera captures at the encoding resolution rather than at
+    /// `.high` (which is typically 1080p on modern iPhones). Matching avoids
+    /// an extra scale pass during encode and saves a meaningful chunk of
+    /// battery on longer recordings.
+    private var matchingCapturePreset: AVCaptureSession.Preset {
+        switch (videoSettings.width, videoSettings.height) {
+        case (640,  480):   return .vga640x480
+        case (1280, 720):   return .hd1280x720
+        case (1920, 1080):  return .hd1920x1080
+        case (3840, 2160):  return .hd4K3840x2160
+        default:            return .high
+        }
+    }
+
     private func configureSession() throws {
         captureSession.beginConfiguration()
-        captureSession.sessionPreset = .high
+        captureSession.sessionPreset = matchingCapturePreset
 
         guard let device = AVCaptureDevice.default(.builtInWideAngleCamera,
                                                    for: .video, position: .back),
@@ -100,10 +171,16 @@ public final class iPhoneCameraStream: NSObject, SyncFieldStream, @unchecked Sen
         try? FileManager.default.removeItem(at: url)
         let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
 
-        let settings: [String: Any] = [
-            AVVideoCodecKey: AVVideoCodecType.h264,
-            AVVideoWidthKey: 1920, AVVideoHeightKey: 1080,
+        var settings: [String: Any] = [
+            AVVideoCodecKey: AVVideoCodecType(rawValue: videoSettings.codec.rawValue),
+            AVVideoWidthKey: videoSettings.width,
+            AVVideoHeightKey: videoSettings.height,
         ]
+        if let bitrate = videoSettings.bitrate {
+            settings[AVVideoCompressionPropertiesKey] = [
+                AVVideoAverageBitRateKey: bitrate,
+            ]
+        }
         let input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
         input.expectsMediaDataInRealTime = true
         writer.add(input)
