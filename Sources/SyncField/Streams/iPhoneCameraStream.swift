@@ -28,27 +28,36 @@ public struct VideoSettings: Sendable {
     /// pick the default for the codec/size, which is usually fine. Set an
     /// explicit value when you need predictable file sizes.
     public let bitrate: Int?
+    /// Target frame rate. If the device doesn't support this fps at the
+    /// requested (width, height), `iPhoneCameraStream` falls back to the
+    /// highest supported rate for that format — capture still succeeds.
+    /// Default 30 preserves v0.2.10 behaviour for existing callers.
+    public let fps: Int
 
     public init(
         width: Int,
         height: Int,
         codec: VideoCodec = .h264,
-        bitrate: Int? = nil
+        bitrate: Int? = nil,
+        fps: Int = 30
     ) {
         self.width = width
         self.height = height
         self.codec = codec
         self.bitrate = bitrate
+        self.fps = fps
     }
 
-    /// 1280 × 720 H.264 — smaller file than `.fullHD`, plenty of detail for
-    /// hand-tracked egocentric capture. Roughly half the bytes of 1080p at
-    /// matched visual quality.
-    public static let hd720 = VideoSettings(width: 1280, height: 720)
-    /// 1920 × 1080 H.264 — legacy default used before v0.2.10.
-    public static let fullHD = VideoSettings(width: 1920, height: 1080)
-    /// 3840 × 2160 H.264 — only on devices that expose a UHD back camera.
-    public static let uhd4K = VideoSettings(width: 3840, height: 2160)
+    /// 1280 × 720 H.264 @ 30 fps — smaller file than `.fullHD`, plenty of
+    /// detail for hand-tracked egocentric capture.
+    public static let hd720 = VideoSettings(width: 1280, height: 720, fps: 30)
+    /// 1280 × 720 H.264 @ 60 fps — preferred for fast-motion egocentric
+    /// tasks (pouring, handling tools) where motion blur matters.
+    public static let hd720_60 = VideoSettings(width: 1280, height: 720, fps: 60)
+    /// 1920 × 1080 H.264 @ 30 fps — legacy default used before v0.2.10.
+    public static let fullHD = VideoSettings(width: 1920, height: 1080, fps: 30)
+    /// 3840 × 2160 H.264 @ 30 fps — only on devices that expose a UHD back camera.
+    public static let uhd4K = VideoSettings(width: 3840, height: 2160, fps: 30)
 }
 
 public final class iPhoneCameraStream: NSObject, SyncFieldStream, @unchecked Sendable {
@@ -157,7 +166,43 @@ public final class iPhoneCameraStream: NSObject, SyncFieldStream, @unchecked Sen
         }
         // If mic is unavailable (permissions, hardware) we fall through without audio.
 
+        // Honour the requested fps. The session preset we picked above
+        // governs the sensor resolution, but the per-device frame duration
+        // is independent — we set it here so callers get e.g. 60 fps at
+        // 720 p for fast-motion egocentric work.
+        applyFrameRate(device: device)
+
         captureSession.commitConfiguration()
+    }
+
+    /// Clamp the requested fps to what the active format can produce, then
+    /// lock min/max frame duration. No-op if the device can't meet the
+    /// request — we keep the default rather than raising, since capture
+    /// must not fail just because a phone topped out at 30 fps.
+    private func applyFrameRate(device: AVCaptureDevice) {
+        let targetFps = Double(videoSettings.fps)
+        guard targetFps > 0 else { return }
+
+        // Highest supported fps for the currently-selected format. The
+        // ranges come from the hardware and include caps like 30 / 60 /
+        // 120 — we match the lowest ceiling >= target.
+        let ranges = device.activeFormat.videoSupportedFrameRateRanges
+        guard let best = ranges.first(where: { $0.maxFrameRate >= targetFps })
+                        ?? ranges.max(by: { $0.maxFrameRate < $1.maxFrameRate }) else {
+            return
+        }
+        let applied = min(best.maxFrameRate, targetFps)
+        let duration = CMTimeMake(value: 1, timescale: Int32(applied))
+
+        do {
+            try device.lockForConfiguration()
+            device.activeVideoMinFrameDuration = duration
+            device.activeVideoMaxFrameDuration = duration
+            device.unlockForConfiguration()
+        } catch {
+            // Locking can fail if another subsystem (e.g. system camera
+            // UI) holds the device; non-fatal — we keep the default rate.
+        }
     }
     #endif
 
