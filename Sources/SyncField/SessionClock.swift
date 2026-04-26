@@ -39,6 +39,10 @@ public final class SessionClock: @unchecked Sendable {
     }
 }
 
+/// Single source of truth for the SDK version. Embedded into every
+/// `sync_point.json` and `manifest.json` written by the orchestrator, and
+/// re-exported through `SyncFieldInsta360.version` so optional modules stay
+/// in lock-step with the core release.
 public enum SyncFieldVersion {
-    public static let current = "0.2.0"
+    public static let current = "0.3.0"
 }

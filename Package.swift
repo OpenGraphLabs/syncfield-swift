@@ -14,9 +14,18 @@ let package = Package(
         .library(name: "SyncFieldInsta360", targets: ["SyncFieldInsta360"]),
     ],
     targets: [
-        .target(name: "SyncField"),
-        .target(name: "SyncFieldUIKit",    dependencies: ["SyncField"]),
-        .target(name: "SyncFieldInsta360", dependencies: ["SyncField"]),
+        .target(
+            name: "SyncField",
+            resources: [
+                .copy("PrivacyInfo.xcprivacy"),
+            ]),
+        .target(name: "SyncFieldUIKit", dependencies: ["SyncField"]),
+        .target(
+            name: "SyncFieldInsta360",
+            dependencies: ["SyncField"],
+            resources: [
+                .copy("PrivacyInfo.xcprivacy"),
+            ]),
         .testTarget(name: "SyncFieldTests", dependencies: ["SyncField"]),
     ]
 )

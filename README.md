@@ -1,307 +1,291 @@
 # syncfield-swift
 
-Lightweight Swift SDK for [SyncField](https://opengraphlabs.com) multi-stream synchronization. Captures precise timestamps during multi-camera and sensor recording and produces JSONL files that the SyncField Docker service consumes for frame-level temporal alignment.
+Swift SDK for [SyncField](https://opengraphlabs.com) multi-stream synchronized recording on iOS. Captures iPhone camera, IMU, BLE tactile gloves, and (optionally) Insta360 Go 3S, all stamped against a single host-monotonic clock and packaged into a self-contained episode directory the SyncField sync server can ingest directly.
+
+- **Zero third-party dependencies** in the core (`SyncField`) — Foundation, AVFoundation, CoreMotion, CoreBluetooth only.
+- **Modular** — link only what you need. Tactile and Insta360 paths are isolated in their own targets.
+- **Modern Swift Concurrency** — `actor`-based session orchestrator, `AsyncStream` health events, full `Sendable` conformance.
+
+## Modules
+
+| Product | Purpose | Required dependencies |
+|---|---|---|
+| `SyncField` | Core. Session orchestrator + iPhone camera/IMU + Oglo tactile gloves. | None (system frameworks only) |
+| `SyncFieldUIKit` | `UIView` / SwiftUI camera preview helpers. | None |
+| `SyncFieldInsta360` | **Optional.** Insta360 Go 3S BLE-trigger + WiFi download. | `INSCameraServiceSDK.xcframework` from Insta360 — see [`docs/insta360.md`](docs/insta360.md) |
 
 ## Install
 
 ### Swift Package Manager
 
-Add to your `Package.swift`:
-
 ```swift
 dependencies: [
-    .package(url: "https://github.com/OpenGraphLabs/syncfield-swift.git", from: "0.1.0"),
+    .package(url: "https://github.com/OpenGraphLabs/syncfield-swift.git", from: "0.3.0"),
+],
+targets: [
+    .target(
+        name: "YourApp",
+        dependencies: [
+            .product(name: "SyncField",        package: "syncfield-swift"),
+            .product(name: "SyncFieldUIKit",   package: "syncfield-swift"), // optional
+            .product(name: "SyncFieldInsta360", package: "syncfield-swift"), // optional, see docs/insta360.md
+        ]),
 ]
 ```
 
-Or in Xcode: **File > Add Package Dependencies** > paste the repository URL.
+Or in Xcode: **File ▸ Add Package Dependencies** ▸ paste `https://github.com/OpenGraphLabs/syncfield-swift.git`.
 
-**Zero dependencies** -- uses only the Swift standard library and Foundation.
+### Info.plist permissions
 
-## Quick Start
+Add the keys for the streams you actually use.
 
-### Video Streams
+| Stream | Required Info.plist keys |
+|---|---|
+| `iPhoneCameraStream` | `NSCameraUsageDescription`, `NSMicrophoneUsageDescription` |
+| `iPhoneMotionStream` | `NSMotionUsageDescription` |
+| `TactileStream` | `NSBluetoothAlwaysUsageDescription` |
+| `Insta360CameraStream` | `NSBluetoothAlwaysUsageDescription`, `NSLocationWhenInUseUsageDescription`, plus the **Hotspot Configuration** capability |
 
-Use `stamp()` to capture timestamps and `link()` to associate the saved video file with the stream.
+A `PrivacyInfo.xcprivacy` manifest is shipped inside each target — your App Store submission inherits it automatically.
 
-```swift
-import SyncField
-
-let session = SyncSession(hostId: "iphone_01", outputDir: outputURL)
-try session.start()
-
-for i in 0..<numFrames {
-    let frame = camera.read()
-    try session.stamp("cam_ego", frameNumber: i)
-    saveFrame(frame, to: "cam_ego.mp4")
-}
-
-session.link("cam_ego", path: "/data/cam_ego.mp4")
-try session.stop()
-```
-
-Output:
-```
-sync_data/
-  sync_point.json
-  cam_ego.timestamps.jsonl
-  manifest.json
-```
-
-### Sensor Streams
-
-Use `record()` to capture timestamps and sensor data in one call. This writes both a `.timestamps.jsonl` file (for alignment) and a `.jsonl` file (sensor channel values).
+## Quick start — iPhone camera + IMU
 
 ```swift
 import SyncField
+import SyncFieldUIKit
 
-let session = SyncSession(hostId: "iphone_01", outputDir: outputURL)
-try session.start()
+let cam = iPhoneCameraStream(streamId: "cam_ego")
+let imu = iPhoneMotionStream(streamId: "imu", rateHz: 100)
 
-for i in 0..<numSamples {
-    let data = imu.read()
-    try session.record("imu", frameNumber: i, channels: [
-        "accel_x": data.ax,
-        "accel_y": data.ay,
-        "accel_z": data.az,
-    ])
+let session = SessionOrchestrator(
+    hostId: "iphone_ego",
+    outputDirectory: episodesDir)
+
+try await session.add(cam)
+try await session.add(imu)
+
+try await session.connect()           // open camera + IMU; preview is live
+try await session.startRecording()    // atomic start of all streams
+//   ... user records ...
+_ = try await session.stopRecording() // close files
+_ = try await session.ingest { _ in } // post-recording imports (no-op for native streams)
+try await session.disconnect()        // release devices
+
+// session.episodeDirectory now holds the episode. Ship it to your storage.
+```
+
+Live camera preview (UIKit):
+
+```swift
+let preview = SyncFieldPreviewView(stream: cam)
+view.addSubview(preview)
+```
+
+Or SwiftUI:
+
+```swift
+SyncFieldPreview(stream: cam)
+```
+
+## The lifecycle
+
+Every recording follows the same five-method cycle. Adding or removing streams is the only thing that changes between setups.
+
+```
+idle ──add()──▶ idle ──connect()──▶ connected ──startRecording()──▶ recording
+                                       ▲                                │
+                                       │                          stopRecording()
+                                       │                                ▼
+                                  disconnect()                      stopping
+                                       │                                │
+                                       │                            ingest()
+                                       │                                ▼
+                                       └──────────────────────────  ingesting ─┐
+                                                                                │
+                                                                               (back to connected)
+```
+
+See [`docs/integration.md`](docs/integration.md) for the host-app patterns that exercise this state machine — deferred-connect for late-attached streams, ingest skipping, custom chirp configuration, and health-event subscription.
+
+## Recipes
+
+Three reference integrations under [`examples/`](examples) cover the common iOS rigs. Each is one self-contained `UIViewController`.
+
+| Setup | Streams | Path |
+|---|---|---|
+| Egocentric only | iPhone camera + IMU | [`examples/egocentric-only/`](examples/egocentric-only) |
+| Egocentric + tactile | iPhone camera + IMU + Oglo gloves (L/R) | [`examples/ego-plus-tactile/`](examples/ego-plus-tactile) |
+| Egocentric + wrist | iPhone camera + IMU + Insta360 Go 3S | [`examples/ego-plus-wrist/`](examples/ego-plus-wrist) |
+
+## Streams
+
+### `iPhoneCameraStream`
+
+H.264 / HEVC mp4 with embedded mic audio track. Audio is the carrier for SyncField's chirp-based cross-host alignment.
+
+```swift
+// 1080 p @ 30 fps default
+let cam = iPhoneCameraStream(streamId: "cam_ego")
+
+// Or pick a preset
+let cam = iPhoneCameraStream(streamId: "cam_ego", videoSettings: .hd720_60)
+
+// Or build your own
+let cam = iPhoneCameraStream(
+    streamId: "cam_ego",
+    videoSettings: VideoSettings(width: 1280, height: 720,
+                                 codec: .hevc,
+                                 bitrate: 6_000_000,
+                                 fps: 60))
+```
+
+Built-in presets: `.hd720`, `.hd720_60`, `.fullHD`, `.uhd4K`. Unsupported (resolution, fps) combinations gracefully fall back to the highest fps the format supports — capture never fails because of a fps mismatch.
+
+### `iPhoneMotionStream`
+
+CoreMotion device motion at the requested rate (default 100 Hz). Writes user acceleration, rotation rate, and gravity to a single sensor JSONL.
+
+```swift
+let imu = iPhoneMotionStream(streamId: "imu", rateHz: 100)
+```
+
+### `TactileStream`
+
+BLE-connected Oglo tactile glove (5 FSR channels @ 100 Hz with firmware-side hardware timestamps). One stream per glove side.
+
+```swift
+let left  = TactileStream(streamId: "tactile_left",  side: .left)
+let right = TactileStream(streamId: "tactile_right", side: .right)
+
+// Optional: subscribe to live samples for UI / gesture preview
+left.setSampleHandler { event in
+    // event.channels: [String: Int] (raw 12-bit FSR), event.frame, event.monotonicNs
 }
-
-try session.stop()
 ```
 
-Output:
-```
-sync_data/
-  sync_point.json
-  imu.timestamps.jsonl
-  imu.jsonl
-  manifest.json
-```
+### `Insta360CameraStream` (optional module)
 
-### Complex Sensor Data
-
-Sensors like hand trackers, tactile arrays, and robot joints produce nested data. The SDK handles these natively -- leaf values must be numeric (`Double` or `Int`).
+BLE-trigger + WiFi-download path for the Insta360 Go 3S wrist camera. **Requires `INSCameraServiceSDK.xcframework` to be linked into your host app.** When the framework is missing, every method throws `Insta360Error.frameworkNotLinked` — the rest of SyncField is unaffected.
 
 ```swift
-// Hand tracker -- nested joint positions and gestures
-try session.record("hand_tracker", frameNumber: i, channels: [
-    "joints": [
-        "wrist": [0.1, 0.2, 0.3],
-        "thumb_tip": [0.4, 0.5, 0.6],
-        "index_tip": [0.7, 0.8, 0.9],
-    ] as [String: Any],
-    "gestures": ["pinch": 0.95, "fist": 0.02] as [String: Any],
-    "finger_angles": [12.5, 45.0, 30.0, 15.0, 5.0],
-])
+import SyncFieldInsta360
 
-// Tactile grid -- 2D pressure array
-try session.record("tactile", frameNumber: i, channels: [
-    "pressure_grid": [[0.1, 0.2, 0.3, 0.4],
-                       [0.5, 0.6, 0.7, 0.8]],
-    "total_force": 12.5,
-])
-
-// Robot arm -- joint states
-try session.record("robot_arm", frameNumber: i, channels: [
-    "joint_positions": [0.0, -1.57, 0.0, -1.57, 0.0, 0.0],
-    "joint_velocities": [0.01, -0.02, 0.0, 0.01, 0.0, 0.0],
-    "gripper": ["width": 0.04, "force": 5.2] as [String: Any],
-])
+let wrist = Insta360CameraStream(streamId: "cam_wrist")
+try await session.add(wrist)
+// ... ingest() automatically switches to the camera AP, downloads the clip, restores WiFi.
 ```
 
-SyncField automatically flattens nested channels for aggregation using dot-notation keys (e.g., `joints.wrist.0`, `gripper.width`).
+Full setup — obtaining the framework, embedding it, the BLE/WiFi flow — is documented in [`docs/insta360.md`](docs/insta360.md).
 
-### Multi-Stream Example
+## Episode directory
 
-A complete example with 2 cameras and 1 IMU, each on its own DispatchQueue.
+Every session writes a timestamped directory under `outputDirectory`:
 
-```swift
-import SyncField
+```
+episodes/
+└── ep_20260411_152930_abc123/
+    ├── manifest.json           # stream catalogue
+    ├── sync_point.json         # monotonic⇄wall-clock anchor + chirp markers
+    ├── session.log             # state-machine transitions
+    ├── cam_ego.mp4
+    ├── cam_ego.timestamps.jsonl
+    ├── imu.jsonl
+    ├── tactile_left.jsonl              (when present)
+    ├── tactile_right.jsonl             (when present)
+    ├── cam_wrist.mp4                   (when present)
+    └── cam_wrist.anchor.json           (BLE-ACK anchor — Insta360)
+```
 
-let session = SyncSession(hostId: "iphone_01", outputDir: outputURL)
-try session.start()
+The SDK does **not** upload — that's intentionally left to the host app. After `disconnect()`, ship `session.episodeDirectory` to your storage.
 
-var recording = true
+## Output format reference
 
-func cameraLoop(cam: Camera, streamId: String, videoPath: String) {
-    var i = 0
-    while recording {
-        let frame = cam.read()
-        try? session.stamp(streamId, frameNumber: i)
-        saveFrame(frame, to: videoPath)
-        i += 1
+### `sync_point.json`
+
+```json
+{
+  "sdk_version": "0.3.0",
+  "monotonic_ns": 1234567890123456789,
+  "wall_clock_ns": 1709890101000000000,
+  "host_id": "iphone_ego",
+  "iso_datetime": "2026-04-11T15:29:30.000000Z",
+  "chirp_start_ns": 1234567890200000000,
+  "chirp_stop_ns":  1234567892800000000,
+  "chirp_start_source": "audio_engine",
+  "chirp_stop_source":  "audio_engine"
+}
+```
+
+### `{stream_id}.timestamps.jsonl` (camera streams)
+
+One JSON object per line, no array wrapper:
+
+```jsonl
+{"capture_ns":1234567890123456789,"clock_domain":"iphone_ego","clock_source":"host_monotonic","frame_number":0,"uncertainty_ns":1000000}
+{"capture_ns":1234567890156789012,"clock_domain":"iphone_ego","clock_source":"host_monotonic","frame_number":1,"uncertainty_ns":1000000}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `frame_number` | int | 0-based |
+| `capture_ns` | int | Host monotonic ns at sample arrival; non-decreasing within a stream |
+| `clock_source` | string | Always `"host_monotonic"` for the iPhone |
+| `clock_domain` | string | Equals `host_id` |
+| `uncertainty_ns` | int | Camera path: 1 ms; sensors: 5 ms |
+
+### `{stream_id}.jsonl` (sensor streams)
+
+```jsonl
+{"capture_ns":1234567890123456789,"channels":{"accel_x":0.12,"accel_y":-9.8,"accel_z":0.05},"clock_domain":"iphone_ego","clock_source":"host_monotonic","frame_number":0,"uncertainty_ns":5000000}
+```
+
+The `channels` object is sensor-specific. For the tactile glove the labels come from the firmware manifest (`thumb`, `index`, `middle`, `ring`, `pinky`); for IMU it's `accel_x/y/z`, `gyro_x/y/z`, `gravity_x/y/z`.
+
+### `manifest.json`
+
+Written by the orchestrator at `stopRecording()` (and again at `ingest()`). Maps every registered stream to its output file plus capability flags:
+
+```json
+{
+  "sdk_version": "0.3.0",
+  "host_id": "iphone_ego",
+  "role": "single",
+  "streams": [
+    {
+      "stream_id": "cam_ego",
+      "kind": "video",
+      "file_path": "cam_ego.mp4",
+      "frame_count": 900,
+      "capabilities": {
+        "produces_file": true,
+        "supports_precise_timestamps": true,
+        "provides_audio_track": true,
+        "requires_ingest": false
+      }
     }
-    session.link(streamId, path: videoPath)
-}
-
-func imuLoop(imu: IMU, streamId: String) {
-    var i = 0
-    while recording {
-        let data = imu.read()
-        try? session.record(streamId, frameNumber: i, channels: [
-            "accel_x": data.ax, "accel_y": data.ay, "accel_z": data.az,
-            "gyro_x": data.gx, "gyro_y": data.gy, "gyro_z": data.gz,
-        ])
-        i += 1
-    }
-}
-
-let queue = DispatchQueue(label: "capture", attributes: .concurrent)
-queue.async { cameraLoop(cam: camLeft, streamId: "cam_left", videoPath: "/data/cam_left.mp4") }
-queue.async { cameraLoop(cam: camRight, streamId: "cam_right", videoPath: "/data/cam_right.mp4") }
-queue.async { imuLoop(imu: imuDevice, streamId: "imu") }
-
-// ... record for desired duration ...
-recording = false
-
-let counts = try session.stop()
-// counts == ["cam_left": 900, "cam_right": 900, "imu": 9000]
-```
-
-Output directory:
-```
-sync_data/
-  sync_point.json
-  cam_left.timestamps.jsonl
-  cam_right.timestamps.jsonl
-  imu.timestamps.jsonl
-  imu.jsonl
-  manifest.json
-```
-
-## Best Practices
-
-### Call `stamp()`/`record()` immediately after I/O read
-
-The timestamp should reflect when data arrived on the host, not when processing finished.
-
-```swift
-// GOOD -- timestamp reflects when data arrived on the host
-let data = device.read()
-try session.stamp("sensor", frameNumber: i)  // immediately after read
-
-// BAD -- processing delay adds jitter to timestamp
-let data = device.read()
-let processed = expensiveTransform(data)
-try session.stamp("sensor", frameNumber: i)  // too late!
-```
-
-### Use one thread per device
-
-Each device should have its own thread or DispatchQueue with a tight read loop. Both `stamp()` and `record()` are thread-safe.
-
-```swift
-let queue = DispatchQueue(label: "capture", attributes: .concurrent)
-
-queue.async {
-    var i = 0
-    while recording {
-        let frame = cam.read()
-        try? session.stamp("cam_left", frameNumber: i)
-        i += 1
-    }
-}
-
-queue.async {
-    var i = 0
-    while recording {
-        let data = imu.read()
-        try? session.record("imu", frameNumber: i, channels: [
-            "accel_x": data.ax, "accel_y": data.ay, "accel_z": data.az,
-        ])
-        i += 1
-    }
+  ]
 }
 ```
 
-### Pre-captured timestamps for minimum jitter
+## Sending an episode to the SyncField sync server
 
-If your capture callback provides its own timestamp, pass it directly to avoid lock-acquisition delay:
+After `disconnect()`, post the directory to your SyncField deployment. Two flavours:
 
-```swift
-let captureNs = MonotonicClock.now()  // capture immediately
-// ... some unavoidable overhead ...
-try session.stamp("cam", frameNumber: i, captureNs: captureNs)
-```
-
-## API Reference
-
-### `SyncSession`
-
-| Method | Description |
-|--------|-------------|
-| `init(hostId:outputDir:)` | Create a session. `outputDir` accepts `URL` or `String`. |
-| `start() -> SyncPoint` | Begin recording. Captures the clock reference point. |
-| `stamp(_:frameNumber:uncertaintyNs:captureNs:) -> UInt64` | Record a timestamp for one frame. |
-| `record(_:frameNumber:channels:uncertaintyNs:captureNs:) -> UInt64` | Record timestamp + sensor data. |
-| `link(_:path:)` | Associate an external file with a stream. |
-| `stop() -> [String: Int]` | End session. Writes manifest and sync point. Returns frame counts. |
-
-### Thread Safety
-
-All methods are thread-safe. `stamp()` and `record()` can be called from multiple threads concurrently. The timestamp is captured *before* acquiring the internal lock, so lock contention does not affect timing precision.
-
-### Timestamp Precision
-
-Uses `clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)` for nanosecond-precision monotonic timestamps -- the iOS/macOS equivalent of Python's `time.monotonic_ns()`. This clock is not affected by NTP adjustments, ensuring consistent intervals for high-frequency capture.
-
-## Integration with SyncField Docker
-
-### Using `manifest.json` (recommended)
-
-After `stop()`, the SDK writes a `manifest.json` that maps all streams to their files. Use it to construct the API request body programmatically.
-
-```swift
-import Foundation
-
-let manifestData = try Data(contentsOf: outputURL.appendingPathComponent("manifest.json"))
-let manifest = try JSONSerialization.jsonObject(with: manifestData) as! [String: Any]
-
-let hostId = manifest["host_id"] as! String
-let streamsMap = manifest["streams"] as! [String: [String: Any]]
-
-var streams: [[String: Any]] = []
-for (streamId, info) in streamsMap {
-    var entry: [String: Any] = ["stream_id": streamId]
-    if let path = info["path"] { entry["path"] = path }
-    if info["type"] as? String == "sensor" { entry["stream_type"] = "sensor" }
-    streams.append(entry)
-}
-
-// Mark first video as primary
-if let idx = streams.firstIndex(where: {
-    streamsMap[$0["stream_id"] as! String]?["type"] as? String == "video"
-}) {
-    streams[idx]["is_primary"] = true
-}
-
-let body: [String: Any] = [
-    "hosts": [["host_id": hostId, "streams": streams]],
-    "timestamps_dir": "/timestamps",
-]
-// POST to http://localhost:8080/api/v1/sync
-```
-
-### Volume-mounted mode
-
-Mount your data and timestamp directories into the container and call the API directly.
+### Volume-mounted
 
 ```bash
-docker run -v ./data:/data -v ./sync_data:/timestamps \
-  syncfield-app:latest
-```
+docker run -v ./episodes/ep_20260411_152930_abc123:/data \
+           -v ./episodes/ep_20260411_152930_abc123:/timestamps \
+           syncfield-app:latest
 
-```bash
 curl -X POST http://localhost:8080/api/v1/sync \
   -H "Content-Type: application/json" \
   -d '{
     "hosts": [
       {
-        "host_id": "iphone_01",
+        "host_id": "iphone_ego",
         "streams": [
           {"path": "/data/cam_ego.mp4", "stream_id": "cam_ego", "is_primary": true},
-          {"path": "/data/cam_wrist.mp4", "stream_id": "cam_wrist"},
           {"stream_id": "imu", "stream_type": "sensor"}
         ]
       }
@@ -310,126 +294,36 @@ curl -X POST http://localhost:8080/api/v1/sync \
   }'
 ```
 
-The service automatically matches `{stream_id}.timestamps.jsonl` and `{stream_id}.jsonl` files to streams using the `timestamps_dir` path.
-
-### File upload mode
-
-Upload files directly without volume mounts.
+### File upload
 
 ```bash
 curl -X POST http://localhost:8080/api/v1/sync/upload \
   -F "files=@cam_ego.mp4" \
-  -F "files=@cam_wrist.mp4" \
-  -F "timestamp_files=@sync_data/cam_ego.timestamps.jsonl" \
-  -F "timestamp_files=@sync_data/cam_wrist.timestamps.jsonl" \
-  -F "stream_ids=cam_ego,cam_wrist" \
-  -F "host_ids=iphone_01,iphone_01" \
+  -F "timestamp_files=@cam_ego.timestamps.jsonl" \
+  -F "timestamp_files=@imu.jsonl" \
+  -F "stream_ids=cam_ego,imu" \
+  -F "host_ids=iphone_ego,iphone_ego" \
   -F "primary_id=cam_ego"
 ```
 
-## Format Specification
+The `manifest.json` produced by the SDK is the authoritative catalogue — you can also generate the request body programmatically by reading it.
 
-This section defines the output format for implementors in other languages.
+## Documentation
 
-### `sync_point.json`
-
-```json
-{
-  "sdk_version": "0.1.0",
-  "monotonic_ns": 1234567890123456789,
-  "wall_clock_ns": 1709890101000000000,
-  "host_id": "iphone_01",
-  "timestamp_ms": 1709890101000,
-  "iso_datetime": "2024-03-08T12:00:01.000000"
-}
-```
-
-### `{stream_id}.timestamps.jsonl`
-
-One JSON object per line (no trailing comma, no array wrapper):
-
-```jsonl
-{"capture_ns":1234567890123456789,"clock_domain":"iphone_01","clock_source":"host_monotonic","frame_number":0,"uncertainty_ns":5000000}
-{"capture_ns":1234567890156789012,"clock_domain":"iphone_01","clock_source":"host_monotonic","frame_number":1,"uncertainty_ns":5000000}
-```
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `frame_number` | int | 0-based sequential index |
-| `capture_ns` | int | Monotonic nanoseconds at data arrival |
-| `clock_source` | string | Always `"host_monotonic"` for SDK output |
-| `clock_domain` | string | Must match `host_id` -- identifies the clock |
-| `uncertainty_ns` | int | Timing uncertainty (default: 5000000 = 5ms) |
-
-**Key rules:**
-- `capture_ns` must be monotonically non-decreasing within each stream
-- `clock_domain` must be identical across all streams on the same host
-- File name must be `{stream_id}.timestamps.jsonl` for auto-matching
-
-### `{stream_id}.jsonl` (Sensor Data)
-
-One JSON object per line, combining timestamp and channel values:
-
-```jsonl
-{"capture_ns":1234567890123456789,"channels":{"accel_x":0.12,"accel_y":-9.8,"accel_z":0.05},"clock_domain":"iphone_01","clock_source":"host_monotonic","frame_number":0,"uncertainty_ns":5000000}
-```
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `frame_number` | int | 0-based sequential index |
-| `capture_ns` | int | Monotonic nanoseconds at data arrival (same clock as video timestamps) |
-| `clock_source` | string | Origin of the timestamp (always `"host_monotonic"` for SDK) |
-| `clock_domain` | string | Host identifier -- must match across all streams on the same host |
-| `uncertainty_ns` | int | Timing uncertainty (default: 5000000 = 5ms) |
-| `channels` | object | Sensor values as key-value pairs (e.g. `{"accel_x": 0.12}`) |
-
-### `manifest.json`
-
-Written by `stop()`. Maps all streams in the session to their output files.
-
-```json
-{
-  "sdk_version": "0.1.0",
-  "host_id": "iphone_01",
-  "streams": {
-    "cam_ego": {
-      "type": "video",
-      "timestamps_path": "cam_ego.timestamps.jsonl",
-      "frame_count": 900,
-      "path": "/data/cam_ego.mp4"
-    },
-    "cam_wrist": {
-      "type": "video",
-      "timestamps_path": "cam_wrist.timestamps.jsonl",
-      "frame_count": 900,
-      "path": "/data/cam_wrist.mp4"
-    },
-    "imu": {
-      "type": "sensor",
-      "sensor_path": "imu.jsonl",
-      "timestamps_path": "imu.timestamps.jsonl",
-      "frame_count": 9000
-    }
-  }
-}
-```
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `sdk_version` | string | SDK version that produced this file |
-| `host_id` | string | Host identifier for this recording session |
-| `streams` | object | Map of `stream_id` to stream metadata |
-| `streams.*.type` | string | `"video"` or `"sensor"` |
-| `streams.*.timestamps_path` | string | Relative path to the timestamps JSONL file |
-| `streams.*.frame_count` | int | Number of frames/samples recorded |
-| `streams.*.path` | string | (video only) Path set via `link()` |
-| `streams.*.sensor_path` | string | (sensor only) Relative path to the sensor data JSONL file |
+- [`examples/`](examples) — three copy-pasteable view controllers
+- [`docs/integration.md`](docs/integration.md) — lifecycle, host-app patterns, health events, custom chirp
+- [`docs/insta360.md`](docs/insta360.md) — Insta360 framework setup and ingest flow
+- [`CHANGELOG.md`](CHANGELOG.md)
 
 ## Platforms
 
-- iOS 15+
-- macOS 12+
+- iOS 15+ (primary; all streams)
+- macOS 12+ (core only — camera/motion/Bluetooth disabled at compile time)
+
+## Thread safety
+
+`SessionOrchestrator` is an `actor`. Streams are individually `Sendable` and safe to call from any task; per-stream internal queues serialise device I/O. Health events flow through `AsyncStream<HealthEvent>` returned by `session.healthEvents`.
 
 ## License
 
-Apache-2.0
+Apache-2.0. See [`LICENSE`](LICENSE).
