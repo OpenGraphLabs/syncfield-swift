@@ -10,7 +10,8 @@ public actor SessionOrchestrator {
                 startChirp: ChirpSpec? = .defaultStart,
                 stopChirp: ChirpSpec? = .defaultStop,
                 postStartStabilizationMs: Double = 200,
-                preStopTailMarginMs: Double = 200) {
+                preStopTailMarginMs: Double = 200,
+                handQualityConfig: HandQualityConfig = .default) {
         self.hostId = hostId
         self.baseDir = outputDirectory
         self.chirpPlayer = chirpPlayer ?? Self.defaultChirpPlayer()
@@ -18,6 +19,7 @@ public actor SessionOrchestrator {
         self.stopChirpSpec = stopChirp
         self.postStartStabilizationMs = postStartStabilizationMs
         self.preStopTailMarginMs = preStopTailMarginMs
+        self.handQualityConfig = handQualityConfig
     }
 
     public private(set) var state: SessionState = .idle
@@ -84,6 +86,17 @@ public actor SessionOrchestrator {
         try await writer.append(kind: "state", detail: "connected->recording")
 
         self.activeClock = clock
+
+        // Hand FOV quality plumbing. The monitor and event writer live for the
+        // duration of the recording; finalized in stopRecording().
+        let evWriter = factory.makeEventWriter()
+        self.eventWriter = evWriter
+        self.recordingStartMonotonicNs = clock.nowMonotonicNs()
+        self.handQualityMonitor = HandQualityMonitor(
+            config: handQualityConfig,
+            recordingStartMonotonicNs: recordingStartMonotonicNs,
+            eventWriter: evWriter
+        )
 
         if countdown > 0 {
             try await Task.sleep(nanoseconds: UInt64(countdown * 1_000_000_000))
@@ -187,6 +200,26 @@ public actor SessionOrchestrator {
             try await writer.append(kind: "state", detail: "recording->stopping")
         }
 
+        // Finalize hand FOV quality: capture stats, close any open intervals,
+        // write hand_quality.json. Failures here are non-fatal (a recording
+        // without quality metadata is still a valid recording).
+        if let monitor = handQualityMonitor {
+            let stopNs = activeClock?.nowMonotonicNs() ?? recordingStartMonotonicNs
+            let stats = await monitor.qualityStats(
+                recordingStartMonotonicNs: recordingStartMonotonicNs,
+                stopMonotonicNs: stopNs
+            )
+            self.lastHandQualityStats = stats
+            await monitor.finalize(stopMonotonicNs: stopNs, stopFrame: -1)
+            let summary = HandQualitySummaryBuilder.build(stats: stats, config: handQualityConfig)
+            let summaryURL = episodeDirectory.appendingPathComponent("hand_quality.json")
+            try? HandQualitySummaryBuilder.write(summary, to: summaryURL)
+        }
+        // EventWriter is finalized as part of monitor.finalize; drop the reference
+        // so future logEvent calls become no-ops until the next startRecording.
+        eventWriter = nil
+        handQualityMonitor = nil
+
         // Write manifest.json at stop time (not only at ingest time).
         // Host apps that skip the orchestrator's `ingest()` phase — e.g.
         // egonaut's Phase-C "pull wrist videos later" flow — would
@@ -267,6 +300,13 @@ public actor SessionOrchestrator {
     private var stopEmission: ChirpEmission?
     private var currentSyncPoint: SyncPoint?
 
+    // Hand FOV quality state — created in startRecording, finalized in stopRecording.
+    private var handQualityConfig: HandQualityConfig
+    private var handQualityMonitor: HandQualityMonitor?
+    private var eventWriter: EventWriter?
+    private var recordingStartMonotonicNs: UInt64 = 0
+    private var lastHandQualityStats: QualityStats?
+
     private static func defaultChirpPlayer() -> ChirpPlayer {
         #if canImport(AVFoundation) && os(iOS)
         return AVAudioEngineChirpPlayer()
@@ -328,6 +368,62 @@ public actor SessionOrchestrator {
         try ManifestWriter.write(
             manifest,
             to: episodeDirectory.appendingPathComponent("manifest.json"))
+    }
+}
+
+// MARK: - Hand FOV quality public API
+
+extension SessionOrchestrator {
+    /// Update the hand-quality config. Takes effect on the next call to
+    /// ``startRecording(countdown:)``; live recordings keep the config they
+    /// were started with.
+    public func setHandQualityConfig(_ config: HandQualityConfig) {
+        self.handQualityConfig = config
+    }
+
+    /// Stream of per-hand state-machine transitions. Call after
+    /// ``startRecording(countdown:)`` returns; before that, the monitor
+    /// does not exist and the returned stream completes immediately.
+    public func handQualityEvents() -> AsyncStream<HandQualityEvent> {
+        guard let monitor = handQualityMonitor else {
+            return AsyncStream { $0.finish() }
+        }
+        return monitor.events
+    }
+
+    /// Feed one frame's worth of detected hands into the quality monitor.
+    /// Host apps that do their own Vision detection (the egonaut RN bridge)
+    /// call this after each frame's `VNDetectHumanHandPoseRequest` completes.
+    /// Safe to call before/after a recording — silently no-ops if the
+    /// monitor is not active.
+    public func ingestHandObservations(_ observations: [HandObservation],
+                                       frame: Int,
+                                       monotonicNs: UInt64) async {
+        await handQualityMonitor?.ingest(observations: observations,
+                                         frame: frame,
+                                         monotonicNs: monotonicNs)
+    }
+
+    /// Append an arbitrary domain event to the per-episode `events.jsonl`.
+    /// Pass `endMonotonicNs == nil` (or equal to `monotonicNs`) for a point
+    /// event; otherwise an interval is emitted in one shot.
+    public func logEvent(kind: String,
+                         monotonicNs: UInt64,
+                         endMonotonicNs: UInt64?,
+                         payload: [String: Any]) async throws {
+        guard let writer = eventWriter else { return }
+        if let endNs = endMonotonicNs, endNs != monotonicNs {
+            let h = try await writer.appendIntervalStart(
+                kind: kind,
+                startMonotonicNs: monotonicNs,
+                startFrame: -1,
+                payload: payload
+            )
+            try await writer.closeInterval(handle: h, endMonotonicNs: endNs, endFrame: -1)
+        } else {
+            try await writer.appendPoint(kind: kind, monotonicNs: monotonicNs, payload: payload)
+        }
+        await writer.flush()
     }
 }
 

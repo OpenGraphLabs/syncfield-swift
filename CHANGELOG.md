@@ -2,6 +2,31 @@
 
 All notable changes to **syncfield-swift** are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0-rc1] — 2026-04-28
+
+First-class hand FOV quality monitoring for egocentric recordings.
+
+### Added
+- `HandQualityMonitor` actor (`Sources/SyncField/Quality/`): per-hand IN / NEAR_EDGE / OUT_OF_FRAME state machine with chirality-first assignment + spatial-continuity fallback, eager near-edge entry, debounced OOF/recovery, and a configurable startup grace window.
+- `EventWriter` actor (`Sources/SyncField/Writers/`): append-only JSON Lines writer for per-episode interval and point events. Each line is independently parseable; open intervals at finalize are auto-closed with `payload._truncated_at_stop = true`.
+- `SessionOrchestrator` public API:
+  - `init(... handQualityConfig: HandQualityConfig = .default)` — opt-out via `enabled: false`.
+  - `setHandQualityConfig(_:)` — applies on the next `startRecording()`.
+  - `handQualityEvents() -> AsyncStream<HandQualityEvent>` — live state transitions for UI / audio cue consumers.
+  - `ingestHandObservations(_:frame:monotonicNs:)` — host apps that already run Vision hand-pose detection feed observations through this method.
+  - `logEvent(kind:monotonicNs:endMonotonicNs:payload:)` — generic interval-or-point domain event logger writing through the same `events.jsonl`.
+- `HandQualitySummary` — `hand_quality.json` schema with `verdict` (good / marginal / reject), `overall_score`, `sub_scores`, `raw` (snake-case `QualityStats`), `thresholds`, and `config`. Mirrors the existing `egomotion_quality.json` shape.
+- `WriterFactory.makeEventWriter(streamId:)` — `events.jsonl` factory rooted at the episode directory.
+- `VisionHandConversion` — `HandObservation.from(vision:minConfidence:)` extension behind a `canImport(Vision)` guard for host apps that want to convert `VNHumanHandPoseObservation` directly.
+
+### Changed
+- `SyncFieldVersion.current` bumped to `0.4.0-rc1`.
+
+### Compatibility
+- Additive only. Existing 0.3.x consumers compile unchanged. Recordings now also produce `events.jsonl` and `hand_quality.json` in the episode directory; consumers that enumerate files should ignore unknown extensions (already the standard pattern).
+
+---
+
 ## [0.3.0] — 2026-04-26
 
 First release positioned for external customer adoption. No breaking source changes vs. `0.2.11`; the bump reflects packaging, documentation, and privacy work that brings the SDK to production quality.
