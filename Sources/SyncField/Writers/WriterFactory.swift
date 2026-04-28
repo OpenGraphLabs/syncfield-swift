@@ -21,4 +21,11 @@ public struct WriterFactory: Sendable {
     public func videoURL(streamId: String, extension ext: String = "mp4") -> URL {
         episodeDirectory.appendingPathComponent("\(streamId).\(ext)")
     }
+
+    /// Returns an ``EventWriter`` rooted at `<episodeDirectory>/events.jsonl`.
+    /// The same `streamId` is stamped into every record this writer emits.
+    public func makeEventWriter(streamId: String = "cam_ego") -> EventWriter {
+        EventWriter(fileURL: episodeDirectory.appendingPathComponent("events.jsonl"),
+                    streamId: streamId)
+    }
 }
