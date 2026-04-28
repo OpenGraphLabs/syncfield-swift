@@ -16,8 +16,8 @@ public actor StreamWriter {
 
     public func append(frame: Int, monotonicNs: UInt64, uncertaintyNs: UInt64) throws {
         let obj: [String: Any] = [
-            "frame": frame,
-            "timestamp_ns": monotonicNs,
+            "frame_number": frame,
+            "capture_ns": monotonicNs,
             "uncertainty_ns": uncertaintyNs,
         ]
         var data = try JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys])

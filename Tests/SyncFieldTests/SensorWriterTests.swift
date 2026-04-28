@@ -17,7 +17,8 @@ final class SensorWriterTests: XCTestCase {
 
         let line = try String(contentsOf: url).split(separator: "\n").first!
         let obj = try JSONSerialization.jsonObject(with: Data(String(line).utf8)) as! [String: Any]
-        XCTAssertEqual(obj["frame"] as? Int, 0)
+        XCTAssertEqual(obj["frame_number"] as? Int, 0)
+        XCTAssertEqual(obj["capture_ns"] as? UInt64, 123)
         let channels = obj["channels"] as! [String: Any]
         XCTAssertEqual(channels["accel_x"] as? Double, 0.1)
     }

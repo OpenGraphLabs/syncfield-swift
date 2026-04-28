@@ -16,8 +16,8 @@ public actor SensorWriter {
                        channels: [String: Any],
                        deviceTimestampNs: UInt64? = nil) throws {
         var obj: [String: Any] = [
-            "frame": frame,
-            "timestamp_ns": monotonicNs,
+            "frame_number": frame,
+            "capture_ns": monotonicNs,
             "channels": channels,
         ]
         if let dts = deviceTimestampNs { obj["device_timestamp_ns"] = dts }

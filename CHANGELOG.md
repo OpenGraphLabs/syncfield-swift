@@ -2,6 +2,18 @@
 
 All notable changes to **syncfield-swift** are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] — 2026-04-29
+
+JSONL field names now match the SyncField server schema. The previous `frame` / `timestamp_ns` keys produced by both writers caused `Sensor load failed for imu: 'capture_ns'` server-side, dropping the IMU stream and tripping the "fewer than 2 streams" guard for any single-camera-plus-IMU recording.
+
+### Changed
+- **BREAKING:** `SensorWriter` (`imu.jsonl` and other `*.jsonl` sensor streams) now emits `frame_number` and `capture_ns` instead of `frame` and `timestamp_ns`. `channels` and the optional `device_timestamp_ns` are unchanged.
+- **BREAKING:** `StreamWriter` (`*.timestamps.jsonl` per-frame video timestamp sidecars) now emits `frame_number` and `capture_ns` instead of `frame` and `timestamp_ns`. `uncertainty_ns` is unchanged.
+- `SyncFieldVersion.current` bumped to `0.5.0`.
+
+### Migration
+- Recordings produced by 0.4.x or earlier are NOT readable by the SyncField server's strict loaders without a key rename. New recordings produced by 0.5.0 work end-to-end with `syncfield-app` (Python server) `load_sensor_jsonl` and `FrameTimestamp.from_dict`.
+
 ## [0.4.0] — 2026-04-28
 
 First-class hand FOV quality monitoring for egocentric recordings.

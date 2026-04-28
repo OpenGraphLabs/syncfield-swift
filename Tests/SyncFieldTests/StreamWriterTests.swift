@@ -19,8 +19,8 @@ final class StreamWriterTests: XCTestCase {
         XCTAssertEqual(lines.count, 2)
 
         let first = try JSONSerialization.jsonObject(with: Data(lines[0].utf8)) as! [String: Any]
-        XCTAssertEqual(first["frame"] as? Int, 0)
-        XCTAssertEqual(first["timestamp_ns"] as? UInt64, 1_000)
+        XCTAssertEqual(first["frame_number"] as? Int, 0)
+        XCTAssertEqual(first["capture_ns"] as? UInt64, 1_000)
         XCTAssertEqual(first["uncertainty_ns"] as? UInt64, 5_000_000)
     }
 }
