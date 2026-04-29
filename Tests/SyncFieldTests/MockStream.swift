@@ -8,6 +8,7 @@ actor MockStream: SyncFieldStream {
     // SyncFieldStream protocol requires these nonisolated
     nonisolated let streamId: String
     nonisolated let capabilities: StreamCapabilities
+    let stopKind: String
 
     enum FailAt { case none, prepare, connect, start, stop, ingest, disconnect }
     var failAt: FailAt = .none
@@ -17,9 +18,12 @@ actor MockStream: SyncFieldStream {
     var recording = false
     var ingested  = false
 
-    init(streamId: String, requiresIngest: Bool = false) {
+    init(streamId: String, requiresIngest: Bool = false, kind: String = "sensor") {
         self.streamId = streamId
-        self.capabilities = StreamCapabilities(requiresIngest: requiresIngest)
+        self.capabilities = StreamCapabilities(
+            requiresIngest: requiresIngest,
+            producesFile: kind == "video")
+        self.stopKind = kind
     }
 
     func setFailAt(_ f: FailAt) { self.failAt = f }
@@ -42,7 +46,7 @@ actor MockStream: SyncFieldStream {
     func stopRecording() async throws -> StreamStopReport {
         if failAt == .stop { throw TestError.boom }
         recording = false
-        return StreamStopReport(streamId: streamId, frameCount: 0, kind: "sensor")
+        return StreamStopReport(streamId: streamId, frameCount: 0, kind: stopKind)
     }
 
     func ingest(into dir: URL, progress: @Sendable (Double) -> Void) async throws -> StreamIngestReport {
