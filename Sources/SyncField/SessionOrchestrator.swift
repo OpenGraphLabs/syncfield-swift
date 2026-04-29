@@ -232,7 +232,7 @@ public actor SessionOrchestrator {
             Dictionary(uniqueKeysWithValues: reports.map { r in
                 (r.streamId, .success(StreamIngestReport(
                     streamId: r.streamId,
-                    filePath: nil,
+                    filePath: Self.defaultFilePath(streamId: r.streamId, kind: r.kind),
                     frameCount: r.frameCount)))
             })
         try? writeManifest(from: manifestResults)
@@ -355,7 +355,9 @@ public actor SessionOrchestrator {
             let report = (try? results[s.streamId]?.get()) ?? nil
             return Manifest.StreamEntry(
                 streamId: s.streamId,
-                filePath: report?.filePath ?? "\(s.streamId).jsonl",
+                filePath: report?.filePath ?? Self.defaultFilePath(
+                    streamId: s.streamId,
+                    kind: s.capabilities.producesFile ? "video" : "sensor"),
                 frameCount: report?.frameCount ?? 0,
                 kind: s.capabilities.producesFile ? "video" : "sensor",
                 capabilities: s.capabilities)
@@ -368,6 +370,10 @@ public actor SessionOrchestrator {
         try ManifestWriter.write(
             manifest,
             to: episodeDirectory.appendingPathComponent("manifest.json"))
+    }
+
+    private static func defaultFilePath(streamId: String, kind: String) -> String {
+        kind == "video" ? "\(streamId).mp4" : "\(streamId).jsonl"
     }
 }
 
