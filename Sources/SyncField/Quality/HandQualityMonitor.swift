@@ -129,47 +129,80 @@ public actor HandQualityMonitor {
 
     // MARK: assignment
 
+    /// Match observations to L/R sides using a weighted cost matrix that
+    /// combines three signals — none of them load-bearing on its own:
+    ///
+    /// 1. **Chirality cost** (weight 1.0). MediaPipe's per-frame Left/
+    ///    Right label, only trusted past ``chiralityConfidenceMin``.
+    ///    Match → 0; mismatch above threshold → 1; below threshold → 0.5
+    ///    (no signal). MediaPipe flips chirality between frames in
+    ///    egocentric view often enough that this can never be a hard
+    ///    gate; pairing it with the two signals below makes flips cost
+    ///    more than they pay in score.
+    /// 2. **Spatial cost** (weight 1.5 when memory fresh, 0 otherwise).
+    ///    Normalized distance from this side's cached wrist to the
+    ///    candidate observation's wrist, scaled to [0,1] over the
+    ///    diagonal. Drops out completely when the side's wrist memory
+    ///    has expired or never existed — preventing a stale anchor from
+    ///    pulling a fresh observation onto the wrong side.
+    /// 3. **Ego-cam position prior** (weight 0.4). In a chest- or head-
+    ///    mounted ego camera the user's left wrist sits in the left
+    ///    half of the (oriented) frame and the right wrist in the right
+    ///    half. Soft preference: |wrist.x - 0.25| for left, |wrist.x -
+    ///    0.75| for right. This is the tie-breaker that recovers the
+    ///    correct identity when the wrist memory has been invalidated
+    ///    (post-OOF) and chirality is uncertain — exactly the failure
+    ///    mode the previous algorithm hit.
     private func assignToSides(_ obs: [HandObservation], monotonicNs: UInt64)
         -> (HandObservation?, HandObservation?) {
-        // Try chirality first when confident enough.
-        let allConfidentChirality = obs.allSatisfy {
-            $0.chirality != nil && $0.chiralityConfidence >= config.chiralityConfidenceMin
-        }
-        if allConfidentChirality && !obs.isEmpty {
-            let l = obs.first(where: { $0.chirality == .left })
-            let r = obs.first(where: { $0.chirality == .right })
-            return (l, r)
-        }
-        // Spatial-continuity fallback
-        guard config.spatialContinuityFallback else { return (nil, nil) }
         if obs.isEmpty { return (nil, nil) }
         if obs.count == 1 {
-            let one = obs[0]
-            if let ch = one.chirality, one.chiralityConfidence >= config.chiralityConfidenceMin {
-                return ch == .left ? (one, nil) : (nil, one)
-            }
-            if let w = one.wrist {
-                let dl = leftState.lastWrist.map { distance($0, w) } ?? .infinity
-                let dr = rightState.lastWrist.map { distance($0, w) } ?? .infinity
-                return dl < dr ? (one, nil) : (nil, one)
-            }
-            return (nil, nil)
+            let o = obs[0]
+            let cL = pairCost(o, side: .left, monotonicNs: monotonicNs)
+            let cR = pairCost(o, side: .right, monotonicNs: monotonicNs)
+            return cL <= cR ? (o, nil) : (nil, o)
         }
-        // 2 observations, both with chirality unknown / low confidence.
         let a = obs[0], b = obs[1]
-        let aw = a.wrist ?? .zero
-        let bw = b.wrist ?? .zero
-        let lastL = leftState.lastWrist
-        let lastR = rightState.lastWrist
-        let costAtoL = lastL.map { distance($0, aw) } ?? 1.0
-        let costAtoR = lastR.map { distance($0, aw) } ?? 1.0
-        let costBtoL = lastL.map { distance($0, bw) } ?? 1.0
-        let costBtoR = lastR.map { distance($0, bw) } ?? 1.0
-        if (costAtoL + costBtoR) <= (costAtoR + costBtoL) {
-            return (a, b)
+        let pairAtoL = pairCost(a, side: .left, monotonicNs: monotonicNs)
+                     + pairCost(b, side: .right, monotonicNs: monotonicNs)
+        let pairAtoR = pairCost(a, side: .right, monotonicNs: monotonicNs)
+                     + pairCost(b, side: .left, monotonicNs: monotonicNs)
+        return pairAtoL <= pairAtoR ? (a, b) : (b, a)
+    }
+
+    private func pairCost(_ o: HandObservation,
+                          side: HandSide,
+                          monotonicNs: UInt64) -> Double {
+        let s = (side == .left) ? leftState : rightState
+        // Chirality cost.
+        let chiralityCost: Double
+        if let ch = o.chirality, o.chiralityConfidence >= config.chiralityConfidenceMin {
+            chiralityCost = (ch == side) ? 0.0 : 1.0
         } else {
-            return (b, a)
+            chiralityCost = 0.5
         }
+        // Spatial cost (only when wrist memory is fresh AND the candidate has a wrist).
+        let spatialWeight: Double
+        let spatialCost: Double
+        if let lw = s.lastWrist,
+           monotonicNs <= s.wristMemoryExpiresNs,
+           let w = o.wrist {
+            let d = distance(lw, w)
+            spatialCost = min(1.0, d / 1.41421356)
+            spatialWeight = 1.5
+        } else {
+            spatialCost = 0.0
+            spatialWeight = 0.0
+        }
+        // Ego-cam prior. Soft preference toward left/right half by wrist x.
+        let priorCost: Double
+        if let w = o.wrist {
+            let target: Double = (side == .left) ? 0.25 : 0.75
+            priorCost = abs(w.x - target)   // range [0, 0.75]
+        } else {
+            priorCost = 0.5
+        }
+        return 1.0 * chiralityCost + spatialWeight * spatialCost + 0.4 * priorCost
     }
 
     private func distance(_ a: SIMD2<Double>, _ b: SIMD2<Double>) -> Double {
@@ -184,7 +217,6 @@ public actor HandQualityMonitor {
                            frame: Int,
                            monotonicNs: UInt64) async {
         let inGrace = monotonicNs < startupGraceUntilNs
-        let status = instantaneousStatus(for: observation)
 
         var s = (side == .left) ? leftState : rightState
 
@@ -194,6 +226,13 @@ public actor HandQualityMonitor {
         } else if monotonicNs > s.wristMemoryExpiresNs {
             s.lastWrist = nil
         }
+
+        // Resolve instantaneous status using the (possibly-updated) cached
+        // wrist so a missing observation backed by a fresh in-frame wrist
+        // is treated as occlusion, not exit.
+        let status = instantaneousStatus(observation: observation,
+                                         sideState: s,
+                                         monotonicNs: monotonicNs)
 
         // While in startup grace, don't transition. Just keep pendingState
         // tracking the latest status so the dwell counter is fresh when grace ends.
@@ -247,17 +286,64 @@ public actor HandQualityMonitor {
         if side == .left { leftState = s } else { rightState = s }
     }
 
-    private func instantaneousStatus(for obs: HandObservation?) -> State {
-        guard let o = obs else { return .outOfFrame }
-        guard o.confidentKeypoints.count >= config.minConfidentKeypointsForBbox else {
+    /// Wrist-centric instantaneous status.
+    ///
+    /// Manipulation-heavy egocentric video frequently produces partial
+    /// hand observations: fingers tucked into a grip, one hand occluded
+    /// by the other, the wrist plus a couple of palm-base joints visible
+    /// but most fingertip landmarks gone. The bbox-extent rule the
+    /// previous logic used would either reject those observations
+    /// outright (via ``minConfidentKeypointsForBbox``) or compute a tiny
+    /// jittery bbox that flickered against the proximity threshold.
+    ///
+    /// Instead, judge from a single representative anchor point:
+    /// 1. Prefer the observation's wrist (landmark 0 — last to be
+    ///    occluded during grasp).
+    /// 2. Fall back to the centroid of confident keypoints when wrist is
+    ///    missing but at least one keypoint survived.
+    /// 3. When the detector returned nothing, but a recent wrist position
+    ///    is still cached and that wrist sat well inside the frame
+    ///    interior, hold the previous status (occlusion-hold).
+    /// 4. Otherwise the hand is genuinely gone — ``outOfFrame``.
+    private func instantaneousStatus(observation obs: HandObservation?,
+                                     sideState s: SideState,
+                                     monotonicNs: UInt64) -> State {
+        let m = config.proximityWarningExtentNorm
+
+        if let o = obs {
+            if let w = o.wrist {
+                return classify(point: w, edgeMargin: m)
+            }
+            if !o.confidentKeypoints.isEmpty {
+                let cx = o.confidentKeypoints.map(\.x).reduce(0, +)
+                    / Double(o.confidentKeypoints.count)
+                let cy = o.confidentKeypoints.map(\.y).reduce(0, +)
+                    / Double(o.confidentKeypoints.count)
+                return classify(point: SIMD2(cx, cy), edgeMargin: m)
+            }
             return .outOfFrame
         }
-        let xs = o.confidentKeypoints.map { $0.x }
-        let ys = o.confidentKeypoints.map { $0.y }
-        let minX = xs.min() ?? 0, maxX = xs.max() ?? 1
-        let minY = ys.min() ?? 0, maxY = ys.max() ?? 1
-        let m = config.proximityWarningExtentNorm
-        let near = minX < m || maxX > 1 - m || minY < m || maxY > 1 - m
+
+        // No fresh observation: occlusion-hold using cached wrist.
+        guard config.occlusionHoldEnabled,
+              let lw = s.lastWrist,
+              monotonicNs <= s.wristMemoryExpiresNs else {
+            return .outOfFrame
+        }
+        // If the last known wrist was already at the very edge, the hand
+        // was on its way out — let the OOF debounce run normally.
+        let exit = config.edgeExitMargin
+        if lw.x < exit || lw.x > 1 - exit || lw.y < exit || lw.y > 1 - exit {
+            return .outOfFrame
+        }
+        return classify(point: lw, edgeMargin: m)
+    }
+
+    private func classify(point p: SIMD2<Double>, edgeMargin m: Double) -> State {
+        // Clamp out-of-unit points (rare but possible from oriented
+        // landmarks); a wrist that lies outside [0,1]² is genuinely off-frame.
+        if p.x < 0 || p.x > 1 || p.y < 0 || p.y > 1 { return .outOfFrame }
+        let near = p.x < m || p.x > 1 - m || p.y < m || p.y > 1 - m
         return near ? .nearEdge : .inFrame
     }
 
@@ -310,6 +396,14 @@ public actor HandQualityMonitor {
             s.openOofHandle = h
             s.lastOofStartNs = monotonicNs
             s.oofCount += 1
+            // Invalidate the cached wrist when entering OOF. The
+            // assignment cost matrix would otherwise keep pulling fresh
+            // observations toward this side's stale anchor, even though
+            // the side is no longer "tracked". Identity is re-established
+            // either by chirality (when MediaPipe is confident) or by the
+            // ego-cam position prior on the next frame.
+            s.lastWrist = nil
+            s.wristMemoryExpiresNs = 0
             continuation.yield(.outOfFrameStart(side: side,
                                                 monotonicNs: monotonicNs, frame: frame))
         }

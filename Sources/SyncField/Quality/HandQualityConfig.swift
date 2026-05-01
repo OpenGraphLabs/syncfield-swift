@@ -20,6 +20,19 @@ public struct HandQualityConfig: Sendable, Equatable, Codable {
     public var startupGraceMs: Int
     public var verdictGoodThreshold: Double
     public var verdictRejectThreshold: Double
+    /// When the detector returns no observation for a side but a recent
+    /// wrist position is still cached (within ``wristMemoryMs``) and that
+    /// wrist sat well inside the frame, treat the missing observation as
+    /// an occlusion rather than an exit. Distance from the edge (in
+    /// normalized units) below which a stale wrist is treated as
+    /// ``nearEdge`` rather than ``inFrame`` is governed by
+    /// ``proximityWarningExtentNorm``; once the stale wrist is closer than
+    /// ``edgeExitMargin`` to any edge, occlusion-hold no longer applies and
+    /// the missing observation flows through to OOF.
+    public var occlusionHoldEnabled: Bool
+    /// If a stale wrist is within this normalized distance of any frame
+    /// edge, occlusion-hold does NOT apply (the hand was on its way out).
+    public var edgeExitMargin: Double
 
     public init(enabled: Bool = true,
                 proximityWarningExtentNorm: Double = 0.10,
@@ -32,7 +45,9 @@ public struct HandQualityConfig: Sendable, Equatable, Codable {
                 wristMemoryMs: Int = 1500,
                 startupGraceMs: Int = 1000,
                 verdictGoodThreshold: Double = 0.95,
-                verdictRejectThreshold: Double = 0.80) {
+                verdictRejectThreshold: Double = 0.80,
+                occlusionHoldEnabled: Bool = true,
+                edgeExitMargin: Double = 0.05) {
         self.enabled = enabled
         self.proximityWarningExtentNorm = proximityWarningExtentNorm
         self.oofDebounceMs = oofDebounceMs
@@ -45,6 +60,8 @@ public struct HandQualityConfig: Sendable, Equatable, Codable {
         self.startupGraceMs = startupGraceMs
         self.verdictGoodThreshold = verdictGoodThreshold
         self.verdictRejectThreshold = verdictRejectThreshold
+        self.occlusionHoldEnabled = occlusionHoldEnabled
+        self.edgeExitMargin = edgeExitMargin
     }
 
     public static let `default` = HandQualityConfig()
@@ -62,5 +79,33 @@ public struct HandQualityConfig: Sendable, Equatable, Codable {
         case startupGraceMs = "startup_grace_ms"
         case verdictGoodThreshold = "verdict_good_threshold"
         case verdictRejectThreshold = "verdict_reject_threshold"
+        case occlusionHoldEnabled = "occlusion_hold_enabled"
+        case edgeExitMargin = "edge_exit_margin"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+        self.proximityWarningExtentNorm = try c.decodeIfPresent(
+            Double.self, forKey: .proximityWarningExtentNorm) ?? 0.10
+        self.oofDebounceMs = try c.decodeIfPresent(Int.self, forKey: .oofDebounceMs) ?? 200
+        self.recoveryDebounceMs = try c.decodeIfPresent(Int.self, forKey: .recoveryDebounceMs) ?? 100
+        self.minKeypointConfidence = try c.decodeIfPresent(
+            Double.self, forKey: .minKeypointConfidence) ?? 0.3
+        self.minConfidentKeypointsForBbox = try c.decodeIfPresent(
+            Int.self, forKey: .minConfidentKeypointsForBbox) ?? 5
+        self.spatialContinuityFallback = try c.decodeIfPresent(
+            Bool.self, forKey: .spatialContinuityFallback) ?? true
+        self.chiralityConfidenceMin = try c.decodeIfPresent(
+            Double.self, forKey: .chiralityConfidenceMin) ?? 0.7
+        self.wristMemoryMs = try c.decodeIfPresent(Int.self, forKey: .wristMemoryMs) ?? 1500
+        self.startupGraceMs = try c.decodeIfPresent(Int.self, forKey: .startupGraceMs) ?? 1000
+        self.verdictGoodThreshold = try c.decodeIfPresent(
+            Double.self, forKey: .verdictGoodThreshold) ?? 0.95
+        self.verdictRejectThreshold = try c.decodeIfPresent(
+            Double.self, forKey: .verdictRejectThreshold) ?? 0.80
+        self.occlusionHoldEnabled = try c.decodeIfPresent(
+            Bool.self, forKey: .occlusionHoldEnabled) ?? true
+        self.edgeExitMargin = try c.decodeIfPresent(Double.self, forKey: .edgeExitMargin) ?? 0.05
     }
 }

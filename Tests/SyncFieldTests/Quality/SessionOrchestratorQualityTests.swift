@@ -37,6 +37,11 @@ final class SessionOrchestratorQualityTests: XCTestCase {
         cfg.startupGraceMs = 0
         cfg.oofDebounceMs = 100
         cfg.recoveryDebounceMs = 50
+        // This integration test drives a centred-hand-then-absent timeline
+        // to verify end-to-end OOF wiring; with the production
+        // occlusion-hold default the centred wrist would suppress OOF for
+        // the wrist-memory window, so disable hold for this fixture.
+        cfg.occlusionHoldEnabled = false
 
         let session = SessionOrchestrator(
             hostId: "test-host",
