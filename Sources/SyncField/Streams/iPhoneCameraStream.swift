@@ -74,6 +74,7 @@ public final class iPhoneCameraStream: NSObject, SyncFieldStream, @unchecked Sen
     private let videoQueue = DispatchQueue(label: "syncfield.camera", qos: .userInitiated)
     private let videoOutput = AVCaptureVideoDataOutput()
     private let audioOutput = AVCaptureAudioDataOutput()
+    private var selectedVideoDevice: AVCaptureDevice?
 
     private var assetWriter: AVAssetWriter?
     private var assetWriterInput: AVAssetWriterInput?
@@ -147,6 +148,7 @@ public final class iPhoneCameraStream: NSObject, SyncFieldStream, @unchecked Sen
                                                   "back camera not available"]))
         }
         captureSession.addInput(input)
+        selectedVideoDevice = device
 
         videoOutput.videoSettings = [
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
@@ -316,6 +318,7 @@ public final class iPhoneCameraStream: NSObject, SyncFieldStream, @unchecked Sen
     public func disconnect() async throws {
         #if canImport(AVFoundation)
         captureSession.stopRunning()
+        selectedVideoDevice = nil
         #endif
         await healthBus?.publish(.streamDisconnected(streamId: streamId, reason: "normal"))
     }
@@ -323,6 +326,24 @@ public final class iPhoneCameraStream: NSObject, SyncFieldStream, @unchecked Sen
     // MARK: Frame processor hook
 
     #if canImport(AVFoundation)
+    static func midpointCorrectedTimestampNs(
+        ptsSeconds: Double,
+        exposureSeconds: Double
+    ) -> (captureNs: UInt64, rawPtsNs: UInt64) {
+        let safeExposure = exposureSeconds.isFinite ? max(0.0, exposureSeconds) : 0.0
+        let rawPtsNs = UInt64(max(0.0, ptsSeconds) * 1_000_000_000)
+        let captureNs = UInt64(max(0.0, ptsSeconds + safeExposure / 2.0) * 1_000_000_000)
+        return (captureNs, rawPtsNs)
+    }
+
+    private func currentExposureDurationSeconds() -> Double {
+        #if os(iOS)
+        return selectedVideoDevice?.exposureDuration.seconds ?? 0
+        #else
+        return 0
+        #endif
+    }
+
     public func setFrameProcessor(throttleHz: Double = 0,
                                   _ body: @escaping @Sendable (CMSampleBuffer, Int) -> Void) {
         self.throttleHz = throttleHz
@@ -390,15 +411,19 @@ extension iPhoneCameraStream: AVCaptureVideoDataOutputSampleBufferDelegate,
         if input.isReadyForMoreMediaData {
             input.append(sampleBuffer)
             // PTS is already in the monotonic host-clock domain on iOS (via the
-            // CMClockGetHostTimeClock). Convert seconds -> nanoseconds directly.
-            let seconds = CMTimeGetSeconds(pts)
-            let monoNs = UInt64(seconds * 1_000_000_000)
+            // CMClockGetHostTimeClock). AVFoundation PTS is effectively the
+            // exposure start; VIO wants the optical midpoint, so shift by
+            // half of the active exposure duration.
+            let stamp = Self.midpointCorrectedTimestampNs(
+                ptsSeconds: CMTimeGetSeconds(pts),
+                exposureSeconds: currentExposureDurationSeconds()
+            )
             let frame = frameCount
             frameCount += 1
             let w = stampWriter
             Task {
                 try? await w?.append(frame: frame,
-                                     monotonicNs: monoNs,
+                                     monotonicNs: stamp.captureNs,
                                      uncertaintyNs: 1_000_000)
             }
         }

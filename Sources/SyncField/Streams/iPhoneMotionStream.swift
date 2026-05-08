@@ -13,6 +13,7 @@ public final class iPhoneMotionStream: SyncFieldStream, @unchecked Sendable {
     private let queue = DispatchQueue(label: "syncfield.motion", qos: .userInitiated)
 
     private var writer: SensorWriter?
+    private var writerPump: SensorWriterPump?
     private var clock: SessionClock?
     private var frameCount = 0
     private var healthBus: HealthBus?
@@ -45,7 +46,9 @@ public final class iPhoneMotionStream: SyncFieldStream, @unchecked Sendable {
 
     public func startRecording(clock: SessionClock,
                                writerFactory: WriterFactory) async throws {
-        self.writer = try writerFactory.makeSensorWriter(streamId: streamId)
+        let writer = try writerFactory.makeSensorWriter(streamId: streamId)
+        self.writer = writer
+        self.writerPump = SensorWriterPump(label: "syncfield.device-motion.writer")
         self.clock = clock
         self.frameCount = 0
 
@@ -63,9 +66,11 @@ public final class iPhoneMotionStream: SyncFieldStream, @unchecked Sendable {
         #if os(iOS)
         manager.stopDeviceMotionUpdates()
         #endif
+        writerPump?.flush()
         try await writer?.close()
         let n = frameCount
         writer = nil
+        writerPump = nil
         return StreamStopReport(streamId: streamId, frameCount: n, kind: "sensor")
     }
 
@@ -82,7 +87,9 @@ public final class iPhoneMotionStream: SyncFieldStream, @unchecked Sendable {
 
     #if os(iOS)
     private func handle(_ motion: CMDeviceMotion) {
-        guard let clock = clock, let writer = writer else { return }
+        guard let clock = clock, let writer = writer, let writerPump = writerPump else {
+            return
+        }
         // CMDeviceMotion.timestamp is seconds since device boot (monotonic).
         // Multiply by 1e9 for ns.
         let ns = UInt64(motion.timestamp * 1_000_000_000)
@@ -101,11 +108,11 @@ public final class iPhoneMotionStream: SyncFieldStream, @unchecked Sendable {
             "gravity_y": motion.gravity.y,
             "gravity_z": motion.gravity.z,
         ]
-        Task { [writer] in
-            try? await writer.append(frame: frame, monotonicNs: ns,
-                                     channels: channels,
-                                     deviceTimestampNs: nil)
-        }
+        writerPump.append(writer: writer,
+                          frame: frame,
+                          monotonicNs: ns,
+                          channels: channels,
+                          deviceTimestampNs: nil)
     }
     #endif
 }
