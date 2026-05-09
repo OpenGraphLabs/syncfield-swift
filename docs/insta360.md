@@ -101,9 +101,19 @@ The BLE ACK monotonic timestamp in `<streamId>.anchor.json` lets the SyncField s
 
 Full view controller example: [`examples/ego-plus-wrist/EgoWristViewController.swift`](../examples/ego-plus-wrist/EgoWristViewController.swift).
 
+## Multi-camera
+
+Add multiple `Insta360CameraStream` instances with distinct `streamId`s to the same `SessionOrchestrator`. `connect()` pairs them in turn (each stream automatically skips the camera the previous one already claimed); `startRecording()` triggers all of them atomically; `ingest()` downloads them sequentially, switching the iPhone Wi-Fi between camera APs and restoring the previous network in between. Tested with two Go 3S.
+
+```swift
+let wristL = Insta360CameraStream(streamId: "cam_wrist_left")
+let wristR = Insta360CameraStream(streamId: "cam_wrist_right")
+try await session.add(wristL)
+try await session.add(wristR)
+```
+
 ## Gotchas
 
 - **Wi-Fi rejoin prompt**. iOS shows a system prompt the first time the app applies a hotspot config. If the user declines, `ingest()` throws `Insta360Error.hotspotApplyFailed`.
-- **One camera per session**. This module pairs a single Go 3S at a time. Multiple wrist cameras require sequential sessions.
 - **Self stopped capture**. If the camera halts recording itself (overheat, full storage), `stopRecording()` may throw `commandFailed`. Surface the error to the user, do not retry blindly.
 - **Version pinning**. `SyncFieldInsta360.version` re-exports `SyncFieldVersion.current`, so the optional module always tracks the core release.

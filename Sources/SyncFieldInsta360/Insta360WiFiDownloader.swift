@@ -41,53 +41,130 @@ public final class Insta360WiFiDownloader: @unchecked Sendable {
                          to destination: URL,
                          ssid: String,
                          passphrase: String,
-                         progress: @Sendable (Double) -> Void) async throws -> Int64 {
+                         progress: @escaping @Sendable (Double) -> Void) async throws -> Int64 {
         try await applyHotspot(ssid: ssid, passphrase: passphrase)
-        defer {
-            // Belt-and-suspenders: explicit removal in addition to joinOnce=true.
-            // Runs on both success and failure / cancellation paths.
-            NEHotspotConfigurationManager.shared.removeConfiguration(forSSID: ssid)
-            INSCameraManager.socket().shutdown()
-            NSLog("[WiFiDownloader] Hotspot config removed + SDK socket shut down (ssid=\(ssid))")
+
+        // Explicit cleanup (not `defer`): `defer` can't await, and iOS needs
+        // a beat after `removeConfiguration` to actually disassociate from
+        // the camera AP and rejoin a saved Wi-Fi. Without the wait the device
+        // stays on `<camera>.OSC` until the user manually toggles Wi-Fi.
+        // Critical for multi-camera (cam1 → cam2 switch) and for any host
+        // app that needs internet immediately after `ingest()` returns.
+        var downloadError: Error?
+        var bytes: Int64 = 0
+        do {
+            // 8 attempts × 1 s. The AP's DHCP IP appears 1–5 s after
+            // `apply` resolves; the previous 3-attempt budget was fragile
+            // when iOS took longer to swing the default route.
+            try await waitForReachability(attempts: 8)
+
+            NSLog("[WiFiDownloader] Camera reachable — connecting SDK socket")
+            INSCameraManager.socket().setup()
+            try await Task.sleep(nanoseconds: 500_000_000) // 0.5 s for socket init
+            INSCameraManager.socket().commandsImpl.sendHeartbeats(with: nil)
+
+            bytes = try await fetchResource(remoteFileURI: remoteFileURI,
+                                            destination: destination,
+                                            progress: progress)
+        } catch {
+            downloadError = error
         }
 
-        try await waitForReachability(attempts: 3)
+        NEHotspotConfigurationManager.shared.removeConfiguration(forSSID: ssid)
+        INSCameraManager.socket().shutdown()
+        NSLog("[WiFiDownloader] Hotspot removed + SDK socket shut down (ssid=\(ssid))")
+        try? await waitForSystemWiFiRestore(away: cameraHost)
 
-        NSLog("[WiFiDownloader] Camera reachable — connecting SDK socket")
-        INSCameraManager.socket().setup()
-        try await Task.sleep(nanoseconds: 500_000_000) // 0.5 s for socket init
-        INSCameraManager.socket().commandsImpl.sendHeartbeats(with: nil)
-
-        return try await fetchResource(remoteFileURI: remoteFileURI,
-                                       destination: destination,
-                                       progress: progress)
+        if let error = downloadError { throw error }
+        return bytes
     }
 
     // MARK: - Hotspot
 
+    /// Two-attempt wrapper: iOS occasionally rejects the first apply with an
+    /// `internal` / `system` error code while it's still releasing a
+    /// previous hotspot config (most often the previous camera's during a
+    /// multi-camera batch). A single retry after a brief settle window
+    /// almost always succeeds.
     private func applyHotspot(ssid: String, passphrase: String) async throws {
+        var lastError: Error?
+        for attempt in 1...2 {
+            do {
+                try await applyHotspotOnce(ssid: ssid, passphrase: passphrase)
+                if attempt > 1 {
+                    NSLog("[WiFiDownloader] applyHotspot succeeded on attempt \(attempt)")
+                }
+                return
+            } catch {
+                lastError = error
+                NSLog("[WiFiDownloader] applyHotspot attempt \(attempt)/2 failed: \(error.localizedDescription)")
+                if attempt < 2 {
+                    NEHotspotConfigurationManager.shared.removeConfiguration(forSSID: ssid)
+                    try? await Task.sleep(nanoseconds: 1_500_000_000)
+                }
+            }
+        }
+        throw lastError ?? Insta360Error.hotspotApplyFailed("apply failed after 2 attempts")
+    }
+
+    /// Single apply attempt wrapped in a 30-second timeout.
+    /// `NEHotspotConfigurationManager.apply` has no built-in deadline; if
+    /// iOS' Wi-Fi state machine deadlocks (most commonly when we
+    /// removeConfiguration for camera N and apply for camera N+1 in quick
+    /// succession), the completion handler never fires and the entire
+    /// `ingest()` would hang forever. 30 s is generous — typical apply is
+    /// ~1–3 s; up to ~10 s when iOS is mid-roaming. Anything longer is
+    /// genuinely stuck and we'd rather surface a clear error than spin.
+    private func applyHotspotOnce(ssid: String, passphrase: String) async throws {
         let config = NEHotspotConfiguration(ssid: ssid, passphrase: passphrase, isWEP: false)
         config.joinOnce = true
 
         NSLog("[WiFiDownloader] Applying NEHotspotConfiguration for SSID=\(ssid)")
-        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-            NEHotspotConfigurationManager.shared.apply(config) { error in
-                if let ns = error as NSError? {
-                    // alreadyAssociated means the device is already on this SSID — not an error.
-                    if ns.domain == NEHotspotConfigurationErrorDomain,
-                       ns.code == NEHotspotConfigurationError.alreadyAssociated.rawValue {
-                        NSLog("[WiFiDownloader] Already associated with \(ssid) — proceeding")
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask {
+                try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+                    NEHotspotConfigurationManager.shared.apply(config) { error in
+                        if let ns = error as NSError? {
+                            // alreadyAssociated means the device is already on this SSID — not an error.
+                            if ns.domain == NEHotspotConfigurationErrorDomain,
+                               ns.code == NEHotspotConfigurationError.alreadyAssociated.rawValue {
+                                NSLog("[WiFiDownloader] Already associated with \(ssid) — proceeding")
+                                cont.resume()
+                                return
+                            }
+                            NSLog("[WiFiDownloader] applyHotspot failed: \(ns.localizedDescription)")
+                            cont.resume(throwing: Insta360Error.hotspotApplyFailed(ns.localizedDescription))
+                            return
+                        }
+                        NSLog("[WiFiDownloader] Hotspot applied for \(ssid)")
                         cont.resume()
-                        return
                     }
-                    NSLog("[WiFiDownloader] applyHotspot failed: \(ns.localizedDescription)")
-                    cont.resume(throwing: Insta360Error.hotspotApplyFailed(ns.localizedDescription))
-                    return
                 }
-                NSLog("[WiFiDownloader] Hotspot applied for \(ssid)")
-                cont.resume()
             }
+            group.addTask {
+                try await Task.sleep(nanoseconds: 30_000_000_000) // 30 s
+                throw Insta360Error.hotspotApplyFailed("apply timed out after 30 s (iOS Wi-Fi state stuck)")
+            }
+            defer { group.cancelAll() }
+            try await group.next()
         }
+    }
+
+    /// Poll until the camera AP is no longer reachable — a practical signal
+    /// that iOS has disassociated and is free to either rejoin a saved
+    /// Wi-Fi or fall back to cellular. Capped short because between cameras
+    /// in a multi-camera batch we don't need full home-Wi-Fi rejoin; the
+    /// next camera's `applyHotspot` overrides immediately.
+    private func waitForSystemWiFiRestore(away cameraHost: String) async throws {
+        let deadline = DispatchTime.now().uptimeNanoseconds + 3_000_000_000
+        while DispatchTime.now().uptimeNanoseconds < deadline {
+            if !(await isHostReachable(host: cameraHost, port: cameraPort)) {
+                NSLog("[WiFiDownloader] Camera AP no longer reachable — network restored")
+                return
+            }
+            try? await Task.sleep(nanoseconds: 300_000_000) // 300 ms
+        }
+        NSLog("[WiFiDownloader] Gave up waiting for Wi-Fi restore after 3 s")
     }
 
     // MARK: - Reachability
@@ -137,7 +214,7 @@ public final class Insta360WiFiDownloader: @unchecked Sendable {
 
     private func fetchResource(remoteFileURI: String,
                                destination: URL,
-                               progress: @Sendable (Double) -> Void) async throws -> Int64 {
+                               progress: @escaping @Sendable (Double) -> Void) async throws -> Int64 {
         NSLog("[WiFiDownloader] Downloading \(remoteFileURI) → \(destination.path)")
         try FileManager.default.createDirectory(
             at: destination.deletingLastPathComponent(),

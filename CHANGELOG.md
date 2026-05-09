@@ -2,6 +2,33 @@
 
 All notable changes to **syncfield-swift** are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.1] — 2026-05-09
+
+Production hardening for `SyncFieldInsta360`. The `#if canImport(INSCameraServiceSDK)` block was previously type-checked only when a host app linked the binary; this release ports the four fixes that the egonaut/og-skill production fork validated against real-world Go 3S usage (single and dual camera).
+
+### Fixed
+- **`SyncFieldInsta360` would not compile when the Insta360 SDK was linked.** `Insta360WiFiDownloader.download(...)` and `fetchResource(...)` declared `progress` as non-escaping but passed it into the SDK's escaping completion handler. Both now take `@escaping @Sendable (Double) -> Void`. `Insta360CameraStream.ingest(...)` bridges the protocol's non-escaping `progress` with `withoutActuallyEscaping` — no protocol change required.
+- **iPhone got stuck on the camera AP after `ingest()`.** The previous `defer` cleanup ran `removeConfiguration` but couldn't `await`, so iOS had no time to disassociate from the camera SSID and rejoin a saved Wi-Fi. `defer` is now an explicit cleanup block that awaits a short reachability poll (`waitForSystemWiFiRestore`) before returning.
+- **`waitForReachability` budget too tight (3 attempts).** The camera AP's DHCP-assigned IP appears 1–5 s after `apply` resolves; bumped to 8 attempts. Eliminates the intermittent `cameraNotReachable` flake on slower iOS Wi-Fi state transitions.
+- **`applyHotspot` could hang forever.** `NEHotspotConfigurationManager.apply` has no built-in deadline; if iOS' Wi-Fi state machine deadlocks (most common on a back-to-back camera-A→camera-B switch in a multi-camera batch), the completion handler never fires. `applyHotspot` now wraps each attempt in a 30 s timeout and retries once after a settle window — covers the transient `internal` / `system` errors iOS surfaces while it's still releasing the previous hotspot config.
+- **Two `Insta360CameraStream` instances could pair to the same camera.** `Insta360BLEController.pair()` now consults a process-wide registry of already-paired UUIDs and skips them during scan. Public API unchanged. Multi-camera (e.g. ego + wrist) now works by simply adding multiple `Insta360CameraStream` instances to one `SessionOrchestrator`.
+
+### Changed
+- `SyncFieldVersion.current` bumped to `0.6.1`. (Version string was unintentionally left at `0.5.0` in 0.6.0; this release also corrects that.)
+- README's `Info.plist` table now lists `NSLocalNetworkUsageDescription` for `Insta360CameraStream`. Required on iOS 14+ for the camera HTTP server (192.168.42.1) and was already documented in `docs/insta360.md`.
+
+### Compatibility
+- Source-compatible. No public API changes; existing call sites that worked with 0.6.0 continue to compile. The `progress` parameter type changed from non-escaping to `@escaping` on two `Insta360WiFiDownloader` methods, but `@escaping` is purely additive at call sites.
+- Output format unchanged.
+
+## [0.6.0] — 2026-05-05
+
+### Added
+- `iPhoneRawIMUStream` — direct accelerometer / gyroscope / magnetometer streams at the device's native sampling rate, complementing the fused `iPhoneMotionStream`.
+
+### Known issue (fixed in 0.6.1)
+- `SyncFieldInsta360` does not compile when `INSCameraServiceSDK.xcframework` is linked into the host target. Upgrade to 0.6.1.
+
 ## [0.5.0] — 2026-04-29
 
 JSONL field names now match the SyncField server schema. The previous `frame` / `timestamp_ns` keys produced by both writers caused `Sensor load failed for imu: 'capture_ns'` server-side, dropping the IMU stream and tripping the "fewer than 2 streams" guard for any single-camera-plus-IMU recording.

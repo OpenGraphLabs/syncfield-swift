@@ -20,7 +20,7 @@ Swift SDK for [SyncField](https://opengraphlabs.com) multi-stream synchronized r
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/OpenGraphLabs/syncfield-swift.git", from: "0.3.0"),
+    .package(url: "https://github.com/OpenGraphLabs/syncfield-swift.git", from: "0.6.1"),
 ],
 targets: [
     .target(
@@ -44,7 +44,7 @@ Add the keys for the streams you actually use.
 | `iPhoneCameraStream` | `NSCameraUsageDescription`, `NSMicrophoneUsageDescription` |
 | `iPhoneMotionStream` | `NSMotionUsageDescription` |
 | `TactileStream` | `NSBluetoothAlwaysUsageDescription` |
-| `Insta360CameraStream` | `NSBluetoothAlwaysUsageDescription`, `NSLocationWhenInUseUsageDescription`, plus the **Hotspot Configuration** capability |
+| `Insta360CameraStream` | `NSBluetoothAlwaysUsageDescription`, `NSLocationWhenInUseUsageDescription`, `NSLocalNetworkUsageDescription`, plus the **Hotspot Configuration** capability |
 
 A `PrivacyInfo.xcprivacy` manifest is shipped inside each target — your App Store submission inherits it automatically.
 

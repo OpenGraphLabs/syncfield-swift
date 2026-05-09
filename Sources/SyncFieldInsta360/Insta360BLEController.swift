@@ -25,6 +25,36 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
     /// The single camera device that is currently BLE-connected.
     private var connectedDevice: INSBluetoothDevice?
 
+    // MARK: - Process-wide pair registry
+    //
+    // Multi-camera support (e.g. two `Insta360CameraStream` instances in one
+    // `SessionOrchestrator`) requires that a second `pair()` call doesn't
+    // re-claim the camera the first call already paired. iOS' BLE keeps a
+    // connected peripheral discoverable in subsequent scans, so without an
+    // exclusion check both controllers would race to grab the same device.
+    //
+    // Tracked at process scope (static) because each `Insta360CameraStream`
+    // owns its own controller and the orchestrator instantiates them
+    // independently — there's no shared owner to thread the set through.
+
+    private static let pairRegistryLock = NSLock()
+    private static var pairedUUIDs = Set<String>()
+
+    private static func currentlyPairedUUIDs() -> Set<String> {
+        pairRegistryLock.lock(); defer { pairRegistryLock.unlock() }
+        return pairedUUIDs
+    }
+
+    private static func registerPaired(_ uuid: String) {
+        pairRegistryLock.lock(); defer { pairRegistryLock.unlock() }
+        pairedUUIDs.insert(uuid)
+    }
+
+    private static func unregisterPaired(_ uuid: String) {
+        pairRegistryLock.lock(); defer { pairRegistryLock.unlock() }
+        pairedUUIDs.remove(uuid)
+    }
+
     // MARK: - Lifecycle
 
     override public init() {
@@ -63,7 +93,11 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
             throw Insta360Error.commandFailed("Bluetooth not ready")
         }
 
-        // Scan briefly for the first Go camera.
+        // Scan briefly for the first Go camera not already paired by another
+        // controller in this process. The `excluding` snapshot is taken once
+        // before the scan starts; concurrent pair() calls from sibling
+        // streams are serialised by the SessionOrchestrator's connect loop.
+        let excluding = Self.currentlyPairedUUIDs()
         let device = try await withTimeout(seconds: 15) {
             try await withCheckedThrowingContinuation { (cont: CheckedContinuation<INSBluetoothDevice, Error>) in
                 var found = false
@@ -71,9 +105,10 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
                     guard let self = self, !found else { return }
                     let name = device.name ?? ""
                     guard name.lowercased().contains("go") else { return }
+                    let deviceId = device.identifierUUIDStringSafe
+                    guard !excluding.contains(deviceId) else { return }
                     found = true
                     self.bluetoothManager.stopScan()
-                    let deviceId = device.identifierUUIDStringSafe
                     self.scannedDevices[deviceId] = device
                     cont.resume(returning: device)
                 }
@@ -94,6 +129,7 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
         }
 
         connectedDevice = device
+        Self.registerPaired(device.identifierUUIDStringSafe)
 
         // Let the connection stabilise.
         try await Task.sleep(nanoseconds: 1_000_000_000)
@@ -103,8 +139,10 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
     /// Disconnect the active BLE session.
     public func unpair() async throws {
         guard let device = connectedDevice else { return }
+        let uuid = device.identifierUUIDStringSafe
         bluetoothManager.disconnectDevice(device)
         connectedDevice = nil
+        Self.unregisterPaired(uuid)
         NSLog("[Insta360BLE] Unpaired")
     }
 
@@ -262,8 +300,10 @@ extension Insta360BLEController: INSBluetoothManagerDelegate {
 
     public func device(_ device: INSBluetoothDevice, didDisconnectWithError error: Error?) {
         NSLog("[Insta360BLE] Device disconnected: \(device.name ?? "unknown"), error: \(error?.localizedDescription ?? "none")")
-        if connectedDevice?.identifierUUIDStringSafe == device.identifierUUIDStringSafe {
+        let uuid = device.identifierUUIDStringSafe
+        if connectedDevice?.identifierUUIDStringSafe == uuid {
             connectedDevice = nil
+            Insta360BLEController.unregisterPaired(uuid)
         }
     }
 }
