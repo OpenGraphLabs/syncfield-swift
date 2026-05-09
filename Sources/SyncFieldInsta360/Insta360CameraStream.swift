@@ -85,13 +85,20 @@ public final class Insta360CameraStream: SyncFieldStream, @unchecked Sendable {
         let creds = try await ble.wifiCredentials()
 
         // 2. Switch iPhone onto the camera's AP, download the clip, restore previous WiFi.
+        //    `wifi.download`'s `progress` is `@escaping` (it gets stored by
+        //    the Insta360 SDK's HTTP socket and called asynchronously).
+        //    Our `progress` parameter is non-escaping per the SyncFieldStream
+        //    protocol, so wrap with `withoutActuallyEscaping` — safe because
+        //    `wifi.download` only invokes the callback during its own await.
         let destination = episodeDirectory.appendingPathComponent("\(streamId).mp4")
-        let _ = try await wifi.download(
-            remoteFileURI: uri,
-            to: destination,
-            ssid: creds.ssid,
-            passphrase: creds.passphrase,
-            progress: progress)
+        try await withoutActuallyEscaping(progress) { escaping in
+            _ = try await wifi.download(
+                remoteFileURI: uri,
+                to: destination,
+                ssid: creds.ssid,
+                passphrase: creds.passphrase,
+                progress: escaping)
+        }
 
         // 3. Persist BLE-ACK anchor so the server can align camera-internal PTS
         //    against host monotonic ns.
