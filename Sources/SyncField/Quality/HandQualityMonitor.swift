@@ -44,6 +44,14 @@ public actor HandQualityMonitor {
         var pendingSinceNs: UInt64 = 0
         var lastWrist: SIMD2<Double>? = nil
         var wristMemoryExpiresNs: UInt64 = 0
+        /// Sticky "deepest known interior" anchor for FP-cue suppression.
+        /// Refreshed only when an observation arrives with a wrist that is
+        /// further than ``HandQualityConfig/interiorAnchorMarginNorm`` from
+        /// any frame edge. Invalidated as soon as a fresh observation lands
+        /// in the edge zone, when the side transitions to ``outOfFrame``,
+        /// or when ``interiorAnchorExpiresNs`` is reached.
+        var lastInteriorWrist: SIMD2<Double>? = nil
+        var interiorAnchorExpiresNs: UInt64 = 0
         var openNearEdgeHandle: EventHandle? = nil
         var openOofHandle: EventHandle? = nil
         var nearEdgeAccumulatedNs: UInt64 = 0
@@ -77,11 +85,21 @@ public actor HandQualityMonitor {
 
     /// Per-frame entry point. Assigns observations to sides, drives the
     /// per-side state machine, writes interval records on transitions.
+    ///
+    /// The detector is configured for ``numHands = 2``, but the cardinality
+    /// prior of egocentric capture (one left + one right at most) is
+    /// enforced here too — anything past the first two observations is
+    /// dropped before assignment. This protects the per-side cost matrix
+    /// from a stray third detection (e.g. a bystander's hand catching the
+    /// frame edge) pulling either side into the wrong status.
     public func ingest(observations: [HandObservation],
                        frame: Int,
                        monotonicNs: UInt64) async {
         guard config.enabled else { return }
-        let (leftObs, rightObs) = assignToSides(observations, monotonicNs: monotonicNs)
+        let capped = observations.count <= 2
+            ? observations
+            : Array(observations.prefix(2))
+        let (leftObs, rightObs) = assignToSides(capped, monotonicNs: monotonicNs)
         await applySide(.left, observation: leftObs, frame: frame, monotonicNs: monotonicNs)
         await applySide(.right, observation: rightObs, frame: frame, monotonicNs: monotonicNs)
     }
@@ -223,8 +241,17 @@ public actor HandQualityMonitor {
         if let w = observation?.wrist {
             s.lastWrist = w
             s.wristMemoryExpiresNs = monotonicNs &+ UInt64(config.wristMemoryMs) * 1_000_000
+            // Maintain the interior anchor: a fresh wrist that is deep
+            // inside the frame refreshes the anchor; a fresh wrist that
+            // has crossed into the edge zone clears it (the hand is on
+            // its way out and edge-zone behavior should now drive OOF).
+            updateInteriorAnchor(side: &s, wrist: w, monotonicNs: monotonicNs)
         } else if monotonicNs > s.wristMemoryExpiresNs {
             s.lastWrist = nil
+        }
+        // Independently expire the interior anchor by its own (longer) timer.
+        if monotonicNs > s.interiorAnchorExpiresNs {
+            s.lastInteriorWrist = nil
         }
 
         // Resolve instantaneous status using the (possibly-updated) cached
@@ -286,6 +313,48 @@ public actor HandQualityMonitor {
         if side == .left { leftState = s } else { rightState = s }
     }
 
+    /// Refresh or invalidate the interior anchor based on a fresh wrist.
+    ///
+    /// The interior anchor is the FP-cue suppression knob: it pins the
+    /// side to ``inFrame`` for the duration of
+    /// ``HandQualityConfig/interiorAnchorHoldMs`` after the last
+    /// confident interior detection, so an occlusion / off-axis pose /
+    /// motion-blur stack that drops the detector for several seconds
+    /// does not fire a false-positive OOF audio cue.
+    ///
+    /// Refresh policy: if the wrist is at least
+    /// ``interiorAnchorMarginNorm`` from every edge → refresh anchor
+    /// (this wrist is unambiguously interior). Otherwise → clear the
+    /// anchor; the hand has crossed into the edge band and the
+    /// existing edge-zone behavior should govern OOF.
+    private func updateInteriorAnchor(side s: inout SideState,
+                                      wrist w: SIMD2<Double>,
+                                      monotonicNs: UInt64) {
+        // Interior anchor is gated by both knobs:
+        //   - ``interiorAnchorHoldMs == 0``  → feature explicitly disabled
+        //   - ``occlusionHoldEnabled == false`` → master "no drop suppression"
+        //     switch (kept consistent with the legacy edge-zone hold so tests
+        //     that flip the master switch still see raw OOF accounting)
+        guard config.interiorAnchorHoldMs > 0,
+              config.occlusionHoldEnabled else {
+            s.lastInteriorWrist = nil
+            s.interiorAnchorExpiresNs = 0
+            return
+        }
+        let margin = config.interiorAnchorMarginNorm
+        let isInterior =
+            w.x >= margin && w.x <= 1 - margin &&
+            w.y >= margin && w.y <= 1 - margin
+        if isInterior {
+            s.lastInteriorWrist = w
+            s.interiorAnchorExpiresNs = monotonicNs
+                &+ UInt64(config.interiorAnchorHoldMs) * 1_000_000
+        } else {
+            s.lastInteriorWrist = nil
+            s.interiorAnchorExpiresNs = 0
+        }
+    }
+
     /// Wrist-centric instantaneous status.
     ///
     /// Manipulation-heavy egocentric video frequently produces partial
@@ -296,15 +365,22 @@ public actor HandQualityMonitor {
     /// outright (via ``minConfidentKeypointsForBbox``) or compute a tiny
     /// jittery bbox that flickered against the proximity threshold.
     ///
-    /// Instead, judge from a single representative anchor point:
+    /// Instead, judge from a single representative anchor point, in this
+    /// priority order:
     /// 1. Prefer the observation's wrist (landmark 0 — last to be
     ///    occluded during grasp).
     /// 2. Fall back to the centroid of confident keypoints when wrist is
     ///    missing but at least one keypoint survived.
-    /// 3. When the detector returned nothing, but a recent wrist position
-    ///    is still cached and that wrist sat well inside the frame
-    ///    interior, hold the previous status (occlusion-hold).
-    /// 4. Otherwise the hand is genuinely gone — ``outOfFrame``.
+    /// 3. **Interior anchor (egocentric FP-cue suppression)**: when the
+    ///    detector returned nothing but a recent *interior-zone* wrist is
+    ///    still within its hold window, force ``inFrame``. This suppresses
+    ///    the false-positive audio cue that would otherwise fire when a
+    ///    cylindrical grip / off-axis pose drops the detector for several
+    ///    seconds even though the hand is physically still in view.
+    /// 4. Edge-zone occlusion-hold: when the detector returned nothing
+    ///    and only a short-lived edge-zone wrist is cached, the hand was
+    ///    on its way out — return ``outOfFrame`` immediately.
+    /// 5. Otherwise the hand is genuinely gone — ``outOfFrame``.
     private func instantaneousStatus(observation obs: HandObservation?,
                                      sideState s: SideState,
                                      monotonicNs: UInt64) -> State {
@@ -324,7 +400,20 @@ public actor HandQualityMonitor {
             return .outOfFrame
         }
 
-        // No fresh observation: occlusion-hold using cached wrist.
+        // No fresh observation. Interior anchor takes precedence over the
+        // shorter assignment-side wrist memory: a hand last seen deep in
+        // the interior is overwhelmingly likely still there but occluded.
+        // Gated by both ``interiorAnchorHoldMs > 0`` and
+        // ``occlusionHoldEnabled`` — see ``updateInteriorAnchor`` for the
+        // rationale on tying the two switches together.
+        if config.interiorAnchorHoldMs > 0,
+           config.occlusionHoldEnabled,
+           s.lastInteriorWrist != nil,
+           monotonicNs <= s.interiorAnchorExpiresNs {
+            return .inFrame
+        }
+
+        // Fall through to the existing edge-zone occlusion-hold path.
         guard config.occlusionHoldEnabled,
               let lw = s.lastWrist,
               monotonicNs <= s.wristMemoryExpiresNs else {
@@ -404,6 +493,11 @@ public actor HandQualityMonitor {
             // ego-cam position prior on the next frame.
             s.lastWrist = nil
             s.wristMemoryExpiresNs = 0
+            // Same reasoning for the interior anchor: once the side has
+            // been declared OOF, any future re-acquisition starts fresh
+            // and must not be suppressed by a stale interior position.
+            s.lastInteriorWrist = nil
+            s.interiorAnchorExpiresNs = 0
             continuation.yield(.outOfFrameStart(side: side,
                                                 monotonicNs: monotonicNs, frame: frame))
         }

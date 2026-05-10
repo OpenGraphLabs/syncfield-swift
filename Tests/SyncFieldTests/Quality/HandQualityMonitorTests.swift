@@ -331,10 +331,17 @@ final class HandQualityMonitorTests: XCTestCase {
 
     /// Once the wrist memory window expires, occlusion-hold releases and
     /// OOF fires.
+    ///
+    /// Note: this exercises the legacy edge-zone wrist memory in
+    /// isolation, so the interior anchor (a longer-lived hold introduced
+    /// after this test was written) is explicitly disabled. The interior
+    /// anchor's own expiry behavior is covered by
+    /// ``test_interiorAnchor_releasesAfterHoldMs``.
     func test_occlusionHold_expiresAfterWristMemory() async throws {
         var cfg = HandQualityConfig.default
         cfg.oofDebounceMs = 200
         cfg.wristMemoryMs = 500
+        cfg.interiorAnchorHoldMs = 0
         let m = HandQualityMonitor(
             config: cfg,
             recordingStartMonotonicNs: 0,
@@ -360,6 +367,184 @@ final class HandQualityMonitorTests: XCTestCase {
     /// A hand observation arriving with no wrist but a couple of confident
     /// palm-region keypoints near the centre should still register
     /// inFrame via the centroid fallback.
+    // MARK: - interior anchor (FP-cue suppression)
+
+    /// Egocentric seed-clip case: the user grips a vacuum stick / reaches
+    /// into a closet. MediaPipe loses the left hand entirely for several
+    /// seconds, even though the wrist was last seen near the centre of the
+    /// frame and the hand is physically still there. The interior anchor
+    /// must hold the side as inFrame for the full ``interiorAnchorHoldMs``
+    /// window so the audio cue does not fire.
+    func test_interiorAnchor_holdsThroughLongOcclusionAtCenter() async throws {
+        let cfg = HandQualityConfig.default   // interiorAnchorHoldMs = 8000
+        let m = HandQualityMonitor(
+            config: cfg,
+            recordingStartMonotonicNs: 0,
+            eventWriter: makeWriter()
+        )
+        let task = collect(m.events)
+        let base: UInt64 = 2_000_000_000
+        // Establish both hands at frame centre (deep interior).
+        await m.ingest(observations: [centeredHand(.left), centeredHand(.right)],
+                       frame: 0, monotonicNs: base)
+        // 60 frames × 100 ms = 6000 ms with the left hand missing — 4× the
+        // assignment-side wrist memory (1500 ms default), but still inside
+        // the 8000 ms interior anchor window.
+        for i in 1...60 {
+            await m.ingest(observations: [centeredHand(.right)],
+                           frame: i, monotonicNs: base + UInt64(i) * frameStepNs)
+        }
+        await m.finalize(stopMonotonicNs: base + 61 * frameStepNs, stopFrame: 61)
+        let emitted = await task.value
+        XCTAssertFalse(emitted.contains {
+            if case .outOfFrameStart(.left, _, _) = $0 { return true }
+            return false
+        }, "interior anchor should suppress OOF for left hand last seen at frame centre")
+    }
+
+    /// The interior anchor MUST be invalidated as soon as a fresh
+    /// observation places the wrist into the edge zone — otherwise a hand
+    /// that visibly walks toward the edge and then drops out would be
+    /// pinned IN forever.
+    func test_interiorAnchor_invalidatedByEdgeObservation() async throws {
+        var cfg = HandQualityConfig.default
+        cfg.oofDebounceMs = 200
+        let m = HandQualityMonitor(
+            config: cfg,
+            recordingStartMonotonicNs: 0,
+            eventWriter: makeWriter()
+        )
+        let task = collect(m.events)
+        let base: UInt64 = 2_000_000_000
+        // Step 1: hand at centre — interior anchor armed.
+        await m.ingest(observations: [centeredHand(.left), centeredHand(.right)],
+                       frame: 0, monotonicNs: base)
+        // Step 2: hand walks to the very left edge (well inside
+        // edgeExitMargin = 0.05) — interior anchor must drop AND the
+        // edge-zone path must classify the next missing-observation frame
+        // as outOfFrame so the OOF debounce can fire.
+        let leavingHand = HandObservation(
+            chirality: .left,
+            chiralityConfidence: 0.95,
+            confidentKeypoints: (0..<10).map { _ in SIMD2(0.02, 0.5) },
+            wrist: SIMD2(0.02, 0.5)
+        )
+        await m.ingest(observations: [leavingHand, centeredHand(.right)],
+                       frame: 1, monotonicNs: base + frameStepNs)
+        // Step 3: hand disappears entirely. Without invalidation in step 2 the
+        // monitor would still consider the side "interior-anchored" and
+        // suppress OOF; with invalidation the edge-zone wrist memory takes
+        // over and OOF fires after the normal debounce.
+        for i in 2...8 {
+            await m.ingest(observations: [centeredHand(.right)],
+                           frame: i, monotonicNs: base + UInt64(i) * frameStepNs)
+        }
+        await m.finalize(stopMonotonicNs: base + 9 * frameStepNs, stopFrame: 9)
+        let emitted = await task.value
+        XCTAssertTrue(emitted.contains {
+            if case .outOfFrameStart(.left, _, _) = $0 { return true }
+            return false
+        }, "OOF must still fire when the last fresh observation was in the edge zone")
+    }
+
+    /// Interior anchor must release after ``interiorAnchorHoldMs`` so a hand
+    /// that genuinely stays out of view longer than the hold still produces
+    /// an OOF event for downstream quality scoring.
+    func test_interiorAnchor_releasesAfterHoldMs() async throws {
+        var cfg = HandQualityConfig.default
+        cfg.interiorAnchorHoldMs = 500    // tighten so the test is fast
+        cfg.wristMemoryMs = 200
+        cfg.oofDebounceMs = 100
+        let m = HandQualityMonitor(
+            config: cfg,
+            recordingStartMonotonicNs: 0,
+            eventWriter: makeWriter()
+        )
+        let task = collect(m.events)
+        let base: UInt64 = 2_000_000_000
+        await m.ingest(observations: [centeredHand(.left), centeredHand(.right)],
+                       frame: 0, monotonicNs: base)
+        // 12 frames × 100 ms = 1200 ms, well past both the 500 ms interior
+        // anchor and the 200 ms assignment memory.
+        for i in 1...12 {
+            await m.ingest(observations: [centeredHand(.right)],
+                           frame: i, monotonicNs: base + UInt64(i) * frameStepNs)
+        }
+        await m.finalize(stopMonotonicNs: base + 13 * frameStepNs, stopFrame: 13)
+        let emitted = await task.value
+        XCTAssertTrue(emitted.contains {
+            if case .outOfFrameStart(.left, _, _) = $0 { return true }
+            return false
+        }, "interior anchor must release after interiorAnchorHoldMs and let OOF fire")
+    }
+
+    /// Disabling the interior anchor (hold = 0) restores the legacy
+    /// behavior — OOF fires after the wrist memory expires regardless of
+    /// where the wrist was last seen.
+    func test_interiorAnchor_disabledByZeroHoldMs() async throws {
+        var cfg = HandQualityConfig.default
+        cfg.interiorAnchorHoldMs = 0      // disabled
+        cfg.wristMemoryMs = 500
+        cfg.oofDebounceMs = 200
+        let m = HandQualityMonitor(
+            config: cfg,
+            recordingStartMonotonicNs: 0,
+            eventWriter: makeWriter()
+        )
+        let task = collect(m.events)
+        let base: UInt64 = 2_000_000_000
+        await m.ingest(observations: [centeredHand(.left), centeredHand(.right)],
+                       frame: 0, monotonicNs: base)
+        for i in 1...12 {
+            await m.ingest(observations: [centeredHand(.right)],
+                           frame: i, monotonicNs: base + UInt64(i) * frameStepNs)
+        }
+        await m.finalize(stopMonotonicNs: base + 13 * frameStepNs, stopFrame: 13)
+        let emitted = await task.value
+        XCTAssertTrue(emitted.contains {
+            if case .outOfFrameStart(.left, _, _) = $0 { return true }
+            return false
+        }, "with interiorAnchorHoldMs=0 the legacy wrist-memory path must drive OOF")
+    }
+
+    /// Cardinality cap: even if the detector hands us 3+ observations in
+    /// one frame (numHands enforcement bug, weird upstream variant), the
+    /// monitor must process at most 1 left + 1 right.
+    func test_ingest_capsObservationsAtTwo() async throws {
+        let m = HandQualityMonitor(
+            config: .default,
+            recordingStartMonotonicNs: 0,
+            eventWriter: makeWriter()
+        )
+        let task = collect(m.events)
+        let base: UInt64 = 2_000_000_000
+        // Three observations: a stray third hand at the bottom edge that, if
+        // not capped, could pollute side assignment.
+        let stray = HandObservation(
+            chirality: .left,
+            chiralityConfidence: 0.95,
+            confidentKeypoints: (0..<10).map { _ in SIMD2(0.5, 0.97) },
+            wrist: SIMD2(0.5, 0.97)
+        )
+        for i in 0..<10 {
+            await m.ingest(observations: [centeredHand(.left), centeredHand(.right), stray],
+                           frame: i, monotonicNs: base + UInt64(i) * frameStepNs)
+        }
+        await m.finalize(stopMonotonicNs: base + 10 * frameStepNs, stopFrame: 10)
+        let emitted = await task.value
+        // The stray bottom-edge hand must NOT pull either side into nearEdge
+        // or OOF. If the cap works, only the two centered observations drive
+        // the state machine.
+        XCTAssertFalse(emitted.contains {
+            if case .nearEdgeStart = $0 { return true }
+            return false
+        })
+        XCTAssertFalse(emitted.contains {
+            if case .outOfFrameStart = $0 { return true }
+            return false
+        })
+    }
+
     func test_partialDetection_noWrist_centroidUsed() async throws {
         let m = HandQualityMonitor(
             config: .default,

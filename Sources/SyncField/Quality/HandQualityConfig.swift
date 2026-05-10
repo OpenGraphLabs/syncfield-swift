@@ -33,6 +33,33 @@ public struct HandQualityConfig: Sendable, Equatable, Codable {
     /// If a stale wrist is within this normalized distance of any frame
     /// edge, occlusion-hold does NOT apply (the hand was on its way out).
     public var edgeExitMargin: Double
+    /// **Egocentric interior anchor** (FP-cue suppression).
+    ///
+    /// In a chest- or head-mounted ego camera the user's hands almost
+    /// always traverse the frame edge before truly leaving. A detection
+    /// drop while the last confident wrist was deep inside the frame is
+    /// therefore overwhelmingly likely to be occlusion (cylindrical grip,
+    /// off-axis pose, motion blur), not a real exit. The interior anchor
+    /// is a separate, longer-lived hold that pins a side to ``inFrame``
+    /// while its last interior wrist is still fresh.
+    ///
+    /// Distinct from ``occlusionHoldEnabled`` / ``wristMemoryMs``, which
+    /// hold a wrist for the *side-assignment* cost matrix and run on a
+    /// shorter clock. The interior anchor only governs the per-side
+    /// ``inFrame`` / ``outOfFrame`` decision.
+    ///
+    /// Set ``interiorAnchorHoldMs`` to 0 to disable.
+    public var interiorAnchorMarginNorm: Double
+    /// How long to hold ``inFrame`` after the last interior-zone wrist
+    /// detection if no further observation arrives. Set to 0 to disable
+    /// the interior anchor entirely (legacy behavior).
+    ///
+    /// Defaults to 8000 ms — long enough to absorb multi-second grip /
+    /// occlusion stacks observed in the seed clip
+    /// (`docs/egocentric-hand-oof-rnd/RESULTS-round-1.md`), short enough
+    /// that a hand truly removed from view for >8 s still produces an
+    /// OOF event for downstream quality scoring.
+    public var interiorAnchorHoldMs: Int
 
     public init(enabled: Bool = true,
                 proximityWarningExtentNorm: Double = 0.10,
@@ -47,7 +74,9 @@ public struct HandQualityConfig: Sendable, Equatable, Codable {
                 verdictGoodThreshold: Double = 0.95,
                 verdictRejectThreshold: Double = 0.80,
                 occlusionHoldEnabled: Bool = true,
-                edgeExitMargin: Double = 0.05) {
+                edgeExitMargin: Double = 0.05,
+                interiorAnchorMarginNorm: Double = 0.20,
+                interiorAnchorHoldMs: Int = 8000) {
         self.enabled = enabled
         self.proximityWarningExtentNorm = proximityWarningExtentNorm
         self.oofDebounceMs = oofDebounceMs
@@ -62,6 +91,8 @@ public struct HandQualityConfig: Sendable, Equatable, Codable {
         self.verdictRejectThreshold = verdictRejectThreshold
         self.occlusionHoldEnabled = occlusionHoldEnabled
         self.edgeExitMargin = edgeExitMargin
+        self.interiorAnchorMarginNorm = interiorAnchorMarginNorm
+        self.interiorAnchorHoldMs = interiorAnchorHoldMs
     }
 
     public static let `default` = HandQualityConfig()
@@ -81,6 +112,8 @@ public struct HandQualityConfig: Sendable, Equatable, Codable {
         case verdictRejectThreshold = "verdict_reject_threshold"
         case occlusionHoldEnabled = "occlusion_hold_enabled"
         case edgeExitMargin = "edge_exit_margin"
+        case interiorAnchorMarginNorm = "interior_anchor_margin_norm"
+        case interiorAnchorHoldMs = "interior_anchor_hold_ms"
     }
 
     public init(from decoder: Decoder) throws {
@@ -107,5 +140,9 @@ public struct HandQualityConfig: Sendable, Equatable, Codable {
         self.occlusionHoldEnabled = try c.decodeIfPresent(
             Bool.self, forKey: .occlusionHoldEnabled) ?? true
         self.edgeExitMargin = try c.decodeIfPresent(Double.self, forKey: .edgeExitMargin) ?? 0.05
+        self.interiorAnchorMarginNorm = try c.decodeIfPresent(
+            Double.self, forKey: .interiorAnchorMarginNorm) ?? 0.20
+        self.interiorAnchorHoldMs = try c.decodeIfPresent(
+            Int.self, forKey: .interiorAnchorHoldMs) ?? 8000
     }
 }
