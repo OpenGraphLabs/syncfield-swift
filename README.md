@@ -20,7 +20,7 @@ Swift SDK for [SyncField](https://opengraphlabs.com) multi-stream synchronized r
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/OpenGraphLabs/syncfield-swift.git", from: "0.7.4"),
+    .package(url: "https://github.com/OpenGraphLabs/syncfield-swift.git", from: "0.7.5"),
 ],
 targets: [
     .target(

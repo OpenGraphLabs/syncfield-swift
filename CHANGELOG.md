@@ -2,6 +2,12 @@
 
 All notable changes to **syncfield-swift** are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.5] — 2026-05-11
+
+### Added
+- `Insta360WiFiDownloader.fetchResource` emits a per-file `[WiFiDownloader.throughput]` log line on completion with elapsed ms, byte count, and MB/s. Required first step for diagnosing slow Pod-docked transfers — without per-file timing it's impossible to attribute "the collect is slow" across the camera radio, the SDK's HTTP layer, and surrounding orchestration (apply hotspot, settle, socket setup).
+- `SyncFieldVersion.current` bumped to `0.7.5`.
+
 ## [0.7.4] — 2026-05-11
 
 ### Fixed
