@@ -35,15 +35,18 @@ The Insta360 SDK license forbids redistributing the binaries. Do not commit them
 3. Open the app target's **Build Settings** and add `TO_B_SDK=1` to **Preprocessor Macros**. This flag is required by the Insta360 SDK.
 4. The xcframeworks pull in CoreBluetooth, NetworkExtension, and SystemConfiguration transitively. Xcode resolves these for you.
 
-When developing `SyncFieldInsta360` from a local checkout, the package target
-also needs to see the Insta360 framework search path while SwiftPM resolves the
-manifest. Set `SYNCFIELD_INSTA360_SDK_PATH` to the full path of
-`INSCameraServiceSDK.xcframework`. The package also auto-detects the common
+When `INSCameraServiceSDK.xcframework` is discoverable while SwiftPM resolves
+the package manifest, `SyncFieldInsta360` adds it as a conditional iOS binary
+target. That keeps the released remote package usable without unsafe build
+flags.
+
+Set `SYNCFIELD_INSTA360_SDK_PATH` to the full path of
+`INSCameraServiceSDK.xcframework` for custom layouts. The package also
+auto-detects the common
 `mobile/ios/Frameworks/Insta360/INSCameraServiceSDK.xcframework` layout when
-`xcodebuild` runs from a host-app checkout, and the sibling
-`../og-skill/mobile/ios/...` layout used for local development. For remote
-package checkouts under Xcode's DerivedData, it also checks common host-app
-roots exposed by Xcode and `~/Documents/og-skill/...`. Set
+`xcodebuild` runs from a host-app checkout, the sibling
+`../og-skill/mobile/ios/...` layout used for local development, common Xcode
+host-app roots, and `~/Documents/og-skill/...`. Set
 `SYNCFIELD_DISABLE_LOCAL_INSTA360_SDK=1` to force the no-framework fallback.
 
 ## Capabilities and permissions

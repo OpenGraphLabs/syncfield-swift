@@ -272,7 +272,7 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
 
         // Let the connection stabilise.
         try await Task.sleep(nanoseconds: 1_000_000_000)
-        NSLog("[Insta360BLE] Paired with \(device.name ?? "(unknown)")")
+        NSLog("[Insta360BLE] Paired with \(Self.displayName(for: device))")
     }
 
     /// Disconnect the active BLE session.
@@ -406,7 +406,7 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
                             cont.resume(throwing: Insta360Error.wifiCredentialsUnavailable)
                         }
                     }
-                    (cmd as AnyObject).perform(sel, with: [wifiInfoType], with: callback)
+                    _ = (cmd as AnyObject).perform(sel, with: [wifiInfoType], with: callback)
                 }
             }
 
@@ -420,7 +420,7 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
         }
 
         // 3. Derive SSID from BLE device name; use Insta360 Go 3S default passphrase.
-        let name = device.name ?? device.identifierUUIDStringSafe
+        let name = device.name.isEmpty ? device.identifierUUIDStringSafe : device.name
         let ssid = name.hasSuffix(".OSC") ? name : "\(name).OSC"
         NSLog("[Insta360BLE] WiFi creds derived from BLE name: SSID=\(ssid), default passphrase")
         return (ssid, "88888888")
@@ -433,7 +433,7 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
             throw Insta360Error.notPaired
         }
         guard let cmd = bluetoothManager.getCommandBy(device) as? INSCameraBasicCommands else {
-            throw Insta360Error.commandFailed("BLE command manager unavailable for \(device.name ?? "device")")
+            throw Insta360Error.commandFailed("BLE command manager unavailable for \(Self.displayName(for: device))")
         }
         return cmd
     }
@@ -501,16 +501,20 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
 
 extension Insta360BLEController: INSBluetoothManagerDelegate {
     public func deviceDidConnected(_ device: INSBluetoothDevice) {
-        NSLog("[Insta360BLE] Device connected: \(device.name ?? "unknown")")
+        NSLog("[Insta360BLE] Device connected: \(Self.displayName(for: device))")
     }
 
     public func device(_ device: INSBluetoothDevice, didDisconnectWithError error: Error?) {
-        NSLog("[Insta360BLE] Device disconnected: \(device.name ?? "unknown"), error: \(error?.localizedDescription ?? "none")")
+        NSLog("[Insta360BLE] Device disconnected: \(Self.displayName(for: device)), error: \(error?.localizedDescription ?? "none")")
         if connectedDevice?.identifierUUIDStringSafe == device.identifierUUIDStringSafe {
             Self.unregisterPaired(device.identifierUUIDStringSafe)
             stopHeartbeat()
             connectedDevice = nil
         }
+    }
+
+    fileprivate static func displayName(for device: INSBluetoothDevice) -> String {
+        device.name.isEmpty ? "unknown" : device.name
     }
 }
 

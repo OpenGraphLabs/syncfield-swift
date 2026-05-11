@@ -6,6 +6,7 @@ import Foundation
 let packageDirectory = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
 let currentDirectory = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
 let insta360SDKRelativePath = "mobile/ios/Frameworks/Insta360/INSCameraServiceSDK.xcframework"
+let insta360SDKBinaryTargetName = "INSCameraServiceSDK"
 let environment = ProcessInfo.processInfo.environment
 let hostAppRootCandidates = [
     environment["PROJECT_DIR"],
@@ -40,22 +41,48 @@ let shouldUseLocalInsta360SDK =
     ProcessInfo.processInfo.environment["SYNCFIELD_DISABLE_LOCAL_INSTA360_SDK"] == nil &&
     localInsta360SDK != nil
 
-let syncFieldInsta360SwiftSettings: [SwiftSetting] =
+func relativePath(from baseDirectory: URL, to target: URL) -> String {
+    let baseComponents = baseDirectory.standardizedFileURL.resolvingSymlinksInPath().pathComponents
+    let targetComponents = target.standardizedFileURL.resolvingSymlinksInPath().pathComponents
+    var commonPrefixCount = 0
+
+    while commonPrefixCount < baseComponents.count,
+          commonPrefixCount < targetComponents.count,
+          baseComponents[commonPrefixCount] == targetComponents[commonPrefixCount] {
+        commonPrefixCount += 1
+    }
+
+    let parentTraversal = Array(repeating: "..", count: baseComponents.count - commonPrefixCount)
+    let targetSuffix = Array(targetComponents.dropFirst(commonPrefixCount))
+    let components = parentTraversal + targetSuffix
+
+    return components.isEmpty ? "." : components.joined(separator: "/")
+}
+
+let syncFieldInsta360BinaryTargets: [Target] =
     shouldUseLocalInsta360SDK && localInsta360SDK != nil
-    ? [.unsafeFlags([
-        "-F", localInsta360SDK!.appendingPathComponent("ios-arm64-simulator").path,
-        "-F", localInsta360SDK!.appendingPathComponent("ios-arm64").path,
-    ], .when(platforms: [.iOS]))]
+    ? [
+        .binaryTarget(
+            name: insta360SDKBinaryTargetName,
+            path: relativePath(from: packageDirectory, to: localInsta360SDK!)
+        ),
+    ]
     : []
 
-let syncFieldInsta360LinkerSettings: [LinkerSetting] =
-    shouldUseLocalInsta360SDK && localInsta360SDK != nil
-    ? [.unsafeFlags([
-        "-F", localInsta360SDK!.appendingPathComponent("ios-arm64-simulator").path,
-        "-F", localInsta360SDK!.appendingPathComponent("ios-arm64").path,
-        "-framework", "INSCameraServiceSDK",
-    ], .when(platforms: [.iOS]))]
-    : []
+let syncFieldInsta360Dependencies: [Target.Dependency] = {
+    var dependencies: [Target.Dependency] = ["SyncField"]
+
+    if shouldUseLocalInsta360SDK {
+        dependencies.append(
+            .target(
+                name: insta360SDKBinaryTargetName,
+                condition: .when(platforms: [.iOS])
+            )
+        )
+    }
+
+    return dependencies
+}()
 
 let package = Package(
     name: "SyncField",
@@ -77,13 +104,11 @@ let package = Package(
         .target(name: "SyncFieldUIKit", dependencies: ["SyncField"]),
         .target(
             name: "SyncFieldInsta360",
-            dependencies: ["SyncField"],
+            dependencies: syncFieldInsta360Dependencies,
             resources: [
                 .copy("PrivacyInfo.xcprivacy"),
-            ],
-            swiftSettings: syncFieldInsta360SwiftSettings,
-            linkerSettings: syncFieldInsta360LinkerSettings),
+            ]),
         .testTarget(name: "SyncFieldTests", dependencies: ["SyncField"]),
         .testTarget(name: "SyncFieldInsta360Tests", dependencies: ["SyncFieldInsta360"]),
-    ]
+    ] + syncFieldInsta360BinaryTargets
 )
