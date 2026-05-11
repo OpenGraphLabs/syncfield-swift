@@ -836,6 +836,11 @@ public final class Insta360WiFiDownloader: @unchecked Sendable {
             withIntermediateDirectories: true)
 
         let http = INSCameraHTTPManager.socket()
+        // Capture throughput per file so callers (and future tuning work)
+        // can see whether the bottleneck is the camera radio, the SDK's
+        // HTTP layer, or our own surrounding overhead. Logs land under
+        // `[WiFiDownloader.throughput]` for easy grep.
+        let startUptimeNs = DispatchTime.now().uptimeNanoseconds
         return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Int64, Error>) in
             let task = http.fetchResource(
                 withURI: remoteFileURI,
@@ -844,14 +849,17 @@ public final class Insta360WiFiDownloader: @unchecked Sendable {
                     if let p = p { progress(p.fractionCompleted) }
                 },
                 completion: { error in
+                    let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds - startUptimeNs) / 1_000_000.0
                     if let error = error {
-                        NSLog("[WiFiDownloader] Download failed: \(error.localizedDescription)")
+                        NSLog("[WiFiDownloader.throughput] FAILED uri=\(remoteFileURI) elapsedMs=\(String(format: "%.0f", elapsedMs)) error=\(error.localizedDescription)")
                         cont.resume(throwing: Insta360Error.downloadFailed(error.localizedDescription))
                         return
                     }
                     let size = (try? FileManager.default
                         .attributesOfItem(atPath: destination.path)[.size]) as? Int64 ?? 0
-                    NSLog("[WiFiDownloader] Download complete: \(destination.lastPathComponent) (\(size) bytes)")
+                    let mb = Double(size) / 1_048_576.0
+                    let mbps = elapsedMs > 0 ? (mb / (elapsedMs / 1000.0)) : 0
+                    NSLog("[WiFiDownloader.throughput] OK uri=\(remoteFileURI) bytes=\(size) sizeMB=\(String(format: "%.2f", mb)) elapsedMs=\(String(format: "%.0f", elapsedMs)) throughputMBps=\(String(format: "%.2f", mbps))")
                     cont.resume(returning: size)
                 })
             if task == nil {
