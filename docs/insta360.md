@@ -38,8 +38,10 @@ The Insta360 SDK license forbids redistributing the binaries. Do not commit them
 When developing `SyncFieldInsta360` from a local checkout, the package target
 also needs to see the Insta360 framework search path while SwiftPM resolves the
 manifest. Set `SYNCFIELD_INSTA360_SDK_PATH` to the full path of
-`INSCameraServiceSDK.xcframework`, or keep `syncfield-swift` next to `og-skill`
-so the local development path is auto-detected. Set
+`INSCameraServiceSDK.xcframework`. The package also auto-detects the common
+`mobile/ios/Frameworks/Insta360/INSCameraServiceSDK.xcframework` layout when
+`xcodebuild` runs from a host-app checkout, and the sibling
+`../og-skill/mobile/ios/...` layout used for local development. Set
 `SYNCFIELD_DISABLE_LOCAL_INSTA360_SDK=1` to force the no-framework fallback.
 
 ## Capabilities and permissions
