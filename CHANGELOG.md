@@ -2,6 +2,34 @@
 
 All notable changes to **syncfield-swift** are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] — 2026-05-11
+
+This release makes deferred Insta360 ingest a first-class SDK feature so host apps can record now and download wrist mp4s later (per-episode "Download" button, batched "Collect all" page) without re-implementing pairing, AP grouping, or sidecar bookkeeping themselves.
+
+### Added
+- **`SessionOrchestrator.remove(streamId:)` + `streamIds()`** for host-driven stream lifecycle. The orchestrator previously only exposed `add(_:)`, so host apps that pair Insta360 wrist cameras manually (per-role assignment driven by identify cue + `assignWristRole`) had no way to deregister a stream when the user unpaired or remapped. The app-side bookkeeping (`wristStreams[role]`) and the SDK-side `streams` array drifted, and the next `add(_:)` with the same `streamId` threw `duplicateStreamId` — breaking Remap, swap-roles (L↔R), and any retry after a partial pair. `remove(streamId:)` mirrors `add(_:)`: same `.idle | .connected` state guard, idempotent (returns `false` when the streamId is not registered), and rejects with `invalidTransition` during `.recording`/`.stopping`/`.ingesting`. The caller owns `stream.disconnect()`; the orchestrator only drops the registration. `streamIds()` returns the registered ids in insertion order so hosts can sweep their own state against the orchestrator's view (e.g. defensively remove any `cam_wrist_*` stream the SDK still tracks during a wipe-all remap).
+- **3-2-1 countdown UX built into `SessionOrchestrator.startRecording`.** `startRecording(countdown:onTick:)` accepts an optional `CountdownSpec` and a per-tick callback. With `CountdownSpec.standard` the SDK plays ascending audible tones (880, 1047, 1175 Hz, 110 ms each) at 1-second intervals through the iPhone main speaker, then runs the atomic BLE start and the sync chirp. `onTick(remaining)` fires once per tick (3, 2, 1) so host UIs can flash the number on screen in lockstep. `CountdownSpec.silent` for visual-only countdown.
+- **`SessionOrchestrator` manages `AVAudioSession` for chirp routing by default.** `connect()` applies `.playAndRecord` with mode `.videoRecording` and options `[.defaultToSpeaker, .mixWithOthers]`, then `overrideOutputAudioPort(.speaker)` to pin the route. BT routing is intentionally excluded so the chirp can't divert to BT earbuds during a recording. `AudioSessionPolicy.manualByHost` opts out.
+- `SyncFieldAudioSession.applyManagedConfig()` public helper exposing the same config (idempotent) for hosts that want to apply it manually outside the orchestrator.
+- **`SessionOrchestrator.finishRecording()`** closes a recording from `.stopping → .connected` without running per-stream `ingest`. The state machine previously had no path out of `.stopping` other than `ingest()`, forcing host apps that defer Insta360 downloads to call `disconnect()` from `.stopping` and absorb the throw. Use this whenever you intend to call `Insta360Collector` later instead of an immediate `ingest()`.
+- **`Insta360Collector`** process-wide actor that performs deferred Insta360 wrist-camera downloads from a directory path, completely decoupled from any `SessionOrchestrator`. Entry points:
+  - `Insta360Collector.shared.collectEpisode(_ episodeDir:progress:)` for one episode's `.pending.json` sidecars.
+  - `Insta360Collector.shared.collectAll(root:progress:)` recursively finds every pending under `root`, groups by camera UUID, and joins each camera's AP **once** across all queued episodes. Matches og-skill's production batch-collect behaviour.
+
+### Changed (breaking)
+- `SessionOrchestrator.startRecording`'s `countdown` parameter changed type from `TimeInterval` to `CountdownSpec?`. Zero-arg callers continue to compile unchanged because the new default is `nil`. Callers passing a positive `TimeInterval` must migrate to a `CountdownSpec`.
+- `Insta360CameraStream.ingest` and `Insta360Collector` no longer write `<streamId>.anchor.json` sidecars. The current SyncField sync core does not consume them; alignment uses `manifest.json` + `sync_point.json` + the iPhone's `*.timestamps.jsonl` + audio cross-correlation of the chirp across every mp4 audio track. The matching `Insta360PendingSidecar.writeAnchor` public helper has been removed.
+
+### Fixed
+- **Actor state-machine race in `SessionOrchestrator.startRecording` / `stopRecording` / `finishRecording`.** State transition was at the END of the method, after multiple `await` suspension points; a concurrent caller could pass the same `require()` check during those awaits and run the whole sequence twice (double chirp, double BLE startCapture/stopCapture causing `msg execute err` on the second send, corrupted AVAssetWriter finalize). State now transitions immediately after the require check, before any await, so reentrant calls fail fast with `invalidTransition`.
+- **`Insta360BLEController.withTimeout` waited for the full timeout on every successful call.** `defer { group.cancelAll() }` ran at scope exit after the drain loop, so the drain awaited the timeout task's full `Task.sleep` to elapse naturally; every BLE command effectively took its `seconds` budget regardless of how fast the actual round-trip was. `cancelAll()` is now called explicitly before the drain so `Task.sleep` cancels immediately. This was the root cause of the 15 s `stopRecording` reported by host apps; it now returns in ~2 s.
+- **Start chirp silently fell back to software-only emission on iOS 18 / A18 Pro under AVCaptureSession + active BLE peripheral.** Chirp player now uses pre-cached `AVAudioPlayer(contentsOf:)` plus belt-and-suspenders `AudioServicesPlaySystemSound`, calls `setActive(true) + overrideOutputAudioPort(.speaker)` before every play, and never re-applies `setCategory` (whose `'!pri'` failure under AVCaptureSession priority was transitioning the session through an interim state that silenced playback).
+
+- `SyncFieldVersion.current` bumped to `0.8.0`.
+
+### Compatibility
+- Source-compatible at zero-arg call sites. Existing `session.startRecording()` and `session.ingest { ... }` continue to work unchanged. The new `.stopping → .connected` transition is purely additive in the state machine.
+
 ## [0.7.5] — 2026-05-11
 
 ### Added

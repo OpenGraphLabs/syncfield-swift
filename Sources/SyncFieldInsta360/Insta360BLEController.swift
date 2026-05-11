@@ -594,11 +594,18 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
                 throw Insta360Error.commandFailed(
                     "operation timed out after \(seconds)s")
             }
-            defer { group.cancelAll() }
-            // The winning task's result is returned. `defer` guarantees the
-            // other task is cancelled; drain its completion so we don't leave
-            // a continuation hanging — any thrown error there is discarded.
+            // Wait for whichever task finishes first.
             let result = try await group.next()!
+            // CRITICAL: cancel the loser BEFORE draining. The previous
+            // version put `cancelAll()` in a `defer`, which runs at
+            // scope exit AFTER the drain loop below — so the drain
+            // waited for the timeout task's full Task.sleep to elapse
+            // naturally, making every BLE command take exactly
+            // `seconds` to return regardless of how fast the actual
+            // BLE call was. Explicit cancellation here triggers
+            // Task.sleep to throw `CancellationError` immediately, and
+            // the drain finishes in microseconds.
+            group.cancelAll()
             while (try? await group.next()) != nil {}
             return result
         }

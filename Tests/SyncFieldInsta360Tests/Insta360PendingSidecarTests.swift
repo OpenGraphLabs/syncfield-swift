@@ -61,4 +61,35 @@ final class Insta360PendingSidecarTests: XCTestCase {
 
         XCTAssertTrue(try Insta360PendingSidecar.scan(tempDir).isEmpty)
     }
+
+    // MARK: - scanRecursive
+
+    func test_scanRecursive_findsPendingsAcrossEpisodes() throws {
+        let epA = tempDir.appendingPathComponent("rec_1/ep_aaa")
+        let epB = tempDir.appendingPathComponent("rec_1/ep_bbb")
+        try FileManager.default.createDirectory(at: epA, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: epB, withIntermediateDirectories: true)
+
+        try Insta360PendingSidecar.write(
+            to: epA, streamId: "cam_wrist_left",
+            cameraFileURI: "file:///A_L", bleUuid: "U_A", bleName: "A",
+            role: "left", bleAckNs: 100)
+        try Insta360PendingSidecar.write(
+            to: epB, streamId: "cam_wrist_right",
+            cameraFileURI: "file:///B_R", bleUuid: "U_B", bleName: "B",
+            role: "right", bleAckNs: 200)
+
+        let found = Insta360PendingSidecar.scanRecursive(root: tempDir)
+        XCTAssertEqual(found.count, 2)
+        let epAResolved = epA.resolvingSymlinksInPath().path
+        let epBResolved = epB.resolvingSymlinksInPath().path
+        XCTAssertTrue(found.contains {
+            $0.episodeDir.resolvingSymlinksInPath().path == epAResolved
+            && $0.sidecar.bleUuid == "U_A"
+        })
+        XCTAssertTrue(found.contains {
+            $0.episodeDir.resolvingSymlinksInPath().path == epBResolved
+            && $0.sidecar.bleUuid == "U_B"
+        })
+    }
 }

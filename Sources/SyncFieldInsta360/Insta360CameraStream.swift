@@ -319,13 +319,6 @@ public final class Insta360CameraStream: SyncFieldStream, @unchecked Sendable {
                 progress: escaping)
         }
 
-        // 3. Persist BLE-ACK anchor so the server can align camera-internal PTS
-        //    against host monotonic ns.
-        try writeInsta360SidecarAnchor(
-            episodeDirectory: episodeDirectory,
-            streamId: streamId,
-            bleAckMonotonicNs: bleAckMonotonicNs)
-
         try? Insta360PendingSidecar.delete(at: episodeDirectory, streamId: streamId)
 
         return StreamIngestReport(streamId: streamId,
@@ -354,16 +347,3 @@ public final class Insta360CameraStream: SyncFieldStream, @unchecked Sendable {
     }
 }
 
-private func writeInsta360SidecarAnchor(episodeDirectory: URL,
-                                        streamId: String,
-                                        bleAckMonotonicNs: UInt64) throws {
-    let obj: [String: Any] = [
-        "stream_id": streamId,
-        "ble_ack_monotonic_ns": bleAckMonotonicNs,
-        "anchor_source": "ble_ack",
-    ]
-    let data = try JSONSerialization.data(withJSONObject: obj,
-                                          options: [.prettyPrinted, .sortedKeys])
-    try data.write(to: episodeDirectory
-        .appendingPathComponent("\(streamId).anchor.json"), options: [.atomic])
-}

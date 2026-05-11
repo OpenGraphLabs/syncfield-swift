@@ -11,6 +11,7 @@ public actor SessionOrchestrator {
                 stopChirp: ChirpSpec? = .defaultStop,
                 postStartStabilizationMs: Double = 200,
                 preStopTailMarginMs: Double = 200,
+                audioSessionPolicy: AudioSessionPolicy = .managedBySDK,
                 handQualityConfig: HandQualityConfig = .default) {
         self.hostId = hostId
         self.baseDir = outputDirectory
@@ -19,6 +20,7 @@ public actor SessionOrchestrator {
         self.stopChirpSpec = stopChirp
         self.postStartStabilizationMs = postStartStabilizationMs
         self.preStopTailMarginMs = preStopTailMarginMs
+        self.audioSessionPolicy = audioSessionPolicy
         self.handQualityConfig = handQualityConfig
     }
 
@@ -45,9 +47,46 @@ public actor SessionOrchestrator {
         streams.append(stream)
     }
 
+    /// Deregister a stream from the session.
+    ///
+    /// Allowed in `.idle` (pre-connect cleanup) and `.connected` (host-driven
+    /// remapping — e.g. unpairing a wrist Insta360 to pair a different camera
+    /// under the same role/streamId). The caller owns the stream's own
+    /// teardown — call `stream.disconnect()` separately if the stream is
+    /// connected. The orchestrator merely drops its registration so a
+    /// subsequent `add(_:)` with the same `streamId` no longer throws
+    /// `duplicateStreamId`.
+    ///
+    /// Idempotent: returns `false` and leaves state untouched when no stream
+    /// with `streamId` is registered. This matches the cleanup pattern host
+    /// apps use during Remap (sweep every role, don't fight partial state).
+    @discardableResult
+    public func remove(streamId: String) throws -> Bool {
+        guard state == .idle || state == .connected else {
+            throw SessionError.invalidTransition(from: state, to: state)
+        }
+        let before = streams.count
+        streams.removeAll { $0.streamId == streamId }
+        return streams.count != before
+    }
+
+    /// streamIds currently registered with the session, in insertion order.
+    /// Useful for diagnostics and for hosts that need to sweep their own
+    /// bookkeeping against the orchestrator's view of registered streams.
+    public func streamIds() -> [String] {
+        streams.map { $0.streamId }
+    }
+
     public func connect() async throws {
         try require(state: .idle, next: .connected)
         guard !streams.isEmpty else { throw SessionError.noStreamsRegistered }
+
+        // Configure AVAudioSession FIRST so the chirp at startRecording emits
+        // from the iPhone main speaker (not earpiece, not BT earbuds) and the
+        // iPhone mic in `iPhoneCameraStream` can still record simultaneously.
+        // Done before per-stream `connect(context:)` so AVCaptureSession's
+        // audio path picks up the configured category from the start.
+        applyAudioSessionPolicy()
 
         sessionId = String(UUID().uuidString.prefix(12).lowercased())
         var connected: [any SyncFieldStream] = []
@@ -72,8 +111,19 @@ public actor SessionOrchestrator {
     }
 
     @discardableResult
-    public func startRecording(countdown: TimeInterval = 0) async throws -> SyncPoint {
+    public func startRecording(
+        countdown: CountdownSpec? = nil,
+        onTick: (@Sendable (Int) -> Void)? = nil
+    ) async throws -> SyncPoint {
         try require(state: .connected, next: .recording)
+        // Transition state IMMEDIATELY, before any `await`. Actor isolation
+        // only holds between suspension points; a concurrent caller could
+        // otherwise pass the same `require(state: .connected)` check while
+        // we're still awaiting countdown / BLE start and end up running the
+        // entire start sequence twice (double countdown, double chirp,
+        // double BLE startCapture causing "msg execute err" on the second
+        // send to each camera).
+        state = .recording
 
         episodeDirectory = try makeEpisodeDirectory()
         let clock = SessionClock()
@@ -98,9 +148,16 @@ public actor SessionOrchestrator {
             eventWriter: evWriter
         )
 
-        if countdown > 0 {
-            try await Task.sleep(nanoseconds: UInt64(countdown * 1_000_000_000))
-        }
+        // 3-2-1 countdown runs IN PARALLEL with the BLE start TaskGroup so
+        // surrounding Insta360 mics start recording in time to catch the
+        // ticks themselves as ambient audio (matches the egonaut production
+        // rhythm: tick-tick-tick at t=0,1,2 / chirp at t≈3). The chirp is
+        // gated on BOTH the countdown finishing AND every stream acking
+        // start, so it always lands as the 4th beat regardless of BLE
+        // latency.
+        let countdownTask: Task<Void, Never>? = (countdown.flatMap { spec in
+            spec.ticks > 0 ? Task { await self.runCountdown(spec, onTick: onTick) } : nil
+        })
 
         // Atomic start: try all concurrently; roll back any that succeeded if any fails.
         var started: [String] = []
@@ -115,6 +172,7 @@ public actor SessionOrchestrator {
                 for try await id in group { started.append(id) }
             }
         } catch {
+            countdownTask?.cancel()
             // Roll back: stop the ones that started, delete their files.
             for s in streams where started.contains(s.streamId) {
                 _ = try? await s.stopRecording()
@@ -124,7 +182,12 @@ public actor SessionOrchestrator {
             throw SessionError.startFailed(cause: error, rolledBack: started)
         }
 
-        state = .recording
+        // State is already `.recording` (set at the top before any await
+        // to gate concurrent callers).
+
+        // Wait for the countdown to finish (if BLE start beat it) so the
+        // chirp lands after the last tick rather than under it.
+        await countdownTask?.value
 
         // Chirp: wait for audio pipeline to stabilize, then emit
         if let spec = startChirpSpec {
@@ -151,6 +214,15 @@ public actor SessionOrchestrator {
 
     public func stopRecording() async throws -> StopReport {
         try require(state: .recording, next: .stopping)
+        // Transition state IMMEDIATELY, before any `await`. Without this the
+        // chirp emit + tail margin sleep (~700ms) opens a window where a
+        // concurrent caller could re-enter and pass the same require check,
+        // causing the full stop sequence to execute twice (double chirp,
+        // double BLE stopCapture giving "msg execute err" on the second
+        // send, corrupted AVAssetWriter finalize that breaks downstream
+        // mp4 reads).
+        state = .stopping
+        let t0 = DispatchTime.now().uptimeNanoseconds
 
         // Stop chirp: emit first, wait for tail to be captured
         if let spec = stopChirpSpec {
@@ -166,6 +238,8 @@ public actor SessionOrchestrator {
                 self.currentSyncPoint = sp
             }
         }
+        let tAfterChirp = DispatchTime.now().uptimeNanoseconds
+        NSLog("[SDK.stopRecording] chirp+tail done elapsedMs=\((tAfterChirp - t0) / 1_000_000)")
 
         // Run each stream's stopRecording concurrently. Rationale:
         // - iPhoneCameraStream / iPhoneMotionStream / TactileStream are
@@ -182,13 +256,20 @@ public actor SessionOrchestrator {
         // (AVAssetWriter commit etc).
         var reports: [StreamStopReport] = []
         var firstError: Error?
+        let tBeforeStreamStop = DispatchTime.now().uptimeNanoseconds
         await withTaskGroup(of: (StreamStopReport?, Error?).self) { group in
             for s in streams {
+                let id = s.streamId
                 group.addTask { [s] in
-                    do { return (try await s.stopRecording(), nil) }
+                    let t0 = DispatchTime.now().uptimeNanoseconds
+                    let result: (StreamStopReport?, Error?)
+                    do { result = (try await s.stopRecording(), nil) }
                     catch {
-                        return (nil, StreamError(streamId: s.streamId, underlying: error))
+                        result = (nil, StreamError(streamId: s.streamId, underlying: error))
                     }
+                    let elapsedMs = (DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000
+                    NSLog("[SDK.stopRecording] stream=\(id) stop elapsedMs=\(elapsedMs)")
+                    return result
                 }
             }
             for await (report, error) in group {
@@ -196,6 +277,9 @@ public actor SessionOrchestrator {
                 if let error = error, firstError == nil { firstError = error }
             }
         }
+        let tAfterStreamStop = DispatchTime.now().uptimeNanoseconds
+        NSLog("[SDK.stopRecording] all streams stopped elapsedMs=\((tAfterStreamStop - tBeforeStreamStop) / 1_000_000)")
+
         if let writer = logWriter {
             try await writer.append(kind: "state", detail: "recording->stopping")
         }
@@ -203,6 +287,7 @@ public actor SessionOrchestrator {
         // Finalize hand FOV quality: capture stats, close any open intervals,
         // write hand_quality.json. Failures here are non-fatal (a recording
         // without quality metadata is still a valid recording).
+        let tBeforeHQ = DispatchTime.now().uptimeNanoseconds
         if let monitor = handQualityMonitor {
             let stopNs = activeClock?.nowMonotonicNs() ?? recordingStartMonotonicNs
             let stats = await monitor.qualityStats(
@@ -215,6 +300,8 @@ public actor SessionOrchestrator {
             let summaryURL = episodeDirectory.appendingPathComponent("hand_quality.json")
             try? HandQualitySummaryBuilder.write(summary, to: summaryURL)
         }
+        let tAfterHQ = DispatchTime.now().uptimeNanoseconds
+        NSLog("[SDK.stopRecording] hand quality finalize elapsedMs=\((tAfterHQ - tBeforeHQ) / 1_000_000)")
         // EventWriter is finalized as part of monitor.finalize; drop the reference
         // so future logEvent calls become no-ops until the next startRecording.
         eventWriter = nil
@@ -237,9 +324,33 @@ public actor SessionOrchestrator {
             })
         try? writeManifest(from: manifestResults)
 
-        state = .stopping
+        // State is already `.stopping` (set at the top before any await
+        // to gate concurrent callers).
         if let error = firstError { throw error }
         return StopReport(streamReports: reports)
+    }
+
+    /// Close the recording without running per-stream `ingest`. Use this when
+    /// you intend to collect Insta360 wrist mp4s later via
+    /// ``SyncFieldInsta360/Insta360Collector`` — single-episode or batched.
+    ///
+    /// On return, `state == .connected`. The episode directory already
+    /// contains every native-stream file (camera mp4 + timestamps, sensor
+    /// jsonl), `manifest.json`, and `sync_point.json`. For each Insta360
+    /// stream, a `<streamId>.pending.json` sidecar records the camera-side
+    /// file URI and BLE-ACK monotonic anchor needed for later download.
+    ///
+    /// Call `disconnect()` after this just like you would after `ingest()`.
+    public func finishRecording() async throws {
+        try require(state: .stopping, next: .connected)
+        // Transition state before the log-writer awaits so a concurrent
+        // call can't pass the same `require(state: .stopping)` check.
+        state = .connected
+        if let writer = logWriter {
+            try await writer.append(kind: "state", detail: "stopping->connected (deferred ingest)")
+            try await writer.close()
+        }
+        logWriter = nil
     }
 
     public func ingest(progress: @Sendable (IngestProgress) -> Void) async throws -> IngestReport {
@@ -296,6 +407,8 @@ public actor SessionOrchestrator {
     private let stopChirpSpec: ChirpSpec?
     private let postStartStabilizationMs: Double
     private let preStopTailMarginMs: Double
+    private let audioSessionPolicy: AudioSessionPolicy
+    private let countdownTickPlayer = CountdownTickPlayer()
     private var startEmission: ChirpEmission?
     private var stopEmission: ChirpEmission?
     private var currentSyncPoint: SyncPoint?
@@ -315,12 +428,58 @@ public actor SessionOrchestrator {
         #endif
     }
 
+    /// Run the pre-start countdown. For each tick: fire `onTick(remaining)`
+    /// so the host UI can flash the number, optionally play an ascending
+    /// tone on the iPhone main speaker, then sleep `intervalMs` before
+    /// the next tick. Cancellable through the surrounding Task.
+    private func runCountdown(
+        _ spec: CountdownSpec,
+        onTick: (@Sendable (Int) -> Void)?
+    ) async {
+        let player = countdownTickPlayer
+        for i in 0..<spec.ticks {
+            let remaining = spec.ticks - i
+            onTick?(remaining)
+            if spec.style == .audible {
+                player.play(tickIndex: i)
+            }
+            if i < spec.ticks - 1 {
+                try? await Task.sleep(
+                    nanoseconds: UInt64(spec.intervalMs * 1_000_000))
+            } else {
+                // Hold the last tick for its own duration before kicking
+                // off BLE start so the operator's perceived rhythm
+                // doesn't skip "1 -> CHIRP" with no breathing room.
+                try? await Task.sleep(
+                    nanoseconds: UInt64(spec.intervalMs * 1_000_000))
+            }
+        }
+    }
+
+    /// Apply the active `AudioSessionPolicy`. On `.managedBySDK`, set the
+    /// shared `AVAudioSession` to play-and-record + speaker-routed so the
+    /// chirp is audible to every nearby microphone. Failures are logged
+    /// but non-fatal (a misconfigured session typically still records,
+    /// just with a quieter chirp; the BLE-ACK anchor in
+    /// `<streamId>.anchor.json` still gives sync alignment within ~50 ms).
+    private func applyAudioSessionPolicy() {
+        guard audioSessionPolicy == .managedBySDK else { return }
+        #if canImport(AVFoundation) && os(iOS)
+        do {
+            try SyncFieldAudioSession.applyManagedConfig()
+        } catch {
+            NSLog("[SyncField] AVAudioSession config failed (\(error.localizedDescription)); continuing with whatever the host left in place.")
+        }
+        #endif
+    }
+
     private func require(state expected: SessionState, next: SessionState) throws {
         let allowed: [(from: SessionState, to: SessionState)] = [
             (.idle,       .connected),
             (.connected,  .recording),
             (.recording,  .stopping),
             (.stopping,   .ingesting),
+            (.stopping,   .connected),   // finishRecording — skip ingest, collect later
             (.ingesting,  .connected),
             (.connected,  .idle),
         ]
