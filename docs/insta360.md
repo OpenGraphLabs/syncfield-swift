@@ -41,7 +41,9 @@ manifest. Set `SYNCFIELD_INSTA360_SDK_PATH` to the full path of
 `INSCameraServiceSDK.xcframework`. The package also auto-detects the common
 `mobile/ios/Frameworks/Insta360/INSCameraServiceSDK.xcframework` layout when
 `xcodebuild` runs from a host-app checkout, and the sibling
-`../og-skill/mobile/ios/...` layout used for local development. Set
+`../og-skill/mobile/ios/...` layout used for local development. For remote
+package checkouts under Xcode's DerivedData, it also checks common host-app
+roots exposed by Xcode and `~/Documents/og-skill/...`. Set
 `SYNCFIELD_DISABLE_LOCAL_INSTA360_SDK=1` to force the no-framework fallback.
 
 ## Capabilities and permissions

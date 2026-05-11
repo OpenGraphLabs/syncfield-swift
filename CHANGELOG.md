@@ -2,6 +2,12 @@
 
 All notable changes to **syncfield-swift** are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2] — 2026-05-11
+
+### Fixed
+- `SyncFieldInsta360` remote Swift Package builds now auto-detect the common `og-skill/mobile/ios/Frameworks/Insta360/INSCameraServiceSDK.xcframework` layout even when Xcode checks the package out under DerivedData, so host apps can move back from a local path dependency to a released package version.
+- `SyncFieldVersion.current` bumped to `0.7.2`.
+
 ## [0.7.1] — 2026-05-11
 
 ### Added

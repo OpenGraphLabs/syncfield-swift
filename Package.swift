@@ -6,7 +6,17 @@ import Foundation
 let packageDirectory = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
 let currentDirectory = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
 let insta360SDKRelativePath = "mobile/ios/Frameworks/Insta360/INSCameraServiceSDK.xcframework"
-let localInsta360SDKCandidates: [URL] = [
+let environment = ProcessInfo.processInfo.environment
+let hostAppRootCandidates = [
+    environment["PROJECT_DIR"],
+    environment["SRCROOT"],
+    environment["SOURCE_ROOT"],
+    environment["WORKSPACE_DIR"],
+    environment["PWD"],
+].compactMap { $0 }.map { URL(fileURLWithPath: $0) }
+let homeDirectory = environment["HOME"].map { URL(fileURLWithPath: $0) }
+
+let localInsta360SDKCandidates: [URL] = ([
     ProcessInfo.processInfo.environment["SYNCFIELD_INSTA360_SDK_PATH"].map {
         URL(fileURLWithPath: $0)
     },
@@ -14,7 +24,15 @@ let localInsta360SDKCandidates: [URL] = [
     currentDirectory.appendingPathComponent(insta360SDKRelativePath),
     currentDirectory.appendingPathComponent("ios/Frameworks/Insta360/INSCameraServiceSDK.xcframework"),
     currentDirectory.appendingPathComponent("Frameworks/Insta360/INSCameraServiceSDK.xcframework"),
-].compactMap { $0?.standardizedFileURL }
+] + hostAppRootCandidates.flatMap { root -> [URL?] in
+    [
+        root.appendingPathComponent("Frameworks/Insta360/INSCameraServiceSDK.xcframework"),
+        root.appendingPathComponent("ios/Frameworks/Insta360/INSCameraServiceSDK.xcframework"),
+        root.appendingPathComponent(insta360SDKRelativePath),
+    ]
+} + [
+    homeDirectory?.appendingPathComponent("Documents/og-skill/\(insta360SDKRelativePath)"),
+]).compactMap { $0?.standardizedFileURL }
 let localInsta360SDK = localInsta360SDKCandidates.first {
     FileManager.default.fileExists(atPath: $0.path)
 }

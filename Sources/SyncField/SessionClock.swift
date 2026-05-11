@@ -44,5 +44,5 @@ public final class SessionClock: @unchecked Sendable {
 /// re-exported through `SyncFieldInsta360.version` so optional modules stay
 /// in lock-step with the core release.
 public enum SyncFieldVersion {
-    public static let current = "0.7.1"
+    public static let current = "0.7.2"
 }
