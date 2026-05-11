@@ -88,6 +88,18 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
 
     /// The single camera device that is currently BLE-connected.
     private var connectedDevice: INSBluetoothDevice?
+
+    /// Identity of the last device this controller was successfully bound
+    /// to. Survives `disconnect` / `unpair`. Exists because BLE can drop
+    /// mid-recording on Go-family hardware (low power radio, RSSI dip,
+    /// camera-side sleep) and `stopRemoteRecording` may then write the
+    /// pending-sidecar with no live identifier. The host needs the UUID
+    /// and name later to re-pair and pull the file off WiFi, so we
+    /// remember them here even after the live connection vanishes.
+    /// Cleared only when the controller adopts a *different* device.
+    private var lastKnownUUID: String?
+    private var lastKnownName: String?
+
     private var heartbeatTask: Task<Void, Never>?
     private let heartbeatIntervalNs: UInt64 = 2_000_000_000
 
@@ -114,6 +126,24 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
     /// the second wrist pair cannot re-claim the first wrist's camera.
     public var connectedDeviceUUID: String? {
         connectedDevice?.identifierUUIDStringSafe
+    }
+
+    /// Last-known peripheral UUID this controller was bound to — survives a
+    /// BLE drop. Prefer this over `connectedDeviceUUID` when persisting
+    /// camera identity to disk (pending sidecars, anchor manifests), so a
+    /// transient disconnect right before `stopRemoteRecording` doesn't
+    /// strip the metadata. Nil only until the first successful pair/adopt.
+    public var lastKnownDeviceUUID: String? {
+        lastKnownUUID
+    }
+
+    /// Last-known BLE-advertised name (camera serial, e.g. "GO 3S 8E13B7").
+    /// Same survival semantics as `lastKnownDeviceUUID` — this is the
+    /// camera's stable hardware identifier and is the right key to use
+    /// when CoreBluetooth peripheral UUIDs rotate across central-manager
+    /// sessions (e.g. app cold start).
+    public var lastKnownDeviceName: String? {
+        lastKnownName
     }
 
     /// Soft-warning channel for SDK-level camera health events (battery,
@@ -267,6 +297,7 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
         }
 
         connectedDevice = device
+        rememberIdentity(of: device)
         Self.registerPaired(device.identifierUUIDStringSafe)
         startHeartbeat()
 
@@ -291,8 +322,21 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
     /// scan and goes straight to command issuance on subsequent calls.
     public func adoptConnectedDevice(_ device: INSBluetoothDevice) {
         self.connectedDevice = device
+        rememberIdentity(of: device)
         Self.registerPaired(device.identifierUUIDStringSafe)
         startHeartbeat()
+    }
+
+    /// Cache the live device's identity so it survives a later disconnect.
+    /// Captures both the CoreBluetooth peripheral UUID (this central
+    /// manager's local handle) and the BLE-advertised name (the camera's
+    /// stable hardware serial). Either is sufficient to find the same
+    /// physical camera in a future scan; the name is preferred when
+    /// central-manager UUIDs rotate across app sessions.
+    private func rememberIdentity(of device: INSBluetoothDevice) {
+        lastKnownUUID = device.identifierUUIDStringSafe
+        let name = device.name
+        if !name.isEmpty { lastKnownName = name }
     }
 
     /// BLE-advertised name of the currently-paired camera, or nil.
@@ -523,6 +567,8 @@ public final class Insta360BLEController: @unchecked Sendable {
     public var onWarning: (@Sendable (Insta360CameraWarning) -> Void)?
     public var connectedDeviceUUID: String? { nil }
     public var connectedDeviceName: String? { nil }
+    public var lastKnownDeviceUUID: String? { nil }
+    public var lastKnownDeviceName: String? { nil }
 
     public init() {}
 

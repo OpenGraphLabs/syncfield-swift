@@ -253,12 +253,34 @@ public final class Insta360CameraStream: SyncFieldStream, @unchecked Sendable {
                        : streamId.hasSuffix("_left")  ? "left"
                        : streamId.hasSuffix("_right") ? "right"
                        : ""
+            // BLE can drop between recording start and stop (Go-family
+            // radios go quiet on RSSI dip / camera-side sleep), which
+            // leaves `connectedDeviceUUID` / `connectedDeviceName` nil at
+            // write time. Without a fallback the sidecar gets empty
+            // strings — the collect path then groups multiple wrist
+            // streams under the same "" key and can no longer route each
+            // pending file back to its camera over WiFi. We fall through
+            // to identity captured at pair time (`lastKnownDevice*`,
+            // survives disconnect) and finally to `boundUUID` (passed at
+            // construction for UUID-bound streams). `device.name` is
+            // non-optional but may be empty before GAP name resolves —
+            // treat empty as missing.
+            let liveUUID = ble.connectedDeviceUUID
+            let liveName: String? = {
+                guard let n = ble.connectedDeviceName, !n.isEmpty else { return nil }
+                return n
+            }()
+            let resolvedUUID = liveUUID ?? ble.lastKnownDeviceUUID ?? boundUUID ?? ""
+            let resolvedName = liveName ?? ble.lastKnownDeviceName ?? ""
+            if resolvedUUID.isEmpty || resolvedName.isEmpty {
+                NSLog("[Insta360CameraStream] WARNING pending sidecar for \(streamId) has weak identity: uuid='\(resolvedUUID)' name='\(resolvedName)' (live uuid=\(liveUUID ?? "nil") lastKnown uuid=\(ble.lastKnownDeviceUUID ?? "nil") boundUUID=\(boundUUID ?? "nil"))")
+            }
             try? Insta360PendingSidecar.write(
                 to: epDir,
                 streamId: streamId,
                 cameraFileURI: uri,
-                bleUuid: ble.connectedDeviceUUID ?? "",
-                bleName: ble.connectedDeviceName ?? "",
+                bleUuid: resolvedUUID,
+                bleName: resolvedName,
                 role: role,
                 bleAckNs: bleAckMonotonicNs)
         }
