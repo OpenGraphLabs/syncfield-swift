@@ -93,6 +93,40 @@ final class Insta360CollectorTests: XCTestCase {
                        "file:///cam_wrist_left")
     }
 
+    func test_itemsForEpisodeDirs_scansOnlyRequestedEpisodeDirs() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("collector_requested_\(UUID().uuidString)")
+        let epA = root.appendingPathComponent("ep_A")
+        let epB = root.appendingPathComponent("ep_B")
+        let epIgnored = root.appendingPathComponent("ep_ignored")
+        for dir in [epA, epB, epIgnored] {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        try writeSidecar(to: epA, streamId: "cam_wrist_left", bleUuid: "U_LEFT")
+        try writeSidecar(to: epB, streamId: "cam_wrist_right", bleUuid: "U_RIGHT")
+        try writeSidecar(to: epIgnored, streamId: "cam_wrist_ignored", bleUuid: "U_IGNORED")
+
+        let items = try Insta360Collector.itemsForEpisodeDirs([epB, epA])
+
+        XCTAssertEqual(Set(items.map { $0.episodeDir.lastPathComponent }), ["ep_A", "ep_B"])
+        XCTAssertEqual(Set(items.map { $0.sidecar.streamId }), ["cam_wrist_left", "cam_wrist_right"])
+    }
+
+    private func writeSidecar(to episodeDir: URL,
+                              streamId: String,
+                              bleUuid: String) throws {
+        try Insta360PendingSidecar.write(
+            to: episodeDir,
+            streamId: streamId,
+            cameraFileURI: "file:///\(streamId)",
+            bleUuid: bleUuid,
+            bleName: "GO 3S \(bleUuid)",
+            role: streamId.hasSuffix("_left") ? "left" : "right",
+            bleAckNs: 0)
+    }
+
     // MARK: - Standalone API surface (no SDK linked → framework-not-linked path)
 
     #if !canImport(INSCameraServiceSDK)

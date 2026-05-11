@@ -92,6 +92,20 @@ public actor Insta360Collector {
         return try await runCollect(items: items, progress: progress)
     }
 
+    /// Collect pending files for an explicit set of episode directories.
+    ///
+    /// Unlike ``collectAll(root:progress:)`` this does not walk unrelated
+    /// recordings under the same root. It still groups by camera UUID, so a
+    /// selected batch upload only joins each physical camera AP once.
+    public func collectEpisodes(
+        _ episodeDirs: [URL],
+        progress: @escaping @Sendable (Progress) -> Void = { _ in }
+    ) async throws -> [Result] {
+        let items = try Self.itemsForEpisodeDirs(episodeDirs)
+        guard !items.isEmpty else { return [] }
+        return try await runCollect(items: items, progress: progress)
+    }
+
     // MARK: - Pure helper (unit-tested)
 
     /// Group pending items by camera UUID, preserving deterministic order
@@ -111,6 +125,24 @@ public actor Insta360Collector {
             }
             return (uuid: uuid, items: bucket)
         }
+    }
+
+    public static func itemsForEpisodeDirs(
+        _ episodeDirs: [URL]
+    ) throws -> [Insta360PendingSidecar.WithDir] {
+        var items: [Insta360PendingSidecar.WithDir] = []
+        for dir in episodeDirs {
+            for sidecar in try Insta360PendingSidecar.scan(dir) {
+                let mp4 = dir.appendingPathComponent("\(sidecar.streamId).mp4")
+                if FileManager.default.fileExists(atPath: mp4.path) {
+                    continue
+                }
+                items.append(Insta360PendingSidecar.WithDir(
+                    episodeDir: dir,
+                    sidecar: sidecar))
+            }
+        }
+        return items
     }
 
     // MARK: - Private orchestration
@@ -210,10 +242,12 @@ public actor Insta360Collector {
             }
         }
 
-        // Best-effort final WiFi restore + hotspot config cleanup.
+        // Best-effort final camera-hotspot config cleanup. Do not sweep all
+        // app-managed SSIDs here: upload Wi-Fi configs may also have been
+        // installed through NEHotspotConfiguration and must survive collect.
         let finalDownloader = Insta360WiFiDownloader()
         await finalDownloader.finalizeWiFiRestore()
-        await finalDownloader.removeAllHotspotConfigurations()
+        await finalDownloader.removeCameraHotspotConfigurations()
 
         return results
     }
