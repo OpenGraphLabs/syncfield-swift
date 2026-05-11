@@ -2,6 +2,13 @@
 
 All notable changes to **syncfield-swift** are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.4] — 2026-05-11
+
+### Fixed
+- **`SyncFieldInsta360` recordings could lose camera identity if BLE dropped mid-session.** `Insta360CameraStream.stopRecording` read `connectedDeviceUUID` / `connectedDeviceName` off the live `Insta360BLEController` at write time, but Go-family BLE drops on RSSI dip / camera-side sleep clear `connectedDevice` in the disconnect delegate. The pending sidecar then got written with empty `bleUuid` / `bleName` and multiple wrist streams collided on the same `byUUID` bucket on the host's collect path — making the recording unroutable back to its source camera over WiFi. The controller now caches the last-known identity (`lastKnownDeviceUUID` / `lastKnownDeviceName`) at every successful pair/adopt and keeps it across disconnects; `stopRecording` falls through live → lastKnown → `boundUUID` for UUID, and live → lastKnown for name.
+- **`SyncFieldInsta360` recordings could fail to stop if BLE dropped before stopCapture.** `startRemoteRecording`, `stopRemoteRecording`, and `wifiCredentials` threw `notPaired` immediately when `connectedDevice` was cleared, leaving the recording on the camera's SD card but unreachable through the documented stop/ingest flow. Each command now invokes a best-effort `reconnectIfNeeded` (targeted scan + connect using cached `lastKnownDeviceUUID`, 10 s + 10 s budget) before reading `commandManager()`. Recoverable disconnects are now transparent to the host; unrecoverable failures propagate the underlying scan/connect error so the existing caller error path is unchanged.
+- `SyncFieldVersion.current` bumped to `0.7.4`.
+
 ## [0.7.3] — 2026-05-11
 
 ### Fixed
