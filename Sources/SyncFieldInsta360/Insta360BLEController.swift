@@ -351,6 +351,7 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
     /// The camera-side file URI is not available until `stopRemoteRecording()` is called;
     /// the Insta360 SDK delivers it in the `stopCapture` completion block via `videoInfo.uri`.
     public func startRemoteRecording(clock: SessionClock) async throws -> UInt64 {
+        try await reconnectIfNeeded()
         let cmd = try commandManager()
 
         let captureOptions = INSCaptureOptions()
@@ -382,6 +383,7 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
     /// Send a BLE stop-capture command and return the camera-side file URI
     /// assigned by the SDK in the completion callback (`videoInfo?.uri`).
     public func stopRemoteRecording() async throws -> String {
+        try await reconnectIfNeeded()
         let cmd = try commandManager()
 
         let deviceTag = connectedDevice?.name ?? "(unknown)"
@@ -416,6 +418,7 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
     ///    (protocol-existential limitation prevents a direct Swift call).
     /// 3. Fallback: derive SSID from BLE name + default passphrase `"88888888"`.
     public func wifiCredentials() async throws -> (ssid: String, passphrase: String) {
+        try await reconnectIfNeeded()
         guard let device = connectedDevice else {
             throw Insta360Error.notPaired
         }
@@ -480,6 +483,74 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
             throw Insta360Error.commandFailed("BLE command manager unavailable for \(Self.displayName(for: device))")
         }
         return cmd
+    }
+
+    /// Best-effort BLE reconnect using the cached identity. Called as a
+    /// safety net before any command that requires a live session
+    /// (`startRemoteRecording`, `stopRemoteRecording`, `wifiCredentials`)
+    /// so a transient mid-recording disconnect doesn't lose the camera-
+    /// side file URI when the user finally taps stop.
+    ///
+    /// No-op when already connected. Returns silently after one
+    /// successful reconnect; on failure, propagates the underlying
+    /// scan/connect error so the caller's existing error path runs.
+    private func reconnectIfNeeded() async throws {
+        if connectedDevice != nil { return }
+        guard let uuid = lastKnownUUID else {
+            throw Insta360Error.notPaired
+        }
+        NSLog("[Insta360BLE] reconnectIfNeeded — re-pairing to \(uuid)")
+
+        // CoreBluetooth needs a beat to settle after a disconnect before
+        // it'll start a fresh scan reliably. Same poll pattern as `pair`.
+        for _ in 0..<50 {
+            if bluetoothManager.state == .ready { break }
+            try await Task.sleep(nanoseconds: 100_000_000)
+        }
+        guard bluetoothManager.state == .ready else {
+            throw Insta360Error.commandFailed("Bluetooth not ready during reconnect")
+        }
+
+        // Targeted scan: only this UUID counts as a hit. Go 3S in deep
+        // sleep advertises at ~1 Hz so the 10 s budget covers the worst
+        // case where the camera went to sleep right after the drop.
+        let device = try await withTimeout(seconds: 10) {
+            try await withCheckedThrowingContinuation {
+                (cont: CheckedContinuation<INSBluetoothDevice, Error>) in
+                var found = false
+                self.bluetoothManager.scanCameras { [weak self] device, _, _ in
+                    guard let self = self, !found else { return }
+                    let scanUUID = device.identifierUUIDStringSafe
+                    guard scanUUID == uuid else { return }
+                    found = true
+                    self.bluetoothManager.stopScan()
+                    self.scannedDevices[uuid] = device
+                    cont.resume(returning: device)
+                }
+            }
+        }
+
+        try await withTimeout(seconds: 10) {
+            try await withCheckedThrowingContinuation {
+                (cont: CheckedContinuation<Void, Error>) in
+                self.bluetoothManager.connect(device) { error in
+                    if let error = error {
+                        cont.resume(throwing: Insta360Error.commandFailed(error.localizedDescription))
+                        return
+                    }
+                    cont.resume()
+                }
+            }
+        }
+
+        connectedDevice = device
+        rememberIdentity(of: device)
+        Self.registerPaired(device.identifierUUIDStringSafe)
+        startHeartbeat()
+        // Match `pair`'s 1 s stabilise window — without it the next
+        // `getCommandBy` can race the SDK's command-manager publish.
+        try await Task.sleep(nanoseconds: 1_000_000_000)
+        NSLog("[Insta360BLE] reconnectIfNeeded — re-paired \(Self.displayName(for: device))")
     }
 
     private func startHeartbeat() {
