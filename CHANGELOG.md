@@ -2,6 +2,16 @@
 
 All notable changes to **syncfield-swift** are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- `SyncFieldInsta360` now exposes `Insta360Scanner` for Go-family BLE discovery, UUID-based identify cues, explicit pair/unpair helpers, and UUID-bound `Insta360CameraStream(streamId:uuid:)` construction for multi-camera rigs.
+- Added `DiscoveredInsta360`, `Insta360PendingSidecar`, `Insta360TranscodeOptions`, and focused `SyncFieldInsta360Tests` coverage for scanner predicates, timeout behavior, and pending sidecar persistence.
+
+### Changed
+- `Insta360BLEController` uses one process-wide `INSBluetoothManager`, maintains heartbeat while paired, retries scanner pair attempts, and rejects duplicate UUID bindings with `Insta360Error.uuidAlreadyBound`.
+- `Package.swift` can use a local Insta360 SDK framework path during development so host apps can import `SyncFieldInsta360` from a sibling checkout without publishing a release first.
+
 ## [0.6.1] — 2026-05-09
 
 Production hardening for `SyncFieldInsta360`. The `#if canImport(INSCameraServiceSDK)` block was previously type-checked only when a host app linked the binary; this release ports the four fixes that the egonaut/og-skill production fork validated against real-world Go 3S usage (single and dual camera).

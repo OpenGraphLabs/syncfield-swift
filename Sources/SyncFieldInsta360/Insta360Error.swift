@@ -1,6 +1,6 @@
 import Foundation
 
-public enum Insta360Error: Error, CustomStringConvertible {
+public enum Insta360Error: Error, CustomStringConvertible, LocalizedError {
     case frameworkNotLinked
     case notPaired
     case wifiCredentialsUnavailable
@@ -8,6 +8,28 @@ public enum Insta360Error: Error, CustomStringConvertible {
     case downloadFailed(String)
     case commandFailed(String)
     case cameraNotReachable
+
+    // Bridge-level wrist-pairing errors
+    case invalidWristRole(String)
+    case notConnected
+    case roleAlreadyPaired(String)
+    case missingUUID
+    case roleConflict
+    case pairInProgress(String)
+
+    // Hub-level errors (Phase A)
+    case scanAlreadyActive
+    case deviceNotDiscovered(String)    // uuid
+    case deviceNotPaired(String)        // uuid
+    case uuidAlreadyBound(String)       // uuid
+    case identifyPhotoFailed(String)
+
+    // Collect-level errors (Phase C)
+    case pendingSidecarInvalid(String)
+    case collectTimeout(String)          // streamId
+
+    // Camera-side transcode errors (fast-collect path)
+    case transcodeFailed(String)
 
     public var description: String {
         switch self {
@@ -25,6 +47,38 @@ public enum Insta360Error: Error, CustomStringConvertible {
             return "Insta360Error: BLE command failed (\(detail))"
         case .cameraNotReachable:
             return "Insta360Error: camera AP reachable timeout at 192.168.42.1"
+        case .invalidWristRole(let raw):
+            return "wrist role must be 'left' or 'right', got: \(raw)"
+        case .notConnected:
+            return "SyncField bridge is not connected (call connect() first)"
+        case .roleAlreadyPaired(let role):
+            return "wrist role already paired: \(role)"
+        case .missingUUID:
+            return "pairStandalone succeeded but no UUID returned"
+        case .roleConflict:
+            return "camera already claimed under another wrist role"
+        case .pairInProgress(let role):
+            return "pair already in progress for wrist role: \(role)"
+        case .scanAlreadyActive:
+            return "Insta360Error: BLE scan is already active"
+        case .deviceNotDiscovered(let uuid):
+            return "Insta360Error: device \(uuid) not seen in recent scan"
+        case .deviceNotPaired(let uuid):
+            return "Insta360Error: device \(uuid) is not currently paired"
+        case .uuidAlreadyBound(let uuid):
+            return "Insta360Error: device \(uuid) is already bound to another Insta360CameraStream"
+        case .identifyPhotoFailed(let detail):
+            return "Insta360Error: takePicture failed (\(detail))"
+        case .pendingSidecarInvalid(let reason):
+            return "Insta360Error: pending sidecar invalid (\(reason))"
+        case .collectTimeout(let streamId):
+            return "Insta360Error: collect timeout for \(streamId)"
+        case .transcodeFailed(let detail):
+            return "Insta360Error: camera-side transcode failed (\(detail))"
         }
     }
+
+    /// `LocalizedError.errorDescription` is what `NSError.localizedDescription`
+    /// surfaces — the bridge forwards this string to JS via `reject(code, msg, err)`.
+    public var errorDescription: String? { description }
 }

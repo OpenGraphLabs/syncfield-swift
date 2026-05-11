@@ -1,6 +1,10 @@
 import Foundation
 import SyncField
 
+#if canImport(INSCameraServiceSDK)
+import INSCameraServiceSDK
+#endif
+
 /// BLE-triggered Insta360 Go 3S camera stream.
 ///
 /// Lifecycle:
@@ -26,13 +30,54 @@ public final class Insta360CameraStream: SyncFieldStream, @unchecked Sendable {
     /// Camera-side file URI returned by the BLE stop-capture command.
     private var cameraFileURI: String?
 
+    /// Episode directory captured at `startRecording` time so `stopRecording`
+    /// can write the pending sidecar even though it isn't passed in.
+    private var currentEpisodeDirectory: URL?
+
+    /// WiFi credentials captured at `pairStandalone` time. Used by `ingest`
+    /// to skip a live BLE round-trip during the WiFi AP switch.
+    private var cachedCreds: (ssid: String, passphrase: String)?
+
+    /// Callback invoked with stream lifecycle events. Set by `pairStandalone`
+    /// when the bridge creates this stream outside the orchestrator's connect
+    /// path; nil if the orchestrator owns the stream (uses `healthBus` instead).
+    private var onHealthEvent: (@Sendable (HealthEvent) -> Void)?
+
+    /// Callback invoked for SDK-level camera warnings (battery, storage,
+    /// thermal, unexpected capture-stop). Wired by the bridge to
+    /// `syncfield:cameraWarning` so a HUD banner can surface before the
+    /// camera self-stops. Independent of `onHealthEvent` because these
+    /// events are camera-specific.
+    private var onCameraWarning: (@Sendable (Insta360CameraWarning) -> Void)?
+    private let boundUUID: String?
+
     #if canImport(INSCameraServiceSDK)
-    private let ble  = Insta360BLEController()
+    private var ble  = Insta360BLEController()
     private let wifi = Insta360WiFiDownloader()
     #endif
 
     public init(streamId: String) {
         self.streamId = streamId
+        self.boundUUID = nil
+    }
+
+    /// Bind this stream to a specific CoreBluetooth peripheral UUID.
+    ///
+    /// Use this with `Insta360Scanner.scan()` + `identify(uuid:)` when a rig
+    /// has multiple Go cameras and the host must decide which physical camera
+    /// maps to which stream id.
+    public init(streamId: String, uuid: String) {
+        self.streamId = streamId
+        self.boundUUID = uuid
+    }
+
+    public func setCameraWarningHandler(
+        _ handler: (@Sendable (Insta360CameraWarning) -> Void)?
+    ) {
+        self.onCameraWarning = handler
+        #if canImport(INSCameraServiceSDK)
+        wireWarningChannel()
+        #endif
     }
 
     public func prepare() async throws {
@@ -44,10 +89,143 @@ public final class Insta360CameraStream: SyncFieldStream, @unchecked Sendable {
     public func connect(context: StreamConnectContext) async throws {
         self.healthBus = context.healthBus
         #if canImport(INSCameraServiceSDK)
-        try await ble.pair()
+        // If the bridge already paired this stream via `pairStandalone`,
+        // `connect` is a no-op — we just store the bus reference so future
+        // lifecycle events (e.g. `.streamDisconnected` on disconnect) are
+        // published there too.
+        if ble.connectedDeviceUUID != nil {
+            return
+        }
+        if let uuid = boundUUID {
+            ble = try await Insta360Scanner.shared.bindController(uuid: uuid)
+            wireWarningChannel()
+            do {
+                self.cachedCreds = try await ble.wifiCredentials()
+                await healthBus?.publish(.streamConnected(streamId: streamId))
+            } catch {
+                await Insta360Scanner.shared.releaseBinding(uuid: uuid)
+                throw error
+            }
+            return
+        }
+        wireWarningChannel()
+        try await ble.pair(excludingUUIDs: [])
+        self.cachedCreds = try await ble.wifiCredentials()
         await healthBus?.publish(.streamConnected(streamId: streamId))
         #else
         throw Insta360Error.frameworkNotLinked
+        #endif
+    }
+
+    /// Pair this stream's BLE camera outside of the orchestrator's `connect()`
+    /// path. The bridge uses this when the user drives pairing manually from
+    /// the discovery screen (e.g. per-role wrist pairing), so each pair is a
+    /// distinct awaitable that can fail, retry, and surface progress to JS.
+    ///
+    /// # Lifecycle-channel contract
+    /// Once a stream has been paired via `pairStandalone`, its **entire**
+    /// lifecycle (`.streamConnected` here, `.streamDisconnected` in
+    /// `disconnect()`) is delivered via `onHealthEvent`. The orchestrator's
+    /// `healthBus` is never published to for this stream, because the bus
+    /// is private to the SDK. If the orchestrator then calls
+    /// `connect(context:)` on this stream, it's a no-op (see that method).
+    /// The bridge is responsible for forwarding `onHealthEvent` callbacks
+    /// to any RN event channel so JS consumers see a consistent signal.
+    public func pairStandalone(
+        onHealthEvent: @escaping @Sendable (HealthEvent) -> Void,
+        onCameraWarning: (@Sendable (Insta360CameraWarning) -> Void)? = nil,
+        excludingUUIDs: Set<String>
+    ) async throws {
+        #if canImport(INSCameraServiceSDK)
+        guard ble.connectedDeviceUUID == nil else {
+            throw Insta360Error.commandFailed(
+                "pairStandalone called on already-paired stream \(streamId)")
+        }
+        self.onHealthEvent = onHealthEvent
+        self.onCameraWarning = onCameraWarning
+        wireWarningChannel()
+        if let uuid = boundUUID {
+            ble = try await Insta360Scanner.shared.bindController(uuid: uuid)
+            do {
+                self.cachedCreds = try await ble.wifiCredentials()
+            } catch {
+                await Insta360Scanner.shared.releaseBinding(uuid: uuid)
+                throw error
+            }
+        } else {
+            try await ble.pair(excludingUUIDs: excludingUUIDs)
+            self.cachedCreds = try await ble.wifiCredentials()
+        }
+        // Snapshot WiFi creds while BLE is freshly connected so `ingest` can
+        // skip the BLE round-trip during the radio-contested hotspot switch.
+        onHealthEvent(.streamConnected(streamId: streamId))
+        #else
+        throw Insta360Error.frameworkNotLinked
+        #endif
+    }
+
+    /// Bridge-side hub (`Insta360BluetoothHub`) owns the BLE manager and
+    /// pre-pairs devices via its multi-camera scan. When the user selects
+    /// a role for an already-identified camera, the hub hands the paired
+    /// `INSBluetoothDevice` off to a fresh `Insta360CameraStream` through
+    /// this method. The stream skips its own scan and goes straight to
+    /// caching WiFi creds + publishing `.streamConnected`.
+    ///
+    /// # Lifecycle-channel contract
+    /// Same as `pairStandalone` — the stream publishes to `onHealthEvent`
+    /// for its entire lifecycle, bypassing `healthBus`.
+    public func adoptPairedDevice(
+        _ device: Any,
+        onHealthEvent: @escaping @Sendable (HealthEvent) -> Void,
+        onCameraWarning: (@Sendable (Insta360CameraWarning) -> Void)? = nil
+    ) async throws {
+        #if canImport(INSCameraServiceSDK)
+        guard let bt = device as? INSBluetoothDevice else {
+            throw Insta360Error.commandFailed(
+                "adoptPairedDevice given non-INSBluetoothDevice")
+        }
+        guard ble.connectedDeviceUUID == nil else {
+            throw Insta360Error.commandFailed(
+                "adoptPairedDevice called on already-paired stream \(streamId)")
+        }
+        self.onHealthEvent = onHealthEvent
+        self.onCameraWarning = onCameraWarning
+        wireWarningChannel()
+        ble.adoptConnectedDevice(bt)
+        self.cachedCreds = try await ble.wifiCredentials()
+        onHealthEvent(.streamConnected(streamId: streamId))
+        #else
+        throw Insta360Error.frameworkNotLinked
+        #endif
+    }
+
+    /// Connect the BLE controller's SDK-level warning channel through to
+    /// the bridge-supplied `onCameraWarning` callback. Captures `streamId`
+    /// and the callback as locals so the closure does not retain `self`.
+    /// `captureStoppedUnexpectedly` is *also* mirrored as a
+    /// `.streamDisconnected` health event so consumers that subscribe to
+    /// the orchestrator's lifecycle channel see the interruption too.
+    #if canImport(INSCameraServiceSDK)
+    private func wireWarningChannel() {
+        let warn = onCameraWarning
+        let health = onHealthEvent
+        let id = streamId
+        ble.onWarning = { event in
+            warn?(event)
+            if case .captureStoppedUnexpectedly = event {
+                health?(.streamDisconnected(streamId: id, reason: "camera_self_stopped"))
+            }
+        }
+    }
+    #endif
+
+    /// UUID of the currently-paired camera. `nil` before pairing or after
+    /// disconnect. Bridge reads this to append to its claimed-UUID set.
+    public var connectedDeviceUUID: String? {
+        #if canImport(INSCameraServiceSDK)
+        return ble.connectedDeviceUUID
+        #else
+        return nil
         #endif
     }
 
@@ -57,6 +235,7 @@ public final class Insta360CameraStream: SyncFieldStream, @unchecked Sendable {
     public func startRecording(clock: SessionClock,
                                writerFactory: WriterFactory) async throws {
         #if canImport(INSCameraServiceSDK)
+        self.currentEpisodeDirectory = writerFactory.videoURL(streamId: streamId).deletingLastPathComponent()
         self.bleAckMonotonicNs = try await ble.startRemoteRecording(clock: clock)
         #else
         throw Insta360Error.frameworkNotLinked
@@ -68,6 +247,21 @@ public final class Insta360CameraStream: SyncFieldStream, @unchecked Sendable {
     public func stopRecording() async throws -> StreamStopReport {
         #if canImport(INSCameraServiceSDK)
         self.cameraFileURI = try await ble.stopRemoteRecording()
+        if let epDir = currentEpisodeDirectory,
+           let uri = cameraFileURI {
+            let role = streamId.hasSuffix("_ego")   ? "ego"
+                       : streamId.hasSuffix("_left")  ? "left"
+                       : streamId.hasSuffix("_right") ? "right"
+                       : ""
+            try? Insta360PendingSidecar.write(
+                to: epDir,
+                streamId: streamId,
+                cameraFileURI: uri,
+                bleUuid: ble.connectedDeviceUUID ?? "",
+                bleName: ble.connectedDeviceName ?? "",
+                role: role,
+                bleAckNs: bleAckMonotonicNs)
+        }
         return StreamStopReport(streamId: streamId, frameCount: 0, kind: "video")
         #else
         throw Insta360Error.frameworkNotLinked
@@ -81,15 +275,18 @@ public final class Insta360CameraStream: SyncFieldStream, @unchecked Sendable {
             throw Insta360Error.downloadFailed("no camera file uri recorded from stopRecording")
         }
 
-        // 1. Fetch WiFi credentials over the existing BLE channel (already paired).
-        let creds = try await ble.wifiCredentials()
+        // 1. Use credentials captured at pair time. Fallback to live BLE fetch
+        //    only if the stream was connected via the orchestrator path
+        //    (older code path) — which also sets `cachedCreds` now, but we
+        //    keep the fallback to avoid a hard crash on unexpected state.
+        let creds: (ssid: String, passphrase: String)
+        if let cached = cachedCreds {
+            creds = cached
+        } else {
+            creds = try await ble.wifiCredentials()
+        }
 
         // 2. Switch iPhone onto the camera's AP, download the clip, restore previous WiFi.
-        //    `wifi.download`'s `progress` is `@escaping` (it gets stored by
-        //    the Insta360 SDK's HTTP socket and called asynchronously).
-        //    Our `progress` parameter is non-escaping per the SyncFieldStream
-        //    protocol, so wrap with `withoutActuallyEscaping` — safe because
-        //    `wifi.download` only invokes the callback during its own await.
         let destination = episodeDirectory.appendingPathComponent("\(streamId).mp4")
         try await withoutActuallyEscaping(progress) { escaping in
             _ = try await wifi.download(
@@ -107,9 +304,11 @@ public final class Insta360CameraStream: SyncFieldStream, @unchecked Sendable {
             streamId: streamId,
             bleAckMonotonicNs: bleAckMonotonicNs)
 
+        try? Insta360PendingSidecar.delete(at: episodeDirectory, streamId: streamId)
+
         return StreamIngestReport(streamId: streamId,
                                   filePath: "\(streamId).mp4",
-                                  frameCount: nil /* frame count unknown; server can probe from mp4 */)
+                                  frameCount: nil)
         #else
         throw Insta360Error.frameworkNotLinked
         #endif
@@ -117,9 +316,19 @@ public final class Insta360CameraStream: SyncFieldStream, @unchecked Sendable {
 
     public func disconnect() async throws {
         #if canImport(INSCameraServiceSDK)
-        try? await ble.unpair()
+        if let uuid = boundUUID {
+            try? await Insta360Scanner.shared.unpair(uuid: uuid)
+        } else {
+            try? await ble.unpair()
+        }
+        cachedCreds = nil
         #endif
-        await healthBus?.publish(.streamDisconnected(streamId: streamId, reason: "normal"))
+        let event = HealthEvent.streamDisconnected(streamId: streamId, reason: "normal")
+        if let cb = onHealthEvent {
+            cb(event)
+        } else {
+            await healthBus?.publish(event)
+        }
     }
 }
 

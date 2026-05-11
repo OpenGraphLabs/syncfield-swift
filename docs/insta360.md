@@ -35,6 +35,13 @@ The Insta360 SDK license forbids redistributing the binaries. Do not commit them
 3. Open the app target's **Build Settings** and add `TO_B_SDK=1` to **Preprocessor Macros**. This flag is required by the Insta360 SDK.
 4. The xcframeworks pull in CoreBluetooth, NetworkExtension, and SystemConfiguration transitively. Xcode resolves these for you.
 
+When developing `SyncFieldInsta360` from a local checkout, the package target
+also needs to see the Insta360 framework search path while SwiftPM resolves the
+manifest. Set `SYNCFIELD_INSTA360_SDK_PATH` to the full path of
+`INSCameraServiceSDK.xcframework`, or keep `syncfield-swift` next to `og-skill`
+so the local development path is auto-detected. Set
+`SYNCFIELD_DISABLE_LOCAL_INSTA360_SDK=1` to force the no-framework fallback.
+
 ## Capabilities and permissions
 
 On the app target:
@@ -103,17 +110,34 @@ Full view controller example: [`examples/ego-plus-wrist/EgoWristViewController.s
 
 ## Multi-camera
 
-Add multiple `Insta360CameraStream` instances with distinct `streamId`s to the same `SessionOrchestrator`. `connect()` pairs them in turn (each stream automatically skips the camera the previous one already claimed); `startRecording()` triggers all of them atomically; `ingest()` downloads them sequentially, switching the iPhone Wi-Fi between camera APs and restoring the previous network in between. Tested with two Go 3S.
+For multiple Go 3S cameras, scan first, identify each physical device, then bind each stream to the chosen CoreBluetooth UUID. Role labels such as `left`, `right`, or `tripod` belong in your app; the SDK owns only discovery, identify, UUID binding, pairing, heartbeat, recording, and ingest.
 
 ```swift
-let wristL = Insta360CameraStream(streamId: "cam_wrist_left")
-let wristR = Insta360CameraStream(streamId: "cam_wrist_right")
+var discovered: [DiscoveredInsta360] = []
+for await camera in try await Insta360Scanner.shared.scan() {
+    discovered.append(camera)
+    if discovered.count == 2 { break }
+}
+await Insta360Scanner.shared.stopScan()
+
+for camera in discovered {
+    try await Insta360Scanner.shared.identify(uuid: camera.uuid)
+    // App UI asks the user which role just flashed/clicked.
+}
+
+let wristL = Insta360CameraStream(streamId: "cam_wrist_left", uuid: leftUUID)
+let wristR = Insta360CameraStream(streamId: "cam_wrist_right", uuid: rightUUID)
 try await session.add(wristL)
 try await session.add(wristR)
 ```
+
+`Insta360CameraStream(streamId:)` is still available for a single camera. In a
+multi-camera rig, prefer the UUID initializer; otherwise BLE scan order decides
+which physical camera each stream claims.
 
 ## Gotchas
 
 - **Wi-Fi rejoin prompt**. iOS shows a system prompt the first time the app applies a hotspot config. If the user declines, `ingest()` throws `Insta360Error.hotspotApplyFailed`.
 - **Self stopped capture**. If the camera halts recording itself (overheat, full storage), `stopRecording()` may throw `commandFailed`. Surface the error to the user, do not retry blindly.
+- **Duplicate UUID binding**. Binding the same UUID to two live streams throws `Insta360Error.uuidAlreadyBound`.
 - **Version pinning**. `SyncFieldInsta360.version` re-exports `SyncFieldVersion.current`, so the optional module always tracks the core release.
