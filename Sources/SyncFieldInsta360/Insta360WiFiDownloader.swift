@@ -65,7 +65,8 @@ public final class Insta360WiFiDownloader: @unchecked Sendable {
             try await Task.sleep(nanoseconds: 500_000_000) // 0.5 s for socket init
             INSCameraManager.socket().commandsImpl.sendHeartbeats(with: nil)
 
-            bytes = try await fetchResource(remoteFileURI: remoteFileURI,
+            let resolvedURI = try await resolveRemoteFileURIIfNeeded(remoteFileURI)
+            bytes = try await fetchResource(remoteFileURI: resolvedURI,
                                              destination: destination,
                                              progress: progress)
         } catch {
@@ -171,7 +172,7 @@ public final class Insta360WiFiDownloader: @unchecked Sendable {
         // file of each camera's batch.
 
         var results: [BatchResult] = []
-        for (idx, item) in items.enumerated() {
+        for (idx, originalItem) in items.enumerated() {
             // Fresh SDK socket per file (SDK doesn't support back-to-back
             // fetchResource on one socket). First file sleeps 300 ms after
             // setup to let the socket init; subsequent files only need 150 ms
@@ -180,6 +181,25 @@ public final class Insta360WiFiDownloader: @unchecked Sendable {
             INSCameraManager.socket().setup()
             try? await Task.sleep(nanoseconds: idx == 0 ? 300_000_000 : 150_000_000)
             INSCameraManager.socket().commandsImpl.sendHeartbeats(with: nil)
+
+            let item: BatchItem
+            do {
+                let resolvedURI = try await resolveRemoteFileURIIfNeeded(originalItem.remoteFileURI)
+                item = BatchItem(
+                    episodeDir: originalItem.episodeDir,
+                    streamId: originalItem.streamId,
+                    remoteFileURI: resolvedURI,
+                    destination: originalItem.destination,
+                    bleAckMonotonicNs: originalItem.bleAckMonotonicNs)
+            } catch {
+                NSLog("[WiFiDownloader] downloadBatch item \(originalItem.streamId) URI resolution failed: \(error.localizedDescription)")
+                results.append(BatchResult(
+                    item: originalItem,
+                    success: false,
+                    error: error.localizedDescription))
+                INSCameraManager.socket().shutdown()
+                continue
+            }
 
             // Signal "this item is the one actively downloading now" so the
             // UI can move the progress bar to it. Queued siblings stay in
@@ -371,39 +391,6 @@ public final class Insta360WiFiDownloader: @unchecked Sendable {
                 "toPbData returned non-NSData type: \(type(of: value))")
         }
         return nsData as Data
-    }
-
-    /// Snapshot every video URI currently visible to the camera HTTP API.
-    /// Used as a before/after diff to discover which URI the transcoded mp4
-    /// landed at (since `uploadEditDataWithData`'s completion block reports
-    /// no output URI directly).
-    private func fetchVideoURIs() async throws -> Set<String> {
-        let http = INSCameraHTTPManager.socket()
-        return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Set<String>, Error>) in
-            let task = http.fetchVideoList(completion: { error, list in
-                if let error = error {
-                    cont.resume(throwing: Insta360Error.transcodeFailed(
-                        "fetchVideoList failed: \(error.localizedDescription)"))
-                    return
-                }
-                var set = Set<String>()
-                if let list = list as? [Any] {
-                    for item in list {
-                        let obj = item as AnyObject
-                        if obj.responds(to: NSSelectorFromString("uri")),
-                           let uri = obj.value(forKey: "uri") as? String,
-                           !uri.isEmpty {
-                            set.insert(uri)
-                        }
-                    }
-                }
-                cont.resume(returning: set)
-            })
-            if task == nil {
-                cont.resume(throwing: Insta360Error.transcodeFailed(
-                    "fetchVideoList returned nil task"))
-            }
-        }
     }
 
     /// Locate the transcoded output URI by diffing the video list before and
@@ -602,6 +589,56 @@ public final class Insta360WiFiDownloader: @unchecked Sendable {
     }
 
     #endif
+
+    /// Snapshot every video URI currently visible to the camera HTTP API.
+    /// Used both by the fallback path when stopCapture confirms stop without
+    /// a URI, and by the optional camera-side transcode discovery flow.
+    private func fetchVideoURIList() async throws -> [String] {
+        let http = INSCameraHTTPManager.socket()
+        return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<[String], Error>) in
+            let task = http.fetchVideoList(completion: { error, list in
+                if let error = error {
+                    cont.resume(throwing: Insta360Error.downloadFailed(
+                        "fetchVideoList failed: \(error.localizedDescription)"))
+                    return
+                }
+                var uris: [String] = []
+                if let list = list as? [Any] {
+                    for item in list {
+                        let obj = item as AnyObject
+                        if obj.responds(to: NSSelectorFromString("uri")),
+                           let uri = obj.value(forKey: "uri") as? String,
+                           !uri.isEmpty {
+                            uris.append(uri)
+                        }
+                    }
+                }
+                cont.resume(returning: uris)
+            })
+            if task == nil {
+                cont.resume(throwing: Insta360Error.downloadFailed(
+                    "fetchVideoList returned nil task"))
+            }
+        }
+    }
+
+    private func fetchVideoURIs() async throws -> Set<String> {
+        Set(try await fetchVideoURIList())
+    }
+
+    private func resolveRemoteFileURIIfNeeded(_ remoteFileURI: String) async throws -> String {
+        guard Insta360PendingSidecar.needsCameraFileURIResolution(remoteFileURI) else {
+            return remoteFileURI
+        }
+
+        let uris = try await fetchVideoURIList()
+        guard let resolved = Insta360VideoURIFallback.bestCandidate(from: uris) else {
+            throw Insta360Error.downloadFailed(
+                "could not resolve camera video URI after stopCapture returned no URI")
+        }
+        NSLog("[WiFiDownloader] resolved missing camera URI to \(resolved)")
+        return resolved
+    }
 
     /// `ProgressThrottle` equivalent local to this file. Nested type so the
     /// batch path doesn't need to reach into SyncFieldBridgeModule's private

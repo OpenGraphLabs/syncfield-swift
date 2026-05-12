@@ -239,19 +239,26 @@ public actor SessionOrchestrator {
     }
 
     public func stopRecording() async throws -> StopReport {
-        try require(state: .recording, next: .stopping)
-        // Transition state IMMEDIATELY, before any `await`. Without this the
-        // chirp emit + tail margin sleep (~700ms) opens a window where a
-        // concurrent caller could re-enter and pass the same require check,
-        // causing the full stop sequence to execute twice (double chirp,
-        // double BLE stopCapture giving "msg execute err" on the second
-        // send, corrupted AVAssetWriter finalize that breaks downstream
-        // mp4 reads).
-        state = .stopping
+        let isRetryingStop: Bool
+        switch state {
+        case .recording:
+            // Transition state IMMEDIATELY, before any `await`. Without this the
+            // chirp emit + tail margin sleep (~700ms) opens a window where a
+            // concurrent caller could re-enter and pass the same require check.
+            state = .stopping
+            stopReportsByStreamId.removeAll()
+            isRetryingStop = false
+        case .stopping:
+            // Previous stop attempt confirmed some streams and failed others.
+            // Retry only streams that do not yet have a stop report.
+            isRetryingStop = true
+        default:
+            throw SessionError.invalidTransition(from: state, to: .stopping)
+        }
         let t0 = DispatchTime.now().uptimeNanoseconds
 
         // Stop chirp: emit first, wait for tail to be captured
-        if let spec = stopChirpSpec {
+        if !isRetryingStop, let spec = stopChirpSpec {
             self.stopEmission = await chirpPlayer.play(spec)
             let waitMs = spec.durationMs + preStopTailMarginMs
             try? await Task.sleep(nanoseconds: UInt64(waitMs * 1_000_000))
@@ -280,11 +287,11 @@ public actor SessionOrchestrator {
         // Errors are collected rather than short-circuited so that a
         // failing BLE camera doesn't cancel a healthy stream's finalise
         // (AVAssetWriter commit etc).
-        var reports: [StreamStopReport] = []
         var firstError: Error?
         let tBeforeStreamStop = DispatchTime.now().uptimeNanoseconds
         await withTaskGroup(of: (StreamStopReport?, Error?).self) { group in
             for s in streams {
+                if stopReportsByStreamId[s.streamId] != nil { continue }
                 let id = s.streamId
                 group.addTask { [s] in
                     let t0 = DispatchTime.now().uptimeNanoseconds
@@ -299,7 +306,9 @@ public actor SessionOrchestrator {
                 }
             }
             for await (report, error) in group {
-                if let report = report { reports.append(report) }
+                if let report = report {
+                    stopReportsByStreamId[report.streamId] = report
+                }
                 if let error = error, firstError == nil { firstError = error }
             }
         }
@@ -342,7 +351,7 @@ public actor SessionOrchestrator {
         // already closed its file, falling back to the conventional
         // `<streamId>.jsonl` path for sensor streams.
         let manifestResults: [String: Result<StreamIngestReport, Error>] =
-            Dictionary(uniqueKeysWithValues: reports.map { r in
+            Dictionary(uniqueKeysWithValues: stopReportsInStreamOrder().map { r in
                 (r.streamId, .success(StreamIngestReport(
                     streamId: r.streamId,
                     filePath: Self.defaultFilePath(streamId: r.streamId, kind: r.kind),
@@ -353,7 +362,7 @@ public actor SessionOrchestrator {
         // State is already `.stopping` (set at the top before any await
         // to gate concurrent callers).
         if let error = firstError { throw error }
-        return StopReport(streamReports: reports)
+        return StopReport(streamReports: stopReportsInStreamOrder())
     }
 
     /// Close the recording without running per-stream `ingest`. Use this when
@@ -438,6 +447,7 @@ public actor SessionOrchestrator {
     private var startEmission: ChirpEmission?
     private var stopEmission: ChirpEmission?
     private var currentSyncPoint: SyncPoint?
+    private var stopReportsByStreamId: [String: StreamStopReport] = [:]
 
     // Hand FOV quality state — created in startRecording, finalized in stopRecording.
     private var handQualityConfig: HandQualityConfig
@@ -452,6 +462,10 @@ public actor SessionOrchestrator {
         #else
         return SilentChirpPlayer()
         #endif
+    }
+
+    private func stopReportsInStreamOrder() -> [StreamStopReport] {
+        streams.compactMap { stopReportsByStreamId[$0.streamId] }
     }
 
     /// Run the pre-start countdown. For each tick: fire `onTick(remaining)`

@@ -5,6 +5,8 @@ import Foundation
 /// URI is not lost if `ingest` is skipped or fails), deleted at successful
 /// `ingest` or `collectEpisode`. Same directory as the final `.mp4`.
 public struct Insta360PendingSidecar: Codable, Sendable {
+    public static let unresolvedCameraFileURI = "unresolved://latest-video"
+
     public let streamId: String
     public let cameraFileURI: String
     public let bleUuid: String
@@ -12,6 +14,36 @@ public struct Insta360PendingSidecar: Codable, Sendable {
     public let role: String              // "ego" | "left" | "right"
     public let bleAckMonotonicNs: UInt64
     public let savedAt: String           // ISO8601
+    public let stopFailureReason: String?
+
+    public init(
+        streamId: String,
+        cameraFileURI: String,
+        bleUuid: String,
+        bleName: String,
+        role: String,
+        bleAckMonotonicNs: UInt64,
+        savedAt: String,
+        stopFailureReason: String? = nil
+    ) {
+        self.streamId = streamId
+        self.cameraFileURI = cameraFileURI
+        self.bleUuid = bleUuid
+        self.bleName = bleName
+        self.role = role
+        self.bleAckMonotonicNs = bleAckMonotonicNs
+        self.savedAt = savedAt
+        self.stopFailureReason = stopFailureReason
+    }
+
+    public var needsCameraFileURIResolution: Bool {
+        Self.needsCameraFileURIResolution(cameraFileURI)
+    }
+
+    public static func needsCameraFileURIResolution(_ uri: String) -> Bool {
+        uri.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || uri == unresolvedCameraFileURI
+    }
 
     // MARK: - Naming
 
@@ -28,7 +60,8 @@ public struct Insta360PendingSidecar: Codable, Sendable {
         bleUuid: String,
         bleName: String,
         role: String,
-        bleAckNs: UInt64
+        bleAckNs: UInt64,
+        stopFailureReason: String? = nil
     ) throws {
         let sidecar = Insta360PendingSidecar(
             streamId: streamId,
@@ -37,7 +70,8 @@ public struct Insta360PendingSidecar: Codable, Sendable {
             bleName: bleName,
             role: role,
             bleAckMonotonicNs: bleAckNs,
-            savedAt: ISO8601DateFormatter().string(from: Date()))
+            savedAt: ISO8601DateFormatter().string(from: Date()),
+            stopFailureReason: stopFailureReason)
 
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -46,6 +80,26 @@ public struct Insta360PendingSidecar: Codable, Sendable {
         try FileManager.default.createDirectory(
             at: episodeDirectory, withIntermediateDirectories: true)
         try data.write(to: url, options: [.atomic])
+    }
+
+    public static func writeUnresolved(
+        to episodeDirectory: URL,
+        streamId: String,
+        bleUuid: String,
+        bleName: String,
+        role: String,
+        bleAckNs: UInt64,
+        stopFailureReason: String
+    ) throws {
+        try write(
+            to: episodeDirectory,
+            streamId: streamId,
+            cameraFileURI: unresolvedCameraFileURI,
+            bleUuid: bleUuid,
+            bleName: bleName,
+            role: role,
+            bleAckNs: bleAckNs,
+            stopFailureReason: stopFailureReason)
     }
 
     // MARK: - Scan

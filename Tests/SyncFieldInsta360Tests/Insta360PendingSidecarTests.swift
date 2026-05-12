@@ -62,6 +62,23 @@ final class Insta360PendingSidecarTests: XCTestCase {
         XCTAssertTrue(try Insta360PendingSidecar.scan(tempDir).isEmpty)
     }
 
+    func test_writeUnresolved_marksSidecarForLaterURIResolution() throws {
+        try Insta360PendingSidecar.writeUnresolved(
+            to: tempDir,
+            streamId: "cam_wrist_left",
+            bleUuid: "AAAA",
+            bleName: "GO 3S A",
+            role: "left",
+            bleAckNs: 99,
+            stopFailureReason: "stopCapture returned no videoInfo.uri")
+
+        let scanned = try Insta360PendingSidecar.scan(tempDir)
+        XCTAssertEqual(scanned.count, 1)
+        XCTAssertTrue(scanned[0].needsCameraFileURIResolution)
+        XCTAssertEqual(scanned[0].cameraFileURI, Insta360PendingSidecar.unresolvedCameraFileURI)
+        XCTAssertEqual(scanned[0].stopFailureReason, "stopCapture returned no videoInfo.uri")
+    }
+
     // MARK: - scanRecursive
 
     func test_scanRecursive_findsPendingsAcrossEpisodes() throws {

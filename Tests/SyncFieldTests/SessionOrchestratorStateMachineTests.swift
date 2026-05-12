@@ -36,6 +36,33 @@ final class SessionOrchestratorStateMachineTests: XCTestCase {
         state = await s.state; XCTAssertEqual(state, .idle)
     }
 
+    func test_stopRecording_canRetryOnlyFailedStreamsFromStoppingState() async throws {
+        let (s, _) = makeSession()
+        let good = MockStream(streamId: "good")
+        let flaky = MockStream(streamId: "flaky")
+        await flaky.failNextStops(1)
+        try await s.add(good)
+        try await s.add(flaky)
+
+        try await s.connect()
+        _ = try await s.startRecording()
+
+        do {
+            _ = try await s.stopRecording()
+            XCTFail("expected first stop attempt to fail")
+        } catch {
+            let state = await s.state
+            XCTAssertEqual(state, .stopping)
+        }
+
+        let retryReport = try await s.stopRecording()
+        XCTAssertEqual(retryReport.streamReports.map(\.streamId), ["good", "flaky"])
+        let goodStopCallCount = await good.stopCallCount
+        let flakyStopCallCount = await flaky.stopCallCount
+        XCTAssertEqual(goodStopCallCount, 1)
+        XCTAssertEqual(flakyStopCallCount, 2)
+    }
+
     func test_start_without_connect_throws_invalid_transition() async {
         let (s, _) = makeSession()
         try? await s.add(MockStream(streamId: "a"))

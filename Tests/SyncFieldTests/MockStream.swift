@@ -12,11 +12,13 @@ actor MockStream: SyncFieldStream {
 
     enum FailAt { case none, prepare, connect, start, stop, ingest, disconnect }
     var failAt: FailAt = .none
+    var stopFailuresRemaining = 0
 
     var prepared = false
     var connected = false
     var recording = false
     var ingested  = false
+    var stopCallCount = 0
 
     init(streamId: String, requiresIngest: Bool = false, kind: String = "sensor") {
         self.streamId = streamId
@@ -27,6 +29,7 @@ actor MockStream: SyncFieldStream {
     }
 
     func setFailAt(_ f: FailAt) { self.failAt = f }
+    func failNextStops(_ count: Int) { self.stopFailuresRemaining = count }
 
     func prepare() async throws {
         if failAt == .prepare { throw TestError.boom }
@@ -44,6 +47,11 @@ actor MockStream: SyncFieldStream {
     }
 
     func stopRecording() async throws -> StreamStopReport {
+        stopCallCount += 1
+        if stopFailuresRemaining > 0 {
+            stopFailuresRemaining -= 1
+            throw TestError.boom
+        }
         if failAt == .stop { throw TestError.boom }
         recording = false
         return StreamStopReport(streamId: streamId, frameCount: 0, kind: stopKind)

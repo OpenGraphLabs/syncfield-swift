@@ -286,7 +286,9 @@ public final class Insta360CameraStream: SyncFieldStream, SyncFieldRecordingPref
     /// in the completion callback — this is where cameraFileURI is populated.
     public func stopRecording() async throws -> StreamStopReport {
         #if canImport(INSCameraServiceSDK)
-        self.cameraFileURI = try await ble.stopRemoteRecording()
+        let stopResult = try await ble.stopRemoteRecordingReliably()
+        self.cameraFileURI = stopResult.cameraFileURI
+            ?? Insta360PendingSidecar.unresolvedCameraFileURI
         if let epDir = currentEpisodeDirectory,
            let uri = cameraFileURI {
             let role = streamId.hasSuffix("_ego")   ? "ego"
@@ -315,14 +317,29 @@ public final class Insta360CameraStream: SyncFieldStream, SyncFieldRecordingPref
             if resolvedUUID.isEmpty || resolvedName.isEmpty {
                 NSLog("[Insta360CameraStream] WARNING pending sidecar for \(streamId) has weak identity: uuid='\(resolvedUUID)' name='\(resolvedName)' (live uuid=\(liveUUID ?? "nil") lastKnown uuid=\(ble.lastKnownDeviceUUID ?? "nil") boundUUID=\(boundUUID ?? "nil"))")
             }
-            try? Insta360PendingSidecar.write(
-                to: epDir,
-                streamId: streamId,
-                cameraFileURI: uri,
-                bleUuid: resolvedUUID,
-                bleName: resolvedName,
-                role: role,
-                bleAckNs: bleAckMonotonicNs)
+            do {
+                if Insta360PendingSidecar.needsCameraFileURIResolution(uri) {
+                    try Insta360PendingSidecar.writeUnresolved(
+                        to: epDir,
+                        streamId: streamId,
+                        bleUuid: resolvedUUID,
+                        bleName: resolvedName,
+                        role: role,
+                        bleAckNs: bleAckMonotonicNs,
+                        stopFailureReason: stopResult.diagnostic ?? "stopCapture returned no video URI after \(stopResult.attempts) attempt(s)")
+                } else {
+                    try Insta360PendingSidecar.write(
+                        to: epDir,
+                        streamId: streamId,
+                        cameraFileURI: uri,
+                        bleUuid: resolvedUUID,
+                        bleName: resolvedName,
+                        role: role,
+                        bleAckNs: bleAckMonotonicNs)
+                }
+            } catch {
+                NSLog("[Insta360CameraStream] WARNING pending sidecar write failed for \(streamId): \(error.localizedDescription)")
+            }
         }
         return StreamStopReport(streamId: streamId, frameCount: 0, kind: "video")
         #else

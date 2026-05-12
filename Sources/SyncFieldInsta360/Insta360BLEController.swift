@@ -130,6 +130,13 @@ internal enum Insta360CommandReadinessPolicy {
     }
 }
 
+internal struct Insta360StopCaptureResult: Sendable {
+    let cameraFileURI: String?
+    let confirmedStopped: Bool
+    let attempts: Int
+    let diagnostic: String?
+}
+
 #if canImport(INSCameraServiceSDK)
 /// BLE controller for a single Insta360 Go 3S camera.
 ///
@@ -186,10 +193,10 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
     private let heartbeatIntervalNs: UInt64 = 2_000_000_000
     private var lastCommandReadyUptimeNs: UInt64 = 0
     private var lastCommandReadyProbe: Insta360CommandReadinessProbe?
+    private let commandGate = Insta360SDKCommandGate()
 
     private static let pairRegistryLock = NSLock()
     private static var pairedUUIDs = Set<String>()
-    private static let sdkCommandGate = Insta360SDKCommandGate()
 
     private static func currentlyPairedUUIDs() -> Set<String> {
         pairRegistryLock.lock(); defer { pairRegistryLock.unlock() }
@@ -599,27 +606,29 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
     /// the Insta360 SDK delivers it in the `stopCapture` completion block via `videoInfo.uri`.
     public func startRemoteRecording(clock: SessionClock) async throws -> UInt64 {
         try Task.checkCancellation()
-        return try await Self.withSDKCommandGate(label: "startRemoteRecording") {
+        return try await withControllerCommandGate(label: "startRemoteRecording") {
             try await self.startRemoteRecordingLocked(clock: clock)
         }
     }
 
     private func startRemoteRecordingLocked(clock: SessionClock) async throws -> UInt64 {
         var lastError: Error?
-        for attempt in 1...2 {
+        for attempt in 1...Insta360CaptureRetryPolicy.maxStartAttempts {
             try Task.checkCancellation()
             do {
                 try await ensureCommandReady(
                     reason: "startRemoteRecording attempt \(attempt)",
                     maxCachedAgeSeconds: attempt == 1 ? 8 : 0)
                 let cmd = try commandManager()
+                await configureRecordingSafetyLimitIfPossible(cmd: cmd)
                 return try await performStartCapture(
                     cmd: cmd,
                     clock: clock,
-                    timeoutSeconds: attempt == 1 ? 6 : 8)
+                    timeoutSeconds: Insta360CaptureRetryPolicy.startTimeoutSeconds(attempt: attempt))
             } catch {
                 lastError = error
-                guard attempt < 2, Self.isRecoverableCommandError(error) else {
+                guard attempt < Insta360CaptureRetryPolicy.maxStartAttempts,
+                      Insta360CaptureRetryPolicy.isRecoverableCommandError(error) else {
                     throw error
                 }
                 NSLog("[Insta360BLE.timing] startCapture recoverable failure attempt=\(attempt): \(error.localizedDescription); forcing wake/reconnect before retry")
@@ -660,28 +669,118 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
         }
     }
 
+    private func configureRecordingSafetyLimitIfPossible(cmd: INSCameraBasicCommands) async {
+        let options = INSCameraOptions()
+        options.captureTimeLimit = Insta360CaptureRetryPolicy.recordingSafetyLimitSeconds
+        let captureTimeLimitType = NSNumber(value: 7) // INSCameraOptionsTypeCaptureTimeLimit
+
+        do {
+            try await withTimeout(seconds: 3) {
+                try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+                    cmd.setOptions(options, forTypes: [captureTimeLimitType]) { error, _ in
+                        if let error {
+                            cont.resume(throwing: error)
+                            return
+                        }
+                        cont.resume()
+                    }
+                }
+            }
+            NSLog("[Insta360BLE] recording safety limit set to \(Insta360CaptureRetryPolicy.recordingSafetyLimitSeconds)s")
+        } catch {
+            // Some firmware rejects this option; stop reliability must not depend on it.
+            NSLog("[Insta360BLE] recording safety limit skipped: \(error.localizedDescription)")
+        }
+    }
+
     /// Send a BLE stop-capture command and return the camera-side file URI
     /// assigned by the SDK in the completion callback (`videoInfo?.uri`).
     public func stopRemoteRecording() async throws -> String {
-        try await Self.withSDKCommandGate(label: "stopRemoteRecording") {
+        let result = try await stopRemoteRecordingReliably()
+        guard let uri = result.cameraFileURI, !uri.isEmpty else {
+            throw Insta360Error.commandFailed(
+                result.diagnostic ?? "stopCapture confirmed stop but returned no video URI")
+        }
+        return uri
+    }
+
+    func stopRemoteRecordingReliably() async throws -> Insta360StopCaptureResult {
+        try Task.checkCancellation()
+        return try await withControllerCommandGate(label: "stopRemoteRecording") {
             try await self.stopRemoteRecordingLocked()
         }
     }
 
-    private func stopRemoteRecordingLocked() async throws -> String {
-        try await ensureCommandReady(reason: "stopRemoteRecording", maxCachedAgeSeconds: 0)
-        let cmd = try commandManager()
+    private func stopRemoteRecordingLocked() async throws -> Insta360StopCaptureResult {
+        var lastError: Error?
+        var sentStopCommand = false
 
+        for attempt in 1...Insta360CaptureRetryPolicy.maxStopAttempts {
+            try Task.checkCancellation()
+            do {
+                try await ensureCommandReady(
+                    reason: "stopRemoteRecording attempt \(attempt)",
+                    maxCachedAgeSeconds: 0)
+                let cmd = try commandManager()
+                sentStopCommand = true
+                let uri = try await performStopCapture(
+                    cmd: cmd,
+                    timeoutSeconds: Insta360CaptureRetryPolicy.stopTimeoutSeconds(attempt: attempt),
+                    attempt: attempt)
+                return Insta360StopCaptureResult(
+                    cameraFileURI: uri,
+                    confirmedStopped: true,
+                    attempts: attempt,
+                    diagnostic: nil)
+            } catch {
+                lastError = error
+                if Insta360CaptureRetryPolicy.indicatesAlreadyStopped(error), sentStopCommand {
+                    NSLog("[Insta360BLE.timing] stopCapture already stopped after attempt=\(attempt): \(error.localizedDescription)")
+                    return Insta360StopCaptureResult(
+                        cameraFileURI: nil,
+                        confirmedStopped: true,
+                        attempts: attempt,
+                        diagnostic: error.localizedDescription)
+                }
+
+                guard attempt < Insta360CaptureRetryPolicy.maxStopAttempts,
+                      Insta360CaptureRetryPolicy.isRecoverableCommandError(error) else {
+                    break
+                }
+
+                NSLog("[Insta360BLE.timing] stopCapture recoverable failure attempt=\(attempt): \(error.localizedDescription); forcing wake/reconnect before retry")
+                if let device = connectedDevice {
+                    markConnectedDeviceStale(device, reason: "stopCapture attempt \(attempt) failed")
+                }
+                await wakeKnownCamera(window: attempt == 1 ? 0.8 : 1.2)
+                try? await Task.sleep(
+                    nanoseconds: Insta360CaptureRetryPolicy.stopBackoffNs(afterAttempt: attempt))
+            }
+        }
+
+        let diagnostic = lastError?.localizedDescription ?? "stopCapture failed without an SDK error"
+        if sentStopCommand {
+            throw Insta360Error.commandFailed(
+                "stopCapture could not confirm camera stop after \(Insta360CaptureRetryPolicy.maxStopAttempts) attempts; last error: \(diagnostic)")
+        }
+        throw lastError ?? Insta360Error.commandFailed("stopCapture failed before command send")
+    }
+
+    private func performStopCapture(
+        cmd: INSCameraBasicCommands,
+        timeoutSeconds: TimeInterval,
+        attempt: Int
+    ) async throws -> String {
         let deviceTag = connectedDevice?.name ?? "(unknown)"
         let sendUptimeNs = DispatchTime.now().uptimeNanoseconds
-        NSLog("[Insta360BLE.timing] stopCapture SEND device=\(deviceTag)")
+        NSLog("[Insta360BLE.timing] stopCapture SEND device=\(deviceTag) attempt=\(attempt)")
 
-        return try await withTimeout(seconds: 15) {
+        return try await withTimeout(seconds: timeoutSeconds) {
             try await withUnsafeThrowingContinuation { (cont: UnsafeContinuation<String, Error>) in
                 cmd.stopCapture(with: nil) { error, videoInfo in
                     let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds - sendUptimeNs) / 1_000_000.0
                     if let error = error {
-                        NSLog("[Insta360BLE.timing] stopCapture FAILED device=\(deviceTag) elapsedMs=\(String(format: "%.0f", elapsedMs)): \(error.localizedDescription)")
+                        NSLog("[Insta360BLE.timing] stopCapture FAILED device=\(deviceTag) attempt=\(attempt) elapsedMs=\(String(format: "%.0f", elapsedMs)): \(error.localizedDescription)")
                         cont.resume(throwing: Insta360Error.commandFailed(error.localizedDescription))
                         return
                     }
@@ -848,7 +947,7 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
     }
 
     public func refreshConnection() async throws {
-        try await Self.withSDKCommandGate(label: "refreshConnection") {
+        try await withControllerCommandGate(label: "refreshConnection") {
             try await self.ensureCommandReady(
                 reason: "refreshConnection",
                 maxCachedAgeSeconds: 0)
@@ -1071,40 +1170,21 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
         Self.unregisterPaired(device.identifierUUIDStringSafe)
     }
 
-    private static func isRecoverableCommandError(_ error: Error) -> Bool {
-        if case Insta360Error.notPaired = error { return true }
-        if case Insta360Error.commandFailed(let detail) = error {
-            let normalized = detail.lowercased()
-            return normalized.contains("timed out")
-                || normalized.contains("timeout")
-                || normalized.contains("unavailable")
-                || normalized.contains("not ready")
-                || normalized.contains("not paired")
-                || normalized.contains("disconnected")
-        }
-        let normalized = error.localizedDescription.lowercased()
-        return normalized.contains("timed out")
-            || normalized.contains("timeout")
-            || normalized.contains("ble")
-            || normalized.contains("bluetooth")
-            || normalized.contains("disconnected")
-    }
-
-    private static func withSDKCommandGate<T: Sendable>(
+    private func withControllerCommandGate<T: Sendable>(
         label: String,
         operation: @Sendable @escaping () async throws -> T
     ) async throws -> T {
-        await sdkCommandGate.acquire()
+        await commandGate.acquire()
         NSLog("[Insta360BLE.gate] \(label) acquired")
         do {
             try Task.checkCancellation()
             let value = try await operation()
             NSLog("[Insta360BLE.gate] \(label) release")
-            await sdkCommandGate.release()
+            await commandGate.release()
             return value
         } catch {
             NSLog("[Insta360BLE.gate] \(label) release after error: \(error.localizedDescription)")
-            await sdkCommandGate.release()
+            await commandGate.release()
             throw error
         }
     }
