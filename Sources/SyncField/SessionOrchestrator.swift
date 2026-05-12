@@ -110,6 +110,32 @@ public actor SessionOrchestrator {
         state = .connected
     }
 
+    /// Verify start-critical streams before the countdown begins.
+    ///
+    /// This keeps hardware failures out of the user-facing countdown path:
+    /// host apps can call this when the user is ready to record, show a
+    /// "connecting cameras" state, and only then call `startRecording`.
+    public func preflightRecording() async throws {
+        guard state == .connected else {
+            throw SessionError.invalidTransition(from: state, to: .connected)
+        }
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for stream in streams {
+                guard let preflight = stream as? any SyncFieldRecordingPreflightStream else {
+                    continue
+                }
+                group.addTask { [stream, preflight] in
+                    do {
+                        try await preflight.preflightRecording()
+                    } catch {
+                        throw StreamError(streamId: stream.streamId, underlying: error)
+                    }
+                }
+            }
+            try await group.waitForAll()
+        }
+    }
+
     @discardableResult
     public func startRecording(
         countdown: CountdownSpec? = nil,

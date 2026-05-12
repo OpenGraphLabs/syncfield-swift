@@ -18,7 +18,7 @@ import INSCameraServiceSDK
 ///
 /// When `INSCameraServiceSDK.xcframework` is not linked, every method throws
 /// `Insta360Error.frameworkNotLinked` — the rest of SyncField is unaffected.
-public final class Insta360CameraStream: SyncFieldStream, @unchecked Sendable {
+public final class Insta360CameraStream: SyncFieldStream, SyncFieldRecordingPreflightStream, @unchecked Sendable {
     public nonisolated let streamId: String
     public nonisolated let capabilities = StreamCapabilities(
         requiresIngest: true, producesFile: true,
@@ -50,6 +50,8 @@ public final class Insta360CameraStream: SyncFieldStream, @unchecked Sendable {
     /// events are camera-specific.
     private var onCameraWarning: (@Sendable (Insta360CameraWarning) -> Void)?
     private let boundUUID: String?
+    private let preferredBLEName: String?
+    private let bindingKey: String?
 
     #if canImport(INSCameraServiceSDK)
     private var ble  = Insta360BLEController()
@@ -59,6 +61,8 @@ public final class Insta360CameraStream: SyncFieldStream, @unchecked Sendable {
     public init(streamId: String) {
         self.streamId = streamId
         self.boundUUID = nil
+        self.preferredBLEName = nil
+        self.bindingKey = nil
     }
 
     /// Bind this stream to a specific CoreBluetooth peripheral UUID.
@@ -69,6 +73,22 @@ public final class Insta360CameraStream: SyncFieldStream, @unchecked Sendable {
     public init(streamId: String, uuid: String) {
         self.streamId = streamId
         self.boundUUID = uuid
+        self.preferredBLEName = nil
+        self.bindingKey = Insta360KnownCameraIdentity(uuid: uuid, bleName: nil).bindingKey
+    }
+
+    /// Bind this stream to a previously saved camera identity.
+    ///
+    /// The BLE name is important for official-app-style reconnect: it gives us
+    /// the stable serial suffix used by wake-by-camera before the camera emits
+    /// a fresh scan advertisement.
+    public init(streamId: String, uuid: String?, preferredName: String?) {
+        self.streamId = streamId
+        self.boundUUID = uuid
+        self.preferredBLEName = preferredName
+        self.bindingKey = Insta360KnownCameraIdentity(
+            uuid: uuid,
+            bleName: preferredName).bindingKey
     }
 
     public func setCameraWarningHandler(
@@ -86,6 +106,14 @@ public final class Insta360CameraStream: SyncFieldStream, @unchecked Sendable {
         #endif
     }
 
+    public func preflightRecording() async throws {
+        #if canImport(INSCameraServiceSDK)
+        try await ble.refreshConnection()
+        #else
+        throw Insta360Error.frameworkNotLinked
+        #endif
+    }
+
     public func connect(context: StreamConnectContext) async throws {
         self.healthBus = context.healthBus
         #if canImport(INSCameraServiceSDK)
@@ -96,14 +124,20 @@ public final class Insta360CameraStream: SyncFieldStream, @unchecked Sendable {
         if ble.connectedDeviceUUID != nil {
             return
         }
-        if let uuid = boundUUID {
-            ble = try await Insta360Scanner.shared.bindController(uuid: uuid)
+        if bindingKey != nil {
+            ble = try await Insta360Scanner.shared.bindController(
+                identity: Insta360KnownCameraIdentity(
+                    uuid: boundUUID,
+                    bleName: preferredBLEName))
             wireWarningChannel()
             do {
                 self.cachedCreds = try await ble.wifiCredentials()
                 await healthBus?.publish(.streamConnected(streamId: streamId))
             } catch {
-                await Insta360Scanner.shared.releaseBinding(uuid: uuid)
+                if let bindingKey {
+                    await Insta360Scanner.shared.releaseBinding(uuid: bindingKey)
+                    try? await Insta360Scanner.shared.unpair(uuid: bindingKey)
+                }
                 throw error
             }
             return
@@ -144,12 +178,18 @@ public final class Insta360CameraStream: SyncFieldStream, @unchecked Sendable {
         self.onHealthEvent = onHealthEvent
         self.onCameraWarning = onCameraWarning
         wireWarningChannel()
-        if let uuid = boundUUID {
-            ble = try await Insta360Scanner.shared.bindController(uuid: uuid)
+        if bindingKey != nil {
+            ble = try await Insta360Scanner.shared.bindController(
+                identity: Insta360KnownCameraIdentity(
+                    uuid: boundUUID,
+                    bleName: preferredBLEName))
             do {
                 self.cachedCreds = try await ble.wifiCredentials()
             } catch {
-                await Insta360Scanner.shared.releaseBinding(uuid: uuid)
+                if let bindingKey {
+                    await Insta360Scanner.shared.releaseBinding(uuid: bindingKey)
+                    try? await Insta360Scanner.shared.unpair(uuid: bindingKey)
+                }
                 throw error
             }
         } else {
@@ -301,6 +341,7 @@ public final class Insta360CameraStream: SyncFieldStream, @unchecked Sendable {
         //    only if the stream was connected via the orchestrator path
         //    (older code path) — which also sets `cachedCreds` now, but we
         //    keep the fallback to avoid a hard crash on unexpected state.
+        try? await ble.enableWiFiForDownload()
         let creds: (ssid: String, passphrase: String)
         if let cached = cachedCreds {
             creds = cached
@@ -329,10 +370,23 @@ public final class Insta360CameraStream: SyncFieldStream, @unchecked Sendable {
         #endif
     }
 
+    /// Best-effort foreground recovery hook for host apps.
+    ///
+    /// If BLE is still connected this sends a lightweight heartbeat; if the
+    /// radio silently dropped while the app was backgrounded, the controller
+    /// runs the same wake + reconnect path used before start/stop commands.
+    public func refreshConnection() async throws {
+        #if canImport(INSCameraServiceSDK)
+        try await ble.refreshConnection()
+        #else
+        throw Insta360Error.frameworkNotLinked
+        #endif
+    }
+
     public func disconnect() async throws {
         #if canImport(INSCameraServiceSDK)
-        if let uuid = boundUUID {
-            try? await Insta360Scanner.shared.unpair(uuid: uuid)
+        if let bindingKey {
+            try? await Insta360Scanner.shared.unpair(uuid: bindingKey)
         } else {
             try? await ble.unpair()
         }
@@ -345,5 +399,20 @@ public final class Insta360CameraStream: SyncFieldStream, @unchecked Sendable {
             await healthBus?.publish(event)
         }
     }
-}
 
+    public var pairedDeviceUUID: String? {
+        #if canImport(INSCameraServiceSDK)
+        return ble.lastKnownDeviceUUID
+        #else
+        return nil
+        #endif
+    }
+
+    public var pairedDeviceName: String? {
+        #if canImport(INSCameraServiceSDK)
+        return ble.lastKnownDeviceName
+        #else
+        return nil
+        #endif
+    }
+}

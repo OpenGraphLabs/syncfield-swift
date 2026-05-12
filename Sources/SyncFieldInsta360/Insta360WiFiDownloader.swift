@@ -25,6 +25,12 @@ public final class Insta360WiFiDownloader: @unchecked Sendable {
 
     public init() {}
 
+    public static func isLikelyCameraHotspotSSID(_ ssid: String) -> Bool {
+        let normalized = ssid.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return false }
+        return normalized.uppercased().hasSuffix(".OSC")
+    }
+
     #if canImport(INSCameraServiceSDK) && canImport(NetworkExtension)
 
     /// Atomically: join camera AP → probe reachability → open SDK socket →
@@ -701,6 +707,32 @@ public final class Insta360WiFiDownloader: @unchecked Sendable {
                 // Give iOS ~500 ms to process the first round before
                 // re-checking. Accumulated app installations sometimes
                 // require two passes to clear the list completely.
+                try? await Task.sleep(nanoseconds: 500_000_000)
+            }
+        }
+    }
+
+    /// Remove only Insta360 camera AP configurations, preserving upload Wi-Fi
+    /// profiles the host app may also manage through NEHotspotConfiguration.
+    public func removeCameraHotspotConfigurations() async {
+        for sweep in 1...2 {
+            let ssids: [String] = await withCheckedContinuation { cont in
+                NEHotspotConfigurationManager.shared.getConfiguredSSIDs { ssids in
+                    cont.resume(returning: ssids)
+                }
+            }
+            let cameraSSIDs = ssids.filter(Self.isLikelyCameraHotspotSSID)
+            if cameraSSIDs.isEmpty {
+                if sweep == 1 {
+                    NSLog("[WiFiDownloader] removeCameraHotspotConfigurations: no camera SSIDs to remove")
+                }
+                return
+            }
+            for ssid in cameraSSIDs {
+                NSLog("[WiFiDownloader] removeCameraHotspotConfigurations sweep \(sweep): removing SSID=\(ssid)")
+                NEHotspotConfigurationManager.shared.removeConfiguration(forSSID: ssid)
+            }
+            if sweep == 1 {
                 try? await Task.sleep(nanoseconds: 500_000_000)
             }
         }

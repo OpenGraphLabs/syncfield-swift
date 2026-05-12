@@ -92,6 +92,20 @@ public actor Insta360Collector {
         return try await runCollect(items: items, progress: progress)
     }
 
+    /// Collect pending files for an explicit set of episode directories.
+    ///
+    /// Unlike ``collectAll(root:progress:)`` this does not walk unrelated
+    /// recordings under the same root. It still groups by camera UUID, so a
+    /// selected batch upload only joins each physical camera AP once.
+    public func collectEpisodes(
+        _ episodeDirs: [URL],
+        progress: @escaping @Sendable (Progress) -> Void = { _ in }
+    ) async throws -> [Result] {
+        let items = try Self.itemsForEpisodeDirs(episodeDirs)
+        guard !items.isEmpty else { return [] }
+        return try await runCollect(items: items, progress: progress)
+    }
+
     // MARK: - Pure helper (unit-tested)
 
     /// Group pending items by camera UUID, preserving deterministic order
@@ -113,6 +127,24 @@ public actor Insta360Collector {
         }
     }
 
+    public static func itemsForEpisodeDirs(
+        _ episodeDirs: [URL]
+    ) throws -> [Insta360PendingSidecar.WithDir] {
+        var items: [Insta360PendingSidecar.WithDir] = []
+        for dir in episodeDirs {
+            for sidecar in try Insta360PendingSidecar.scan(dir) {
+                let mp4 = dir.appendingPathComponent("\(sidecar.streamId).mp4")
+                if FileManager.default.fileExists(atPath: mp4.path) {
+                    continue
+                }
+                items.append(Insta360PendingSidecar.WithDir(
+                    episodeDir: dir,
+                    sidecar: sidecar))
+            }
+        }
+        return items
+    }
+
     // MARK: - Private orchestration
 
     #if canImport(INSCameraServiceSDK)
@@ -125,26 +157,23 @@ public actor Insta360Collector {
         items: [Insta360PendingSidecar.WithDir],
         progress: @escaping @Sendable (Progress) -> Void
     ) async throws -> [Result] {
+        try Task.checkCancellation()
         let groups = Self.groupByCamera(items)
-        let neededUUIDs = Set(groups.map(\.uuid))
-
-        // Ensure every needed camera is BLE-discovered (and therefore
-        // pairable). UUIDs already paired in this process are skipped.
-        let alreadyPaired = await Insta360Scanner.shared.pairedUUIDs()
-        let missing = neededUUIDs.subtracting(alreadyPaired)
-        if !missing.isEmpty {
-            try await discoverUUIDs(missing,
-                                     timeoutSeconds: Self.discoveryTimeoutSeconds)
-        }
 
         var results: [Result] = []
 
         // iOS can only be on one WiFi AP at a time — process cameras sequentially.
         for (uuid, group) in groups {
+            try Task.checkCancellation()
             do {
-                try await Insta360Scanner.shared.pair(uuid: uuid)
+                try await Insta360Scanner.shared.pair(
+                    uuid: uuid,
+                    preferredName: group.first?.sidecar.bleName)
+                try Task.checkCancellation()
                 let ble = try await Insta360Scanner.shared.controller(forUUID: uuid)
+                try? await ble.enableWiFiForDownload()
                 let creds = try await ble.wifiCredentials()
+                try Task.checkCancellation()
 
                 let batchItems = group.map { item in
                     Insta360WiFiDownloader.BatchItem(
@@ -169,8 +198,10 @@ public actor Insta360Collector {
                             bleUuid: uuid,
                             fraction: fraction))
                     })
+                try Task.checkCancellation()
 
                 for br in batchResults {
+                    try Task.checkCancellation()
                     guard let owner = group.first(where: {
                         $0.sidecar.streamId == br.item.streamId &&
                         $0.episodeDir == br.item.episodeDir
@@ -210,10 +241,12 @@ public actor Insta360Collector {
             }
         }
 
-        // Best-effort final WiFi restore + hotspot config cleanup.
+        // Best-effort final camera-hotspot config cleanup. Do not sweep all
+        // app-managed SSIDs here: upload Wi-Fi configs may also have been
+        // installed through NEHotspotConfiguration and must survive collect.
         let finalDownloader = Insta360WiFiDownloader()
         await finalDownloader.finalizeWiFiRestore()
-        await finalDownloader.removeAllHotspotConfigurations()
+        await finalDownloader.removeCameraHotspotConfigurations()
 
         return results
     }
@@ -223,8 +256,11 @@ public actor Insta360Collector {
     /// elapses. Stops the scan in either case. Returns silently — pair
     /// errors at the call site surface "deviceNotDiscovered" for any
     /// camera the scan never saw, which carries the right diagnostic.
-    private func discoverUUIDs(_ needed: Set<String>,
-                                timeoutSeconds: UInt64) async throws {
+    private func discoverUUIDs(
+        _ needed: Set<String>,
+        preferredNamesByUUID: [String: String],
+        timeoutSeconds: UInt64
+    ) async throws {
         await Insta360Scanner.shared.stopScan()
         let stream = try await Insta360Scanner.shared.scan()
 
@@ -236,13 +272,45 @@ public actor Insta360Collector {
 
         var seen: Set<String> = []
         for await camera in stream {
-            seen.insert(camera.uuid)
+            if let matched = await matchedNeededUUID(
+                for: camera,
+                needed: needed,
+                preferredNamesByUUID: preferredNamesByUUID
+            ) {
+                seen.insert(matched)
+            }
             if needed.isSubset(of: seen) {
                 await Insta360Scanner.shared.stopScan()
                 break
             }
         }
         timeout.cancel()
+    }
+
+    private func matchedNeededUUID(
+        for camera: DiscoveredInsta360,
+        needed: Set<String>,
+        preferredNamesByUUID: [String: String]
+    ) async -> String? {
+        if needed.contains(camera.uuid) { return camera.uuid }
+        let cameraSerial = Insta360BLEController.extractSerialLast6(fromBLEName: camera.name)
+
+        for (uuid, name) in preferredNamesByUUID {
+            guard needed.contains(uuid),
+                  let preferredSerial = Insta360BLEController.extractSerialLast6(fromBLEName: name),
+                  preferredSerial == cameraSerial
+            else { continue }
+            return uuid
+        }
+
+        for uuid in needed {
+            guard let record = await Insta360IdentityStore.shared.record(forUUID: uuid),
+                  record.serialLast6 == cameraSerial
+            else { continue }
+            return uuid
+        }
+
+        return nil
     }
     #else
     private func runCollect(

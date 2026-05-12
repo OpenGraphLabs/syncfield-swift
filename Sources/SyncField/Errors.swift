@@ -1,7 +1,7 @@
 // Sources/SyncField/Errors.swift
 import Foundation
 
-public enum SessionError: Error, CustomStringConvertible {
+public enum SessionError: Error, CustomStringConvertible, LocalizedError {
     case invalidTransition(from: SessionState, to: SessionState)
     case duplicateStreamId(String)
     case noStreamsRegistered
@@ -22,9 +22,11 @@ public enum SessionError: Error, CustomStringConvertible {
             return "SessionError: operation requires the session to be running"
         }
     }
+
+    public var errorDescription: String? { description }
 }
 
-public struct StreamError: Error, CustomStringConvertible {
+public struct StreamError: Error, CustomStringConvertible, LocalizedError {
     public let streamId: String
     public let underlying: Error
 
@@ -36,4 +38,6 @@ public struct StreamError: Error, CustomStringConvertible {
     public var description: String {
         "StreamError[\(streamId)]: \(underlying)"
     }
+
+    public var errorDescription: String? { description }
 }

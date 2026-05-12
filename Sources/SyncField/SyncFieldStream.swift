@@ -45,3 +45,16 @@ public protocol SyncFieldStream: Sendable {
                 progress: @Sendable (Double) -> Void) async throws -> StreamIngestReport
     func disconnect() async throws
 }
+
+/// Optional stream contract for hardware that needs a live pre-start check
+/// before the user-facing countdown begins.
+///
+/// `SessionOrchestrator.startRecording(countdown:)` intentionally starts
+/// external cameras at countdown begin so the countdown ticks are captured in
+/// every audio track. That means a disconnected external camera must be
+/// detected before the countdown UI/audio starts, not after. Streams that can
+/// cheaply verify or refresh their device connection implement this protocol;
+/// all other streams are ignored by `preflightRecording()`.
+public protocol SyncFieldRecordingPreflightStream: SyncFieldStream {
+    func preflightRecording() async throws
+}
