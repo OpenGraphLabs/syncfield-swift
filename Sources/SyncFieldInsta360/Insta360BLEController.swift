@@ -319,6 +319,24 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
         await Self.wake(serialLast6: serial, window: window)
     }
 
+    @discardableResult
+    internal static func waitForCommandManagerReady(
+        manager: INSBluetoothManager,
+        device: INSBluetoothDevice,
+        maxNs: UInt64 = 1_500_000_000,
+        pollNs: UInt64 = 50_000_000
+    ) async throws -> UInt64 {
+        let started = DispatchTime.now().uptimeNanoseconds
+        while DispatchTime.now().uptimeNanoseconds &- started < maxNs {
+            try Task.checkCancellation()
+            if manager.getCommandBy(device) != nil {
+                return DispatchTime.now().uptimeNanoseconds &- started
+            }
+            try await Task.sleep(nanoseconds: pollNs)
+        }
+        return DispatchTime.now().uptimeNanoseconds &- started
+    }
+
     // MARK: - Lifecycle
 
     override public convenience init() {
@@ -404,6 +422,7 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
     /// whose UUID is NOT in `excludingUUIDs`. Default behavior (empty set)
     /// matches the original single-camera semantics.
     public func pair(excludingUUIDs: Set<String> = []) async throws {
+        try Task.checkCancellation()
         // Wait for CoreBluetooth to become ready (up to 5 s).
         for _ in 0..<50 {
             if bluetoothManager.state == .ready { break }
@@ -434,11 +453,13 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
                 }
                 cycle += 1
                 if Task.isCancelled { break }
-                try? await Task.sleep(nanoseconds: 700_000_000)
+                try? await Task.sleep(
+                    nanoseconds: Insta360WakeRetryPolicy.intervalNs(cycle: cycle))
             }
         }
         defer { wakeTask.cancel() }
 
+        try Task.checkCancellation()
         let device = try await withTimeout(seconds: 15) {
             try await withCheckedThrowingContinuation { (cont: CheckedContinuation<INSBluetoothDevice, Error>) in
                 var found = false
@@ -457,6 +478,7 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
         }
 
         // BLE connect.
+        try Task.checkCancellation()
         try await withTimeout(seconds: 15) {
             try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
                 self.bluetoothManager.connect(device) { error in
@@ -475,8 +497,10 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
         Self.registerPaired(device.identifierUUIDStringSafe)
         startHeartbeat()
 
-        // Let the connection stabilise.
-        try await Task.sleep(nanoseconds: 1_000_000_000)
+        let readyNs = try await Self.waitForCommandManagerReady(
+            manager: bluetoothManager,
+            device: device)
+        NSLog("[Insta360BLE.timing] commandManager ready after pair elapsedMs=\(String(format: "%.0f", Double(readyNs) / 1_000_000.0))")
         configureWakeOnBluetoothIfPossible(for: device)
         NSLog("[Insta360BLE] Paired with \(Self.displayName(for: device))")
     }
@@ -1116,6 +1140,7 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
         // CoreBluetooth needs a beat to settle after a disconnect before
         // it'll start a fresh scan reliably. Same poll pattern as `pair`.
         for _ in 0..<50 {
+            try Task.checkCancellation()
             if bluetoothManager.state == .ready { break }
             try await Task.sleep(nanoseconds: 100_000_000)
         }
@@ -1140,7 +1165,8 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
                 }
                 cycle += 1
                 if Task.isCancelled { break }
-                try? await Task.sleep(nanoseconds: 700_000_000)
+                try? await Task.sleep(
+                    nanoseconds: Insta360WakeRetryPolicy.intervalNs(cycle: cycle))
             }
         }
         defer {
@@ -1202,14 +1228,16 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
     }
 
     private func finishReconnect(with device: INSBluetoothDevice) async throws {
+        try Task.checkCancellation()
         connectedDevice = device
         rememberIdentity(of: device)
         await persistIdentity(of: device)
         Self.registerPaired(device.identifierUUIDStringSafe)
         startHeartbeat()
-        // Match `pair`'s 1 s stabilise window — without it the next
-        // `getCommandBy` can race the SDK's command-manager publish.
-        try await Task.sleep(nanoseconds: 1_000_000_000)
+        let readyNs = try await Self.waitForCommandManagerReady(
+            manager: bluetoothManager,
+            device: device)
+        NSLog("[Insta360BLE.timing] commandManager ready after reconnect elapsedMs=\(String(format: "%.0f", Double(readyNs) / 1_000_000.0))")
         configureWakeOnBluetoothIfPossible(for: device)
         NSLog("[Insta360BLE] reconnectIfNeeded — re-paired \(Self.displayName(for: device))")
     }

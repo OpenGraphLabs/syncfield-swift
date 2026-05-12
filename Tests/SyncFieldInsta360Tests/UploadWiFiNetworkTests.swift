@@ -91,4 +91,13 @@ final class UploadWiFiNetworkTests: XCTestCase {
         XCTAssertFalse(Insta360WiFiDownloader.isLikelyCameraHotspotSSID("Office WiFi"))
         XCTAssertFalse(Insta360WiFiDownloader.isLikelyCameraHotspotSSID("osc-lab-router"))
     }
+
+    func test_hotspotApplyFailureDescriptionIncludesKind() {
+        let error = Insta360Error.hotspotApplyFailedWithKind(
+            kind: .userDenied,
+            detail: "user denied")
+
+        XCTAssertTrue(error.localizedDescription.contains("userDenied"))
+        XCTAssertTrue(error.localizedDescription.contains("user denied"))
+    }
 }

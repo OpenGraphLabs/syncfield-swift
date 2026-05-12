@@ -69,6 +69,14 @@ final class Insta360WakeTests: XCTestCase {
             .broadcast)
     }
 
+    func test_wakeRetryPolicyRampsRetryIntervals() {
+        XCTAssertEqual(Insta360WakeRetryPolicy.intervalNs(cycle: 0), 300_000_000)
+        XCTAssertEqual(Insta360WakeRetryPolicy.intervalNs(cycle: 2), 300_000_000)
+        XCTAssertEqual(Insta360WakeRetryPolicy.intervalNs(cycle: 3), 700_000_000)
+        XCTAssertEqual(Insta360WakeRetryPolicy.intervalNs(cycle: 5), 700_000_000)
+        XCTAssertEqual(Insta360WakeRetryPolicy.intervalNs(cycle: 6), 1_500_000_000)
+    }
+
     func test_commandReadinessPolicyKeepsRecordingPathSideEffectFree() {
         XCTAssertEqual(
             Insta360CommandReadinessPolicy.probe(for: "refreshConnection"),

@@ -133,7 +133,8 @@ public actor Insta360Scanner {
 
             cycle += 1
             if Task.isCancelled { break }
-            try? await Task.sleep(nanoseconds: 650_000_000)
+            try? await Task.sleep(
+                nanoseconds: Insta360WakeRetryPolicy.intervalNs(cycle: cycle))
         }
     }
 
@@ -160,7 +161,7 @@ public actor Insta360Scanner {
         try await pair(identity: identity)
     }
 
-    internal func pair(uuid: String, preferredName: String?) async throws {
+    public func pair(uuid: String, preferredName: String?) async throws {
         let identity = Insta360KnownCameraIdentity(uuid: uuid, bleName: preferredName)
         try await pair(identity: identity)
     }
@@ -171,6 +172,7 @@ public actor Insta360Scanner {
         }
         await acquirePairingSlot()
         defer { releasePairingSlot() }
+        try Task.checkCancellation()
         try await waitForBluetoothReady()
         if pairedDevices[bindingKey] != nil { return }  // idempotent
         let shouldResumeScan = pauseHardwareScanForConnection()
@@ -179,6 +181,7 @@ public actor Insta360Scanner {
 
         var lastError: Error?
         for attempt in 1...3 {
+            try Task.checkCancellation()
             var connectedDeviceForCleanup: INSBluetoothDevice?
             do {
                 let wakeTask = Task { [identity] in
@@ -188,10 +191,10 @@ public actor Insta360Scanner {
                 let device = try await connect(identity: identity, attempt: attempt)
                 connectedDeviceForCleanup = device
 
-                // Give the SDK a moment to publish the device's command
-                // manager before we adopt it — shorter than 1 s caused the
-                // subsequent `getCommandBy` to return nil on some devices.
-                try await Task.sleep(nanoseconds: 1_000_000_000)
+                let readyNs = try await Insta360BLEController.waitForCommandManagerReady(
+                    manager: bluetoothManager,
+                    device: device)
+                NSLog("[Insta360Scanner.timing] commandManager ready binding=\(bindingKey) elapsedMs=\(String(format: "%.0f", Double(readyNs) / 1_000_000.0))")
                 pairedDevices[bindingKey] = device
                 let controller = Insta360BLEController()
                 controller.adoptConnectedDevice(device)
@@ -217,7 +220,7 @@ public actor Insta360Scanner {
                 }
                 if attempt < 3 {
                     let backoffNs = UInt64(attempt) * 1_000_000_000
-                    try? await Task.sleep(nanoseconds: backoffNs)
+                    try await Task.sleep(nanoseconds: backoffNs)
                 }
             }
         }
@@ -386,7 +389,8 @@ public actor Insta360Scanner {
             }
             cycle += 1
             if Task.isCancelled { break }
-            try? await Task.sleep(nanoseconds: 700_000_000)
+            try? await Task.sleep(
+                nanoseconds: Insta360WakeRetryPolicy.intervalNs(cycle: cycle))
         }
     }
 
@@ -534,6 +538,10 @@ public actor Insta360Scanner {
     public func stopScan() async {}
 
     public func pair(uuid _: String) async throws {
+        throw Insta360Error.frameworkNotLinked
+    }
+
+    public func pair(uuid _: String, preferredName _: String?) async throws {
         throw Insta360Error.frameworkNotLinked
     }
 

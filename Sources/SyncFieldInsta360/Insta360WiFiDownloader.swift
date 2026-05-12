@@ -765,23 +765,29 @@ public final class Insta360WiFiDownloader: @unchecked Sendable {
                 }
             }
         }
-        throw lastError ?? Insta360Error.hotspotApplyFailed("apply failed after 2 attempts")
+        throw lastError ?? Insta360Error.hotspotApplyFailedWithKind(
+            kind: .unknown,
+            detail: "apply failed after 2 attempts")
     }
 
-    private func applyHotspotOnce(ssid: String, passphrase: String) async throws {
+    private func applyHotspotOnce(
+        ssid: String,
+        passphrase: String,
+        applyTimeoutSeconds: TimeInterval = 8
+    ) async throws {
         let config = NEHotspotConfiguration(ssid: ssid, passphrase: passphrase, isWEP: false)
         config.joinOnce = true
 
         let sendUptimeNs = DispatchTime.now().uptimeNanoseconds
         NSLog("[WiFiDownloader.timing] applyHotspot SEND ssid=\(ssid)")
 
-        // Wrap in a 30-second timeout. NEHotspotConfiguration.apply has no
+        // Wrap in a short timeout. NEHotspotConfiguration.apply has no
         // built-in deadline; if iOS' WiFi state machine deadlocks (most
         // commonly when we removeConfiguration for camera N and apply for
-        // camera N+1 in quick succession), the completion never fires and
-        // the entire collect hangs forever. 30 s is generous — typical
-        // apply is ~1-3 s; up to ~10 s when iOS is mid-roaming. Anything
-        // longer is genuinely stuck.
+        // camera N+1 in quick succession), the completion never fires and the
+        // entire collect hangs forever. Typical apply is ~1-3 s; 8 s is long
+        // enough for normal iOS state-machine lag while keeping denial/stuck
+        // cases actionable.
         try await withThrowingTaskGroup(of: Void.self) { group in
             group.addTask {
                 try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
@@ -796,7 +802,9 @@ public final class Insta360WiFiDownloader: @unchecked Sendable {
                                 return
                             }
                             NSLog("[WiFiDownloader.timing] applyHotspot FAILED ssid=\(ssid) elapsedMs=\(String(format: "%.0f", elapsedMs)): \(ns.localizedDescription)")
-                            cont.resume(throwing: Insta360Error.hotspotApplyFailed(ns.localizedDescription))
+                            cont.resume(throwing: Insta360Error.hotspotApplyFailedWithKind(
+                                kind: UploadWiFiApplyFailureKind.classify(ns),
+                                detail: ns.localizedDescription))
                             return
                         }
                         NSLog("[WiFiDownloader.timing] applyHotspot OK ssid=\(ssid) elapsedMs=\(String(format: "%.0f", elapsedMs))")
@@ -805,9 +813,11 @@ public final class Insta360WiFiDownloader: @unchecked Sendable {
                 }
             }
             group.addTask {
-                try await Task.sleep(nanoseconds: 30_000_000_000) // 30 s
+                try await Task.sleep(nanoseconds: UInt64(max(0, applyTimeoutSeconds) * 1_000_000_000))
                 NSLog("[WiFiDownloader.timing] applyHotspot TIMEOUT ssid=\(ssid) — iOS WiFi state likely stuck")
-                throw Insta360Error.hotspotApplyFailed("apply timed out after 30 s (iOS WiFi state stuck)")
+                throw Insta360Error.hotspotApplyFailedWithKind(
+                    kind: .unknown,
+                    detail: "apply timed out after \(applyTimeoutSeconds)s (iOS WiFi state stuck)")
             }
             defer { group.cancelAll() }
             try await group.next()

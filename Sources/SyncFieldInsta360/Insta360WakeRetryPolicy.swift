@@ -19,4 +19,10 @@ internal struct Insta360WakeRetryPolicy: Sendable {
         }
         return cycle % 3 == 2 ? .broadcast : .targeted(serialLast6)
     }
+
+    internal static func intervalNs(cycle: Int) -> UInt64 {
+        if cycle < 3 { return 300_000_000 }
+        if cycle < 6 { return 700_000_000 }
+        return 1_500_000_000
+    }
 }

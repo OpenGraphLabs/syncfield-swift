@@ -1,10 +1,44 @@
 import Foundation
 
+#if os(iOS) && canImport(NetworkExtension)
+import NetworkExtension
+#endif
+
+public enum UploadWiFiApplyFailureKind: String, Codable, Equatable, Sendable {
+    case userDenied
+    case notInForeground
+    case systemConfigFailed
+    case unknown
+
+    #if os(iOS) && canImport(NetworkExtension)
+    public static func classify(_ error: NSError) -> UploadWiFiApplyFailureKind {
+        guard error.domain == NEHotspotConfigurationErrorDomain else {
+            return .unknown
+        }
+        switch error.code {
+        case NEHotspotConfigurationError.userDenied.rawValue:
+            return .userDenied
+        case NEHotspotConfigurationError.applicationIsNotInForeground.rawValue:
+            return .notInForeground
+        case NEHotspotConfigurationError.systemConfiguration.rawValue:
+            return .systemConfigFailed
+        default:
+            return .unknown
+        }
+    }
+    #else
+    public static func classify(_: NSError) -> UploadWiFiApplyFailureKind {
+        .unknown
+    }
+    #endif
+}
+
 public enum Insta360Error: Error, CustomStringConvertible, LocalizedError {
     case frameworkNotLinked
     case notPaired
     case wifiCredentialsUnavailable
     case hotspotApplyFailed(String)
+    case hotspotApplyFailedWithKind(kind: UploadWiFiApplyFailureKind, detail: String)
     case downloadFailed(String)
     case commandFailed(String)
     case cameraNotReachable
@@ -41,6 +75,8 @@ public enum Insta360Error: Error, CustomStringConvertible, LocalizedError {
             return "Insta360Error: camera did not provide WiFi SSID/passphrase over BLE"
         case .hotspotApplyFailed(let detail):
             return "Insta360Error: NEHotspotConfiguration apply failed (\(detail))"
+        case .hotspotApplyFailedWithKind(let kind, let detail):
+            return "Insta360Error: NEHotspotConfiguration apply failed [\(kind.rawValue)] (\(detail))"
         case .downloadFailed(let detail):
             return "Insta360Error: \(detail)"
         case .commandFailed(let detail):

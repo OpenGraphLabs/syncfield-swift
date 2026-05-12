@@ -123,7 +123,9 @@ public actor UploadWiFiReconnector {
         pollIntervalSeconds: TimeInterval = 1
     ) async -> UploadWiFiRejoinResult {
         do {
-            try await apply(profile: profile)
+            try await apply(
+                profile: profile,
+                applyTimeoutSeconds: min(max(timeoutSeconds, 0), 8))
         } catch {
             return UploadWiFiRejoinResult(
                 state: .failed,
@@ -241,7 +243,10 @@ public actor UploadWiFiReconnector {
         #endif
     }
 
-    private func apply(profile: UploadWiFiProfile) async throws {
+    private func apply(
+        profile: UploadWiFiProfile,
+        applyTimeoutSeconds: TimeInterval = 8
+    ) async throws {
         #if os(iOS) && canImport(NetworkExtension)
         let config: NEHotspotConfiguration
         if profile.passphrase.isEmpty {
@@ -264,7 +269,9 @@ public actor UploadWiFiReconnector {
                                 cont.resume()
                                 return
                             }
-                            cont.resume(throwing: Insta360Error.hotspotApplyFailed(ns.localizedDescription))
+                            cont.resume(throwing: Insta360Error.hotspotApplyFailedWithKind(
+                                kind: UploadWiFiApplyFailureKind.classify(ns),
+                                detail: ns.localizedDescription))
                             return
                         }
                         cont.resume()
@@ -272,14 +279,19 @@ public actor UploadWiFiReconnector {
                 }
             }
             group.addTask {
-                try await Task.sleep(nanoseconds: 30_000_000_000)
-                throw Insta360Error.hotspotApplyFailed("upload Wi-Fi apply timed out")
+                let timeoutNs = UInt64(max(0, applyTimeoutSeconds) * 1_000_000_000)
+                try await Task.sleep(nanoseconds: timeoutNs)
+                throw Insta360Error.hotspotApplyFailedWithKind(
+                    kind: .unknown,
+                    detail: "upload Wi-Fi apply timed out after \(applyTimeoutSeconds)s")
             }
             _ = try await group.next()
             group.cancelAll()
         }
         #else
-        throw Insta360Error.hotspotApplyFailed("upload Wi-Fi rejoin is only available on iOS")
+        throw Insta360Error.hotspotApplyFailedWithKind(
+            kind: .unknown,
+            detail: "upload Wi-Fi rejoin is only available on iOS")
         #endif
     }
 }
