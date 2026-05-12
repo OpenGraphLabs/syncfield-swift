@@ -117,7 +117,8 @@ let session = SessionOrchestrator(
     startChirp: .defaultStart,            // 17–19 kHz sweep, 200 ms
     stopChirp:  .defaultStop,
     postStartStabilizationMs: 200,        // wait for AVAudioEngine to settle
-    preStopTailMarginMs: 200)             // capture full chirp tail
+    preStopTailMarginMs: 800)             // chirp body + 400 ms post-chirp
+                                           // silence + Insta360 stop slack
 ```
 
 ### Disabling the chirp

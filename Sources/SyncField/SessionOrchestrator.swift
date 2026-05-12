@@ -4,13 +4,38 @@ import Foundation
 public actor SessionOrchestrator {
     // MARK: Public API
 
+    /// - Parameter preStopTailMarginMs: How long to keep recording AFTER the
+    ///   stop chirp body finishes, in milliseconds. The orchestrator sleeps
+    ///   for ``stopChirp.durationMs + preStopTailMarginMs`` between emitting
+    ///   the chirp and broadcasting per-stream `stopRecording()`. The tail
+    ///   has to absorb two distinct sources of slack so the chirp survives
+    ///   on every host:
+    ///
+    ///   1. The downstream audio sync aligner cross-correlates a ±400 ms
+    ///      window centred on the chirp peak. It needs roughly that much
+    ///      *post-chirp* silence in every recording to find a confident peak.
+    ///   2. Insta360 wrist cameras stop the underlying mp4 noticeably before
+    ///      the BLE `stopCapture` round-trip completes — empirically 300–400
+    ///      ms of trailing audio is dropped relative to the iPhone's own
+    ///      AVAssetWriter end. Without an iPhone-side cushion that
+    ///      compensates, the wrist cams' chirp body lands inside the last
+    ///      few hundred ms of their recording with no usable post-chirp
+    ///      silence (the cause of the ego_wrist sync failures observed in
+    ///      production through 2026-05-12).
+    ///
+    ///   The default 800 ms covers both: 400 ms cross-correlation window
+    ///   plus ~300–400 ms of Insta360 stop slack with safety. Pass a smaller
+    ///   value if you only target hosts with negligible stop latency
+    ///   (iPhone-only, or external mics that finalise immediately) and want
+    ///   to shorten ``stopRecording()`` end-to-end latency. Pass ``0`` in
+    ///   tests that mock the chirp player.
     public init(hostId: String,
                 outputDirectory: URL,
                 chirpPlayer: ChirpPlayer? = nil,
                 startChirp: ChirpSpec? = .defaultStart,
                 stopChirp: ChirpSpec? = .defaultStop,
                 postStartStabilizationMs: Double = 200,
-                preStopTailMarginMs: Double = 200,
+                preStopTailMarginMs: Double = 800,
                 audioSessionPolicy: AudioSessionPolicy = .managedBySDK,
                 handQualityConfig: HandQualityConfig = .default) {
         self.hostId = hostId

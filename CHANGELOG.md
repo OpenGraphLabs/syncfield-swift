@@ -2,6 +2,21 @@
 
 All notable changes to **syncfield-swift** are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.1] — 2026-05-13
+
+Patch release that hardens cross-host audio sync for ego + Insta360 wrist setups by guaranteeing the stop chirp is captured with usable post-chirp silence on every host. Source-compatible with 0.9.0; recompile and ship.
+
+### Changed
+- **`SessionOrchestrator.preStopTailMarginMs` default raised from 200 ms → 800 ms.** The orchestrator emits the stop chirp and then sleeps for `chirp.durationMs + preStopTailMarginMs` before broadcasting per-stream `stopRecording()`. The previous 200 ms tail was sized for an iPhone-only host, where the AVAssetWriter closes within milliseconds of the stop call. Insta360 wrist cameras stop the underlying mp4 noticeably earlier than the BLE `stopCapture` ACK round-trip (300–400 ms of trailing audio is dropped relative to the iPhone timeline in production captures), so the previous default left them with the chirp body landing inside the last few hundred ms of their recording and the downstream audio aligner's ±400 ms cross-correlation window with no usable post-chirp silence. The new 800 ms default covers the aligner window plus typical Insta360 stop slack with safety. Hosts that pass an explicit value continue to use exactly what they pass; only the implicit default changes.
+- `SyncFieldVersion.current` bumped to `0.9.1`.
+
+### Fixed
+- **Insta360 wrist-cam stop chirps are now reliably captured end-to-end.** Production ego_wrist captures through 2026-05-12 lost the last 130–170 ms of the stop chirp body on each wrist camera, dropping audio-aligner confidence below the conservative threshold and (before the syncfield core's chirp-anchor fallback shipped) breaking video sync for the entire episode. Combined with the syncfield-side single-anchor fallback, this SDK change moves wrist-cam alignment confidence from the ~0.5–0.6 borderline range into the ~0.85+ comfortable range.
+
+### Compatibility
+- API-source-compatible with 0.9.x. Constructor signature unchanged; only the implicit default for `preStopTailMarginMs` shifts. Tests that pass `preStopTailMarginMs: 0` (e.g. `SessionOrchestratorChirpTests`) are unaffected.
+- `stopRecording()` end-to-end latency increases by ~600 ms when the default tail margin is in effect. Hosts that pin the previous behaviour can pass `preStopTailMarginMs: 200` explicitly.
+
 ## [0.9.0] — 2026-05-12
 
 This release pulls the wide-FOV egocentric capture configuration that was previously living in host apps (og-skill's `EgonautIPhoneCameraStream`) into the SDK, so `iPhoneCameraStream` now produces ultra-wide capture by default — matching the egocentric / head-mounted data-collection use case the SDK targets. Public API signatures are unchanged; existing call sites (`iPhoneCameraStream(streamId:)`, `iPhoneCameraStream(streamId:videoSettings:)`) compile and run identically, they just yield wider video.
