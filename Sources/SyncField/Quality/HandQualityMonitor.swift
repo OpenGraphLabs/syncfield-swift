@@ -313,7 +313,7 @@ public actor HandQualityMonitor {
         if side == .left { leftState = s } else { rightState = s }
     }
 
-    /// Refresh or invalidate the interior anchor based on a fresh wrist.
+    /// Refresh or decay the interior anchor based on a fresh wrist.
     ///
     /// The interior anchor is the FP-cue suppression knob: it pins the
     /// side to ``inFrame`` for the duration of
@@ -322,11 +322,22 @@ public actor HandQualityMonitor {
     /// motion-blur stack that drops the detector for several seconds
     /// does not fire a false-positive OOF audio cue.
     ///
-    /// Refresh policy: if the wrist is at least
-    /// ``interiorAnchorMarginNorm`` from every edge → refresh anchor
-    /// (this wrist is unambiguously interior). Otherwise → clear the
-    /// anchor; the hand has crossed into the edge band and the
-    /// existing edge-zone behavior should govern OOF.
+    /// Refresh policy:
+    /// 1. Wrist deeper than ``interiorAnchorMarginNorm`` from every
+    ///    edge → refresh anchor to the full hold window (unambiguously
+    ///    interior).
+    /// 2. Wrist inside the edge band → **decay**, not drop. Ego-cam
+    ///    manipulation routinely brushes the edge zone for a frame or
+    ///    two during reach / lift / regrip moves, and clearing the
+    ///    anchor on a single edge-zone observation re-introduces the
+    ///    multi-second OOF false positives the anchor was designed to
+    ///    suppress (chair-grip / sleeve-occlusion manipulation, see
+    ///    `docs/egocentric-hand-oof-rnd/`). Instead, shrink the expiry
+    ///    to ``interiorAnchorEdgeDecayMs`` from now so a hand that
+    ///    truly continues past the edge still produces OOF within
+    ///    ~1.5 s of the crossing, while a transient edge brush followed
+    ///    by an interior re-detection re-arms the full hold window on
+    ///    the next interior wrist.
     private func updateInteriorAnchor(side s: inout SideState,
                                       wrist w: SIMD2<Double>,
                                       monotonicNs: UInt64) {
@@ -349,11 +360,22 @@ public actor HandQualityMonitor {
             s.lastInteriorWrist = w
             s.interiorAnchorExpiresNs = monotonicNs
                 &+ UInt64(config.interiorAnchorHoldMs) * 1_000_000
-        } else {
-            s.lastInteriorWrist = nil
-            s.interiorAnchorExpiresNs = 0
+        } else if s.lastInteriorWrist != nil {
+            // Edge-zone brush with a live anchor — decay rather than drop.
+            let decayExpiresNs = monotonicNs
+                &+ Self.interiorAnchorEdgeDecayMs * 1_000_000
+            s.interiorAnchorExpiresNs = min(s.interiorAnchorExpiresNs,
+                                            decayExpiresNs)
         }
+        // else: no live anchor to decay, edge observation is a no-op.
     }
+
+    /// Short tail applied to a live interior anchor when a fresh wrist
+    /// crosses into the edge zone. See ``updateInteriorAnchor``. Tuned
+    /// to outlast a typical 200 ms OOF debounce plus the 100-300 ms
+    /// regrip / reach window observed in chest-mount manipulation
+    /// footage, while still firing OOF roughly 1.7 s after a real exit.
+    private static let interiorAnchorEdgeDecayMs: UInt64 = 1500
 
     /// Wrist-centric instantaneous status.
     ///

@@ -402,11 +402,20 @@ final class HandQualityMonitorTests: XCTestCase {
         }, "interior anchor should suppress OOF for left hand last seen at frame centre")
     }
 
-    /// The interior anchor MUST be invalidated as soon as a fresh
-    /// observation places the wrist into the edge zone — otherwise a hand
-    /// that visibly walks toward the edge and then drops out would be
-    /// pinned IN forever.
-    func test_interiorAnchor_invalidatedByEdgeObservation() async throws {
+    /// The interior anchor MUST release shortly after a fresh observation
+    /// places the wrist into the edge zone — otherwise a hand that
+    /// visibly walks toward the edge and then drops out would be pinned
+    /// IN forever.
+    ///
+    /// The policy is *decay*, not instant invalidation: an edge-zone wrist
+    /// shrinks the anchor expiry to ``interiorAnchorEdgeDecayMs`` (~1.5 s)
+    /// from the brush, so a hand that genuinely continues past the edge
+    /// still produces OOF within roughly that window plus
+    /// ``oofDebounceMs``, while a transient edge brush followed by an
+    /// interior re-detection re-arms the full hold. Instant clearing was
+    /// the prior policy and re-introduced multi-second OOF false
+    /// positives on chair-grip / sleeve-occlusion manipulation.
+    func test_interiorAnchor_releasesShortlyAfterEdgeObservation() async throws {
         var cfg = HandQualityConfig.default
         cfg.oofDebounceMs = 200
         let m = HandQualityMonitor(
@@ -416,13 +425,14 @@ final class HandQualityMonitorTests: XCTestCase {
         )
         let task = collect(m.events)
         let base: UInt64 = 2_000_000_000
-        // Step 1: hand at centre — interior anchor armed.
+        // Step 1: hand at centre — interior anchor armed at base + 8000 ms.
         await m.ingest(observations: [centeredHand(.left), centeredHand(.right)],
                        frame: 0, monotonicNs: base)
         // Step 2: hand walks to the very left edge (well inside
-        // edgeExitMargin = 0.05) — interior anchor must drop AND the
-        // edge-zone path must classify the next missing-observation frame
-        // as outOfFrame so the OOF debounce can fire.
+        // edgeExitMargin = 0.05). The interior anchor expiry must shrink
+        // to ~1.5 s from this brush and the edge-zone path must then
+        // classify the subsequent missing-observation frames as
+        // outOfFrame so the OOF debounce can fire.
         let leavingHand = HandObservation(
             chirality: .left,
             chiralityConfidence: 0.95,
@@ -431,20 +441,64 @@ final class HandQualityMonitorTests: XCTestCase {
         )
         await m.ingest(observations: [leavingHand, centeredHand(.right)],
                        frame: 1, monotonicNs: base + frameStepNs)
-        // Step 3: hand disappears entirely. Without invalidation in step 2 the
-        // monitor would still consider the side "interior-anchored" and
-        // suppress OOF; with invalidation the edge-zone wrist memory takes
-        // over and OOF fires after the normal debounce.
-        for i in 2...8 {
+        // Step 3+: hand disappears entirely. Run past the decay tail
+        // (~1.5 s) plus the OOF debounce (200 ms) with margin so the
+        // OOF event has time to fire.
+        for i in 2...25 {
             await m.ingest(observations: [centeredHand(.right)],
                            frame: i, monotonicNs: base + UInt64(i) * frameStepNs)
         }
-        await m.finalize(stopMonotonicNs: base + 9 * frameStepNs, stopFrame: 9)
+        await m.finalize(stopMonotonicNs: base + 26 * frameStepNs, stopFrame: 26)
         let emitted = await task.value
         XCTAssertTrue(emitted.contains {
             if case .outOfFrameStart(.left, _, _) = $0 { return true }
             return false
         }, "OOF must still fire when the last fresh observation was in the edge zone")
+    }
+
+    /// A transient edge brush followed by an interior re-detection must
+    /// NOT cause OOF — the anchor decays on the brush but is re-armed by
+    /// the next interior wrist, so a subsequent multi-second occlusion
+    /// stays suppressed. This is the chair-grip / sleeve-occlusion
+    /// manipulation case the decay policy exists to fix.
+    func test_interiorAnchor_edgeBrushRecoversOnInteriorRefresh() async throws {
+        var cfg = HandQualityConfig.default
+        cfg.oofDebounceMs = 200
+        let m = HandQualityMonitor(
+            config: cfg,
+            recordingStartMonotonicNs: 0,
+            eventWriter: makeWriter()
+        )
+        let task = collect(m.events)
+        let base: UInt64 = 2_000_000_000
+        // Centre → anchor armed.
+        await m.ingest(observations: [centeredHand(.left), centeredHand(.right)],
+                       frame: 0, monotonicNs: base)
+        // Single-frame edge brush.
+        let brush = HandObservation(
+            chirality: .left,
+            chiralityConfidence: 0.95,
+            confidentKeypoints: (0..<10).map { _ in SIMD2(0.05, 0.5) },
+            wrist: SIMD2(0.05, 0.5)
+        )
+        await m.ingest(observations: [brush, centeredHand(.right)],
+                       frame: 1, monotonicNs: base + frameStepNs)
+        // Interior re-detection — must re-arm anchor to the full hold.
+        await m.ingest(observations: [centeredHand(.left), centeredHand(.right)],
+                       frame: 2, monotonicNs: base + 2 * frameStepNs)
+        // 50 frames × 100 ms = 5000 ms with the left hand missing — well
+        // past the 1500 ms decay tail and the 1500 ms assignment-side
+        // wrist memory, but inside the re-armed 8000 ms anchor.
+        for i in 3...52 {
+            await m.ingest(observations: [centeredHand(.right)],
+                           frame: i, monotonicNs: base + UInt64(i) * frameStepNs)
+        }
+        await m.finalize(stopMonotonicNs: base + 53 * frameStepNs, stopFrame: 53)
+        let emitted = await task.value
+        XCTAssertFalse(emitted.contains {
+            if case .outOfFrameStart(.left, _, _) = $0 { return true }
+            return false
+        }, "edge brush followed by interior re-detection must not fire OOF")
     }
 
     /// Interior anchor must release after ``interiorAnchorHoldMs`` so a hand
