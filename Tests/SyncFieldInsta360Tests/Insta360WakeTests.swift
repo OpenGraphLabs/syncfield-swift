@@ -69,19 +69,52 @@ final class Insta360WakeTests: XCTestCase {
             .broadcast)
     }
 
-    func test_commandReadinessPolicyHardGatesRecordingOnOptionsProbe() {
+    func test_commandReadinessPolicyKeepsRecordingPathSideEffectFree() {
         XCTAssertEqual(
             Insta360CommandReadinessPolicy.probe(for: "refreshConnection"),
-            .commandChannel)
+            .bleLinkOnly)
         XCTAssertEqual(
             Insta360CommandReadinessPolicy.probe(for: "startRemoteRecording attempt 1"),
-            .commandChannel)
+            .bleLinkOnly)
         XCTAssertEqual(
             Insta360CommandReadinessPolicy.probe(for: "stopRemoteRecording"),
             .bleLinkOnly)
         XCTAssertEqual(
             Insta360CommandReadinessPolicy.probe(for: "startCapture attempt 1 failed cleanup"),
             .bleLinkOnly)
+    }
+
+    func test_commandReadinessPolicyChecksGoPowerForRecordingPath() {
+        XCTAssertTrue(
+            Insta360CommandReadinessPolicy.requiresPoweredGoCamera(for: "refreshConnection"))
+        XCTAssertTrue(
+            Insta360CommandReadinessPolicy.requiresPoweredGoCamera(for: "startRemoteRecording attempt 1"))
+        XCTAssertFalse(
+            Insta360CommandReadinessPolicy.requiresPoweredGoCamera(for: "wifiCredentials"))
+        XCTAssertTrue(
+            Insta360CommandReadinessPolicy.isGoCameraPoweredForRecording(
+                powerOn: true,
+                powerOnForQC: false))
+        XCTAssertTrue(
+            Insta360CommandReadinessPolicy.isGoCameraPoweredForRecording(
+                powerOn: false,
+                powerOnForQC: true))
+        XCTAssertFalse(
+            Insta360CommandReadinessPolicy.isGoCameraPoweredForRecording(
+                powerOn: false,
+                powerOnForQC: false))
+        XCTAssertFalse(
+            Insta360CommandReadinessPolicy.shouldWakeConnectedGoCamera(
+                powerOn: true,
+                powerOnForQC: false))
+        XCTAssertFalse(
+            Insta360CommandReadinessPolicy.shouldWakeConnectedGoCamera(
+                powerOn: false,
+                powerOnForQC: true))
+        XCTAssertTrue(
+            Insta360CommandReadinessPolicy.shouldWakeConnectedGoCamera(
+                powerOn: false,
+                powerOnForQC: false))
     }
 
     func test_commandReadinessPolicyKeepsOptionsProbeForOptionReads() {

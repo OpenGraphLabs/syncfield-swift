@@ -108,11 +108,25 @@ internal enum Insta360CommandReadinessProbe: Equatable, Sendable {
 internal enum Insta360CommandReadinessPolicy {
     static func probe(for reason: String) -> Insta360CommandReadinessProbe {
         let normalized = reason.lowercased()
-        if normalized.contains("stopremoterecording")
-            || normalized.contains("cleanup") {
-            return .bleLinkOnly
+        if normalized.contains("wificredentials")
+            || normalized.contains("enablewififordownload") {
+            return .commandChannel
         }
-        return .commandChannel
+        return .bleLinkOnly
+    }
+
+    static func requiresPoweredGoCamera(for reason: String) -> Bool {
+        let normalized = reason.lowercased()
+        return normalized.contains("refreshconnection")
+            || normalized.contains("startremoterecording")
+    }
+
+    static func isGoCameraPoweredForRecording(powerOn: Bool, powerOnForQC: Bool) -> Bool {
+        powerOn || powerOnForQC
+    }
+
+    static func shouldWakeConnectedGoCamera(powerOn: Bool, powerOnForQC: Bool) -> Bool {
+        !isGoCameraPoweredForRecording(powerOn: powerOn, powerOnForQC: powerOnForQC)
     }
 }
 
@@ -513,30 +527,12 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
 
     private func configureWakeOnBluetoothIfPossible(for device: INSBluetoothDevice) {
         writeWakeupAuthDataIfPossible(for: device)
-        configurePhoneAuthorizationIfPossible(for: device)
 
-        Task { [weak self] in
-            guard let self else { return }
-            do {
-                let cmd = try self.commandManager()
-                let options = INSCameraOptions()
-                options.btWakeupSw = .on
-                try await Self.withTimeout(seconds: 5) {
-                    try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-                        cmd.setOptions(options, forTypes: [NSNumber(value: 97)]) { error, _ in
-                            if let error {
-                                cont.resume(throwing: error)
-                                return
-                            }
-                            cont.resume()
-                        }
-                    }
-                }
-                NSLog("[Insta360BLE.wake] Bluetooth wake switch enabled for \(Self.displayName(for: device))")
-            } catch {
-                NSLog("[Insta360BLE.wake] Bluetooth wake switch best-effort skipped for \(Self.displayName(for: device)): \(error.localizedDescription)")
-            }
-        }
+        // Do not opportunistically send command-channel provisioning here.
+        // GO 3S often accepts the BLE link before its command channel is
+        // ready; background `setOptions` / authorization probes then race
+        // recording preflight and can poison the SDK connection with 444
+        // disconnects. Wake provisioning needs an explicit foreground flow.
     }
 
     private func writeWakeupAuthDataIfPossible(for device: INSBluetoothDevice) {
@@ -549,55 +545,6 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
         }
         connection.writeWakeupAuthDataToCamera()
         NSLog("[Insta360BLE.wake] Wake auth data written for \(Self.displayName(for: device))")
-    }
-
-    private func configurePhoneAuthorizationIfPossible(for device: INSBluetoothDevice) {
-        Task { [weak self] in
-            guard let self else { return }
-            let authorizationId = INSConnectionUtils.authorizationId()
-            guard !authorizationId.isEmpty else { return }
-            do {
-                let cmd = try self.commandManager()
-                let options = INSCameraOptions()
-                options.authorizationId = authorizationId
-                try await Self.withTimeout(seconds: 5) {
-                    try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-                        cmd.setOptions(options, forTypes: [NSNumber(value: 38)]) { error, _ in
-                            if let error {
-                                cont.resume(throwing: error)
-                                return
-                            }
-                            cont.resume()
-                        }
-                    }
-                }
-
-                if let authCmd = cmd as? INSBluetoothCommands,
-                   let initiator = INSCheckAuthorizationInitiatorType(rawValue: 1) {
-                    try await Self.withTimeout(seconds: 8) {
-                        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-                            authCmd.checkPhoneAuthorization(
-                                with: nil,
-                                initiatorType: initiator,
-                                deviceId: authorizationId
-                            ) { error, status in
-                                if let error {
-                                    cont.resume(throwing: error)
-                                    return
-                                }
-                                if let status {
-                                    NSLog("[Insta360BLE.auth] authorization state=\(status.state.rawValue) deviceId=\(status.deviceId)")
-                                }
-                                cont.resume()
-                            }
-                        }
-                    }
-                }
-                NSLog("[Insta360BLE.auth] Phone authorization configured for \(Self.displayName(for: device))")
-            } catch {
-                NSLog("[Insta360BLE.auth] Phone authorization best-effort skipped for \(Self.displayName(for: device)): \(error.localizedDescription)")
-            }
-        }
     }
 
     private func preferredWakeSerial(excludingUUIDs: Set<String>) async -> String? {
@@ -645,7 +592,7 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
                 return try await performStartCapture(
                     cmd: cmd,
                     clock: clock,
-                    timeoutSeconds: attempt == 1 ? 12 : 16)
+                    timeoutSeconds: attempt == 1 ? 6 : 8)
             } catch {
                 lastError = error
                 guard attempt < 2, Self.isRecoverableCommandError(error) else {
@@ -918,13 +865,25 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
                 continue
             }
 
-            await wakeKnownCamera(window: attempt == 1 ? 0.45 : 0.8)
+            if shouldWakeBeforeProbe(device) {
+                await wakeKnownCamera(window: attempt == 1 ? 0.45 : 0.8)
+            }
 
             guard await isBLELinkReachable(device, timeout: attempt == 1 ? 2 : 3) else {
                 lastError = Insta360Error.commandFailed("BLE link probe timed out")
                 markConnectedDeviceStale(device, reason: "\(reason) RSSI probe failed")
                 try? await Task.sleep(nanoseconds: UInt64(attempt) * 400_000_000)
                 continue
+            }
+
+            if Insta360CommandReadinessPolicy.requiresPoweredGoCamera(for: reason) {
+                do {
+                    try ensurePoweredGoCameraForRecording(device, reason: reason)
+                } catch {
+                    lastError = error
+                    NSLog("[Insta360BLE] \(reason) power probe failed: \(error.localizedDescription)")
+                    throw error
+                }
             }
 
             do {
@@ -957,6 +916,30 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
         }
 
         throw lastError ?? Insta360Error.commandFailed("\(reason) failed")
+    }
+
+    private func ensurePoweredGoCameraForRecording(
+        _ device: INSBluetoothDevice,
+        reason: String
+    ) throws {
+        guard device.isGOPeripheral() else { return }
+        NSLog("[Insta360BLE] power probe device=\(Self.displayName(for: device)) reason=\(reason) powerOn=\(device.powerOn) powerOnForQC=\(device.powerOnForQC) lowBattery=\(device.powerForLowBatteryStatus)")
+        guard Insta360CommandReadinessPolicy.isGoCameraPoweredForRecording(
+            powerOn: device.powerOn,
+            powerOnForQC: device.powerOnForQC
+        ) else {
+            if device.powerForLowBatteryStatus {
+                throw Insta360Error.commandFailed("camera is in low battery power-off state")
+            }
+            throw Insta360Error.commandFailed("camera is not powered on")
+        }
+    }
+
+    private func shouldWakeBeforeProbe(_ device: INSBluetoothDevice) -> Bool {
+        guard device.isGOPeripheral() else { return false }
+        return Insta360CommandReadinessPolicy.shouldWakeConnectedGoCamera(
+            powerOn: device.powerOn,
+            powerOnForQC: device.powerOnForQC)
     }
 
     private func wakeKnownCamera(window: TimeInterval) async {
@@ -1030,11 +1013,11 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
         }
     }
 
-    private func bestEffortStopCaptureAfterAmbiguousStart() async {
+    private func bestEffortStopCaptureAfterAmbiguousStart(timeoutSeconds: TimeInterval = 5) async {
         guard let cmd = try? commandManager() else { return }
         let deviceTag = connectedDevice?.name ?? "(unknown)"
         do {
-            try await withTimeout(seconds: 5) {
+            try await withTimeout(seconds: timeoutSeconds) {
                 try await withUnsafeThrowingContinuation { (cont: UnsafeContinuation<Void, Error>) in
                     cmd.stopCapture(with: nil) { error, _ in
                         if let error {

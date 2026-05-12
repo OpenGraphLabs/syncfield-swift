@@ -2,6 +2,30 @@
 
 All notable changes to **syncfield-swift** are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] — 2026-05-12
+
+This release pulls the wide-FOV egocentric capture configuration that was previously living in host apps (og-skill's `EgonautIPhoneCameraStream`) into the SDK, so `iPhoneCameraStream` now produces ultra-wide capture by default — matching the egocentric / head-mounted data-collection use case the SDK targets. Public API signatures are unchanged; existing call sites (`iPhoneCameraStream(streamId:)`, `iPhoneCameraStream(streamId:videoSettings:)`) compile and run identically, they just yield wider video.
+
+### Changed (breaking)
+- **`iPhoneCameraStream` now defaults to the back ultra-wide camera at minimum zoom.** Equivalent to the iOS Camera app's 0.5× lens. On devices with a physical `.builtInUltraWideCamera` (iPhone 11 and newer except SE), the stream selects it directly. On devices without one (iPhone SE, X, 8 and earlier) the stream falls back to `.builtInWideAngleCamera` via a `DiscoverySession` ranked by `videoFieldOfView` — preserving the pre-0.9 behaviour on that hardware. Devices with a multi-lens virtual camera get the widest physical sensor and the framing the user expects from a "0.5×" tap, rather than the default 1× crop. Existing call sites compile unchanged; recordings simply have a wider field of view.
+- **Within the selected device, the format with the largest `videoFieldOfView` is picked at configuration time.** Multi-lens hardware can expose several formats at the same resolution with different effective FOV (some cropped for stabilization headroom); 0.9 picks the widest. Resolution / fps requested via `VideoSettings` is honoured as before — the FOV-max ranking only breaks ties among compatible formats.
+- **Video stabilization is set to `.off` on the capture connection.** Standard / cinematic stabilization modes crop the sensor for motion headroom, silently narrowing the effective FOV and undoing the widest-format selection above. Capture pipelines that needed stabilization on must now set it themselves after `connect()` returns.
+- **`videoZoomFactor` is locked to `minAvailableVideoZoomFactor` at both `configureSession` time and at the top of `startRecording`.** The re-application in `startRecording` is defensive: between session config and the first recorded frame, an intervening subsystem (preview manager, system camera UI) can nudge zoom off its floor, which on a multi-lens device snaps capture back to the standard 1× wide-angle framing. Recording-time re-enforcement guarantees the recorded clip starts at full ultra-wide framing every time.
+
+### Added
+- **`setIntrinsicMatrixHandler(_:)`** on `iPhoneCameraStream`. AVFoundation attaches the per-frame `kCMSampleBufferAttachmentKey_CameraIntrinsicMatrix` to vended sample buffers when the connection supports it; the new handler delivers the extracted fx/fy/cx/cy plus sample-buffer dimensions in a `DeliveredCameraIntrinsics` struct. Runs on the capture serial queue. Hosts use this to write a `camera_intrinsics.json` sidecar without re-implementing the 3-way attachment lookup (`CMGetAttachment` → sample-attachments array → image-buffer attachment) that AVFoundation requires across iOS versions.
+- **`activeCameraMetadata: ActiveCameraMetadata?`** on `iPhoneCameraStream`. Returns the device type, localized name, active-format dimensions, and `videoFieldOfView` after `connect()` resolves. Hosts use this to compute and write an FOV-based intrinsics estimate at recording start, before any frame with an attached matrix arrives.
+- `SyncFieldVersion.current` bumped to `0.9.0`.
+
+### Fixed
+- **Powered-on Insta360 GO recording preflight is side-effect free again.** `refreshConnection` and `startRemoteRecording` no longer send a `getOptions` command probe before `startCapture`; they verify the BLE link, GO power flags, and SDK command object, then let the SDK's `startCapture` command be the first capture-channel operation. `getOptionsWithTypes` is reserved for real option reads such as WiFi credentials. Already-powered GO cameras are also no longer sent redundant wake advertisements during preflight/start, and the `startCapture` timeout is kept to an expected fast ACK window with a single reconnect retry.
+- **Ambiguous `startCapture` cleanup no longer hammers the same stale command channel.** On a recoverable start failure, the controller marks the BLE session stale, reconnects through the existing identity/wake path, and then sends best-effort `stopCapture` cleanup. This avoids the observed `stopCapture` timeout followed by SDK `444` disconnect loop on powered-on cameras.
+
+### Compatibility
+- API-source-compatible. All public types and method signatures from 0.8 still compile.
+- Runtime-behaviour-breaking on hardware with a `.builtInUltraWideCamera`: capture field of view widens, native pixel-buffer dimensions for that format may differ from the previous `.builtInWideAngleCamera` selection. Frame-processor consumers that hard-code dimensions (Vision models, custom feature extractors) should re-verify against the new format.
+- No behaviour change on hardware without a `.builtInUltraWideCamera`. Those devices continue to receive `.builtInWideAngleCamera` capture via the discovery-session fallback.
+
 ## [0.8.0] — 2026-05-11
 
 This release makes deferred Insta360 ingest a first-class SDK feature so host apps can record now and download wrist mp4s later (per-episode "Download" button, batched "Collect all" page) without re-implementing pairing, AP grouping, or sidecar bookkeeping themselves.
