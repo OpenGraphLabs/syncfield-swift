@@ -108,6 +108,27 @@ final class CountdownTests: XCTestCase {
                                      "countdown must hold start by at least ticks × interval")
     }
 
+    func test_countdownTicksAfterStreamsHaveStarted() async throws {
+        let (s, _) = makeSession()
+        let recorder = CountdownStartOrderRecorder()
+        try await s.add(DelayedStartStream(streamId: "a", delayNs: 80_000_000, recorder: recorder))
+        try await s.connect()
+
+        let spec = CountdownSpec(ticks: 1, intervalMs: 50, style: .silent)
+        _ = try await s.startRecording(countdown: spec) { _ in
+            recorder.markTick()
+        }
+
+        let startNs = await recorder.streamStartNs
+        let tickNs = await recorder.firstTickNs
+        XCTAssertNotNil(startNs)
+        XCTAssertNotNil(tickNs)
+        XCTAssertGreaterThanOrEqual(
+            tickNs ?? 0,
+            startNs ?? UInt64.max,
+            "visible/audible countdown must not begin until streams have acknowledged start")
+    }
+
     // MARK: - Pure tone synthesis
 
     func test_toneSynthesis_producesNonZeroSamples() {
@@ -147,4 +168,60 @@ actor TickCollector {
     }
     private func appendInside(_ v: Int) { values.append(v) }
     func snapshot() -> [Int] { values }
+}
+
+private actor CountdownStartOrderRecorder {
+    private(set) var streamStartNs: UInt64?
+    private(set) var firstTickNs: UInt64?
+
+    func markStreamStarted() {
+        streamStartNs = DispatchTime.now().uptimeNanoseconds
+    }
+
+    nonisolated func markTick() {
+        Task { await self.markTickInside() }
+    }
+
+    private func markTickInside() {
+        if firstTickNs == nil {
+            firstTickNs = DispatchTime.now().uptimeNanoseconds
+        }
+    }
+}
+
+private final class DelayedStartStream: SyncFieldStream, @unchecked Sendable {
+    nonisolated let streamId: String
+    nonisolated let capabilities = StreamCapabilities(
+        requiresIngest: false,
+        producesFile: false)
+
+    private let delayNs: UInt64
+    private let recorder: CountdownStartOrderRecorder
+
+    init(streamId: String, delayNs: UInt64, recorder: CountdownStartOrderRecorder) {
+        self.streamId = streamId
+        self.delayNs = delayNs
+        self.recorder = recorder
+    }
+
+    func prepare() async throws {}
+    func connect(context: StreamConnectContext) async throws {}
+
+    func startRecording(clock: SessionClock, writerFactory: WriterFactory) async throws {
+        try await Task.sleep(nanoseconds: delayNs)
+        await recorder.markStreamStarted()
+    }
+
+    func stopRecording() async throws -> StreamStopReport {
+        StreamStopReport(streamId: streamId, frameCount: 0, kind: "sensor")
+    }
+
+    func ingest(
+        into dir: URL,
+        progress: @Sendable (Double) -> Void
+    ) async throws -> StreamIngestReport {
+        StreamIngestReport(streamId: streamId, filePath: nil, frameCount: 0)
+    }
+
+    func disconnect() async throws {}
 }

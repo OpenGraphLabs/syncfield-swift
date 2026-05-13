@@ -77,19 +77,25 @@ final class Insta360WakeTests: XCTestCase {
         XCTAssertEqual(Insta360WakeRetryPolicy.intervalNs(cycle: 6), 1_500_000_000)
     }
 
-    func test_commandReadinessPolicyKeepsRecordingPathSideEffectFree() {
+    func test_commandReadinessPolicyUsesCommandChannelForRecordingPreflight() {
         XCTAssertEqual(
             Insta360CommandReadinessPolicy.probe(for: "refreshConnection"),
-            .bleLinkOnly)
+            .commandChannel)
         XCTAssertEqual(
             Insta360CommandReadinessPolicy.probe(for: "startRemoteRecording attempt 1"),
-            .bleLinkOnly)
+            .commandChannel)
         XCTAssertEqual(
             Insta360CommandReadinessPolicy.probe(for: "stopRemoteRecording"),
             .bleLinkOnly)
         XCTAssertEqual(
             Insta360CommandReadinessPolicy.probe(for: "startCapture attempt 1 failed cleanup"),
             .bleLinkOnly)
+        XCTAssertTrue(
+            Insta360CommandReadinessPolicy.requiresCaptureControlProbe(for: "refreshConnection"))
+        XCTAssertTrue(
+            Insta360CommandReadinessPolicy.requiresCaptureControlProbe(for: "startRemoteRecording attempt 1"))
+        XCTAssertFalse(
+            Insta360CommandReadinessPolicy.requiresCaptureControlProbe(for: "wifiCredentials"))
     }
 
     func test_commandReadinessPolicyChecksGoPowerForRecordingPath() {

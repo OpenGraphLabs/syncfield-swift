@@ -1,6 +1,31 @@
 // Sources/SyncField/SessionOrchestrator.swift
 import Foundation
 
+private final class SessionStartTimeoutResumeGate<T>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var didResume = false
+
+    func resume(
+        _ continuation: UnsafeContinuation<T, Error>,
+        _ result: Result<T, Error>
+    ) {
+        lock.lock()
+        guard !didResume else {
+            lock.unlock()
+            return
+        }
+        didResume = true
+        lock.unlock()
+
+        switch result {
+        case .success(let value):
+            continuation.resume(returning: value)
+        case .failure(let error):
+            continuation.resume(throwing: error)
+        }
+    }
+}
+
 public actor SessionOrchestrator {
     // MARK: Public API
 
@@ -36,6 +61,7 @@ public actor SessionOrchestrator {
                 stopChirp: ChirpSpec? = .defaultStop,
                 postStartStabilizationMs: Double = 200,
                 preStopTailMarginMs: Double = 800,
+                streamStartTimeoutSeconds: Double = 45,
                 audioSessionPolicy: AudioSessionPolicy = .managedBySDK,
                 handQualityConfig: HandQualityConfig = .default) {
         self.hostId = hostId
@@ -45,6 +71,7 @@ public actor SessionOrchestrator {
         self.stopChirpSpec = stopChirp
         self.postStartStabilizationMs = postStartStabilizationMs
         self.preStopTailMarginMs = preStopTailMarginMs
+        self.streamStartTimeoutSeconds = streamStartTimeoutSeconds
         self.audioSessionPolicy = audioSessionPolicy
         self.handQualityConfig = handQualityConfig
     }
@@ -199,33 +226,35 @@ public actor SessionOrchestrator {
             eventWriter: evWriter
         )
 
-        // 3-2-1 countdown runs IN PARALLEL with the BLE start TaskGroup so
-        // surrounding Insta360 mics start recording in time to catch the
-        // ticks themselves as ambient audio (matches the egonaut production
-        // rhythm: tick-tick-tick at t=0,1,2 / chirp at t≈3). The chirp is
-        // gated on BOTH the countdown finishing AND every stream acking
-        // start, so it always lands as the 4th beat regardless of BLE
-        // latency.
-        let countdownTask: Task<Void, Never>? = (countdown.flatMap { spec in
-            spec.ticks > 0 ? Task { await self.runCountdown(spec, onTick: onTick) } : nil
-        })
-
-        // Atomic start: try all concurrently; roll back any that succeeded if any fails.
+        // Atomic start: try all streams concurrently and wait for every host
+        // to ACK before the audible/visible countdown starts. This avoids the
+        // user-facing "stuck at 1" failure mode when an external camera is
+        // slow or paired to a stale ActionPod endpoint: failures now surface
+        // while the host app is still in its "starting cameras" state, before
+        // the operator hears 3-2-1.
         var started: [String] = []
         do {
             try await withThrowingTaskGroup(of: String.self) { group in
                 for s in streams {
+                    let timeoutSeconds = streamStartTimeoutSeconds
                     group.addTask { [s] in
-                        try await s.startRecording(clock: clock, writerFactory: factory)
+                        try await Self.withStartTimeout(
+                            seconds: timeoutSeconds,
+                            streamId: s.streamId
+                        ) {
+                            try await s.startRecording(clock: clock, writerFactory: factory)
+                        }
                         return s.streamId
                     }
                 }
                 for try await id in group { started.append(id) }
             }
         } catch {
-            countdownTask?.cancel()
-            // Roll back: stop the ones that started, delete their files.
-            for s in streams where started.contains(s.streamId) {
+            // Roll back every stream, not only the ones that returned before
+            // the failure. A timed-out SDK call can represent an ambiguous
+            // start where the camera accepted capture but never delivered its
+            // callback; best-effort stop keeps the rig safe for the next take.
+            for s in streams {
                 _ = try? await s.stopRecording()
             }
             try? FileManager.default.removeItem(at: episodeDirectory)
@@ -236,9 +265,13 @@ public actor SessionOrchestrator {
         // State is already `.recording` (set at the top before any await
         // to gate concurrent callers).
 
-        // Wait for the countdown to finish (if BLE start beat it) so the
-        // chirp lands after the last tick rather than under it.
-        await countdownTask?.value
+        // Countdown after stream ACK: all hosts are already recording, so the
+        // ticks and the start chirp are guaranteed to be present in every
+        // audio track. Host apps should drive their visible countdown from the
+        // `onTick` callback rather than from an independent JS timer.
+        if let spec = countdown, spec.ticks > 0 {
+            await runCountdown(spec, onTick: onTick)
+        }
 
         // Chirp: wait for audio pipeline to stabilize, then emit
         if let spec = startChirpSpec {
@@ -467,6 +500,7 @@ public actor SessionOrchestrator {
     private let stopChirpSpec: ChirpSpec?
     private let postStartStabilizationMs: Double
     private let preStopTailMarginMs: Double
+    private let streamStartTimeoutSeconds: Double
     private let audioSessionPolicy: AudioSessionPolicy
     private let countdownTickPlayer = CountdownTickPlayer()
     private var startEmission: ChirpEmission?
@@ -487,6 +521,44 @@ public actor SessionOrchestrator {
         #else
         return SilentChirpPlayer()
         #endif
+    }
+
+    private static func withStartTimeout<T: Sendable>(
+        seconds: Double,
+        streamId: String,
+        operation: @Sendable @escaping () async throws -> T
+    ) async throws -> T {
+        let operationTask = Task<T, Error> {
+            try await operation()
+        }
+        let gate = SessionStartTimeoutResumeGate<T>()
+        var timeoutTask: Task<Void, Never>?
+        defer {
+            operationTask.cancel()
+            timeoutTask?.cancel()
+        }
+
+        return try await withUnsafeThrowingContinuation { continuation in
+            timeoutTask = Task.detached {
+                let ns = UInt64(max(0, seconds) * 1_000_000_000)
+                try? await Task.sleep(nanoseconds: ns)
+                if Task.isCancelled { return }
+                let error = NSError(
+                    domain: "SyncField.SessionOrchestrator",
+                    code: -10,
+                    userInfo: [NSLocalizedDescriptionKey:
+                        "stream \(streamId) start timed out after \(seconds)s"])
+                gate.resume(continuation, .failure(error))
+            }
+
+            Task.detached {
+                do {
+                    gate.resume(continuation, .success(try await operationTask.value))
+                } catch {
+                    gate.resume(continuation, .failure(error))
+                }
+            }
+        }
     }
 
     private func stopReportsInStreamOrder() -> [StreamStopReport] {

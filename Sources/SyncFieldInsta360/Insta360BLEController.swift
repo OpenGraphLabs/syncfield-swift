@@ -120,10 +120,18 @@ internal enum Insta360CommandReadinessPolicy {
     static func probe(for reason: String) -> Insta360CommandReadinessProbe {
         let normalized = reason.lowercased()
         if normalized.contains("wificredentials")
-            || normalized.contains("enablewififordownload") {
+            || normalized.contains("enablewififordownload")
+            || normalized.contains("refreshconnection")
+            || normalized.contains("startremoterecording") {
             return .commandChannel
         }
         return .bleLinkOnly
+    }
+
+    static func requiresCaptureControlProbe(for reason: String) -> Bool {
+        let normalized = reason.lowercased()
+        return normalized.contains("refreshconnection")
+            || normalized.contains("startremoterecording")
     }
 
     static func requiresPoweredGoCamera(for reason: String) -> Bool {
@@ -1252,7 +1260,11 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
             }
 
             do {
-                try await probeCommandChannel(timeout: attempt == 1 ? 4 : 6)
+                if Insta360CommandReadinessPolicy.requiresCaptureControlProbe(for: reason) {
+                    try await probeCaptureControlChannel(timeout: attempt == 1 ? 4 : 6)
+                } else {
+                    try await probeCommandChannel(timeout: attempt == 1 ? 4 : 6)
+                }
                 lastCommandReadyUptimeNs = DispatchTime.now().uptimeNanoseconds
                 lastCommandReadyProbe = probePolicy
                 return
@@ -1345,6 +1357,11 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
                 _ = (cmd as AnyObject).perform(sel, with: optionTypes, with: callback)
             }
         }
+    }
+
+    private func probeCaptureControlChannel(timeout: TimeInterval) async throws {
+        let result = try await currentCaptureState(timeout: timeout)
+        NSLog("[Insta360BLE] capture control probe ACK state=\(result.stateRaw) captureTime=\(result.captureTime)")
     }
 
     private func currentCaptureState(
