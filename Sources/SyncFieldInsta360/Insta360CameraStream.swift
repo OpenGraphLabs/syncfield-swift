@@ -449,4 +449,12 @@ public final class Insta360CameraStream: SyncFieldStream, SyncFieldRecordingPref
         return nil
         #endif
     }
+
+    public func dockStatus() async -> Insta360DockStatus {
+        #if canImport(INSCameraServiceSDK)
+        return await ble.dockStatus()
+        #else
+        return .unknown
+        #endif
+    }
 }

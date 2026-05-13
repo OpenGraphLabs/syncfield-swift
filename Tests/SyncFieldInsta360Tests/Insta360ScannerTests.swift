@@ -70,6 +70,48 @@ final class Insta360ScannerTests: XCTestCase {
             go3Version: nil))
     }
 
+    func test_dockStatus_resolvesConnectedChargeBoxAsDocked() {
+        XCTAssertEqual(Insta360BLEController.resolveDockStatus(
+            chargeBoxStateRaw: 1,
+            chargeboxUsbConnectedRaw: 1,
+            chargeboxBtConnectedRaw: 1
+        ), .docked)
+    }
+
+    func test_dockStatus_resolvesPeripheralConnectionAsDocked() {
+        XCTAssertEqual(Insta360BLEController.resolveDockStatus(
+            chargeBoxStateRaw: nil,
+            chargeboxUsbConnectedRaw: 2,
+            chargeboxBtConnectedRaw: 1
+        ), .docked)
+        XCTAssertEqual(Insta360BLEController.resolveDockStatus(
+            chargeBoxStateRaw: nil,
+            chargeboxUsbConnectedRaw: 1,
+            chargeboxBtConnectedRaw: 2
+        ), .docked)
+    }
+
+    func test_dockStatus_resolvesExplicitNoConnectionAsSeparated() {
+        XCTAssertEqual(Insta360BLEController.resolveDockStatus(
+            chargeBoxStateRaw: 0,
+            chargeboxUsbConnectedRaw: 1,
+            chargeboxBtConnectedRaw: 1
+        ), .separated)
+    }
+
+    func test_dockStatus_keepsAmbiguousValuesUnknown() {
+        XCTAssertEqual(Insta360BLEController.resolveDockStatus(
+            chargeBoxStateRaw: nil,
+            chargeboxUsbConnectedRaw: 1,
+            chargeboxBtConnectedRaw: 1
+        ), .unknown)
+        XCTAssertEqual(Insta360BLEController.resolveDockStatus(
+            chargeBoxStateRaw: nil,
+            chargeboxUsbConnectedRaw: nil,
+            chargeboxBtConnectedRaw: nil
+        ), .unknown)
+    }
+
     func test_withTimeout_successReturnsValueBeforeDeadline() async throws {
         let value = try await Insta360BLEController.withTimeout(seconds: 1.0) {
             try await Task.sleep(nanoseconds: 100_000_000)

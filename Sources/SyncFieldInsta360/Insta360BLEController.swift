@@ -100,6 +100,17 @@ public enum Insta360CameraWarning: Sendable {
     }
 }
 
+/// Best-effort Action Pod dock state for GO-series cameras.
+///
+/// `unknown` intentionally remains usable: the SDK does not always publish
+/// charge-box metadata immediately after BLE pairing, especially around
+/// docking transitions.
+public enum Insta360DockStatus: String, Codable, Sendable {
+    case separated
+    case docked
+    case unknown
+}
+
 internal enum Insta360CommandReadinessProbe: Equatable, Sendable {
     case bleLinkOnly
     case commandChannel
@@ -1913,3 +1924,97 @@ public final class Insta360BLEController: @unchecked Sendable {
     }
 }
 #endif // canImport(INSCameraServiceSDK)
+
+extension Insta360BLEController {
+    internal static func resolveDockStatus(
+        chargeBoxStateRaw: UInt?,
+        chargeboxUsbConnectedRaw: UInt?,
+        chargeboxBtConnectedRaw: UInt?
+    ) -> Insta360DockStatus {
+        let noConnection: UInt = 0
+        let connected: UInt = 1
+        let peripheralConnected: UInt = 2
+
+        if chargeBoxStateRaw == connected
+            || chargeboxUsbConnectedRaw == peripheralConnected
+            || chargeboxBtConnectedRaw == peripheralConnected {
+            return .docked
+        }
+
+        if chargeBoxStateRaw == noConnection {
+            return .separated
+        }
+
+        return .unknown
+    }
+
+    /// Query GO-series Action Pod dock status without making it a hard
+    /// pairing precondition. Callers should treat `.unknown` as allowed and
+    /// only surface guidance for `.docked`.
+    public func dockStatus() async -> Insta360DockStatus {
+        #if canImport(INSCameraServiceSDK)
+        let deviceName = lastKnownName ?? connectedDevice?.name ?? "(unknown)"
+        guard connectedDevice != nil else {
+            NSLog("[Insta360BLE] dockStatus unknown device=\(deviceName) reason=notPaired")
+            return .unknown
+        }
+
+        do {
+            try await ensureCommandReady(
+                reason: "dockStatus",
+                maxCachedAgeSeconds: 5)
+        } catch {
+            NSLog("[Insta360BLE] dockStatus unknown device=\(deviceName) readiness=\(error.localizedDescription)")
+            return .unknown
+        }
+
+        do {
+            let cmd = try commandManager()
+            let chargeBoxStatusType = NSNumber(value: 85) // INSCameraOptionsTypeChargeBoxStatus
+            let response: (options: INSCameraOptions, successTypes: [NSNumber]) = try await Self.withTimeout(seconds: 4) {
+                try await withCheckedThrowingContinuation { (cont: CheckedContinuation<(INSCameraOptions, [NSNumber]), Error>) in
+                    let sel = NSSelectorFromString("getOptionsWithTypes:completion:")
+                    guard (cmd as AnyObject).responds(to: sel) else {
+                        cont.resume(throwing: Insta360Error.commandFailed("BLE getOptions unavailable"))
+                        return
+                    }
+                    let callback: @convention(block) (NSError?, INSCameraOptions?, NSArray?) -> Void = { error, options, successTypes in
+                        if let error {
+                            cont.resume(throwing: Insta360Error.commandFailed(error.localizedDescription))
+                            return
+                        }
+                        if let options {
+                            let successNumbers = successTypes?.compactMap { $0 as? NSNumber } ?? []
+                            cont.resume(returning: (options, successNumbers))
+                        } else {
+                            cont.resume(throwing: Insta360Error.commandFailed("dock status unavailable"))
+                        }
+                    }
+                    _ = (cmd as AnyObject).perform(sel, with: [chargeBoxStatusType], with: callback)
+                }
+            }
+
+            let stateRaw = UInt(response.options.chargeBoxStatus.state.rawValue)
+            let usbRaw = UInt(response.options.chargeBoxStatus.chargeboxUsbConnectedState.rawValue)
+            let btRaw = UInt(response.options.chargeBoxStatus.chargeboxBtConnectedState.rawValue)
+            let resolved = Self.resolveDockStatus(
+                chargeBoxStateRaw: stateRaw,
+                chargeboxUsbConnectedRaw: usbRaw,
+                chargeboxBtConnectedRaw: btRaw)
+            let optionConfirmed = response.successTypes.contains {
+                $0.intValue == chargeBoxStatusType.intValue
+            }
+            let trustedStatus: Insta360DockStatus = optionConfirmed || resolved == .docked
+                ? resolved
+                : .unknown
+            NSLog("[Insta360BLE] dockStatus device=\(deviceName) status=\(trustedStatus.rawValue) state=\(stateRaw) usb=\(usbRaw) bt=\(btRaw) optionConfirmed=\(optionConfirmed)")
+            return trustedStatus
+        } catch {
+            NSLog("[Insta360BLE] dockStatus unknown device=\(deviceName) error=\(error.localizedDescription)")
+            return .unknown
+        }
+        #else
+        return .unknown
+        #endif
+    }
+}
