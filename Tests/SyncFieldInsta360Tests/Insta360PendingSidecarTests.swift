@@ -33,6 +33,82 @@ final class Insta360PendingSidecarTests: XCTestCase {
         XCTAssertEqual(scanned[0].bleUuid, "AAAA")
         XCTAssertEqual(scanned[0].role, "left")
         XCTAssertEqual(scanned[0].bleAckMonotonicNs, 1_234_567_890)
+        XCTAssertNil(scanned[0].bleAckWallClockMs)
+        XCTAssertNil(scanned[0].stopWallClockMs)
+        XCTAssertNil(scanned[0].cameraDurationSec)
+        XCTAssertNil(scanned[0].cameraFileSize)
+        XCTAssertNil(scanned[0].expectedSegments)
+    }
+
+    func test_writeThenScan_roundTripsLongRecordingMetadata() throws {
+        try Insta360PendingSidecar.write(
+            to: tempDir,
+            streamId: "cam_wrist_left",
+            cameraFileURI: Insta360PendingSidecar.unresolvedCameraFileURI,
+            bleUuid: "AAAA",
+            bleName: "GO 3S A",
+            role: "left",
+            bleAckNs: 1_234_567_890,
+            stopFailureReason: "stopCapture acked without uri",
+            bleAckWallClockMs: 1_778_688_000_000,
+            stopWallClockMs: 1_778_689_200_000,
+            cameraDurationSec: 1_200,
+            cameraFileSize: 4_294_967_296,
+            expectedSegments: 2)
+
+        let scanned = try Insta360PendingSidecar.scan(tempDir)
+        XCTAssertEqual(scanned.count, 1)
+        XCTAssertEqual(scanned[0].bleAckWallClockMs, 1_778_688_000_000)
+        XCTAssertEqual(scanned[0].stopWallClockMs, 1_778_689_200_000)
+        XCTAssertEqual(scanned[0].cameraDurationSec, 1_200)
+        XCTAssertEqual(scanned[0].cameraFileSize, 4_294_967_296)
+        XCTAssertEqual(scanned[0].expectedSegments, 2)
+    }
+
+    func test_decodeLegacyJSONWithoutLongRecordingMetadata() throws {
+        let json = """
+        {
+          "streamId": "cam_wrist_left",
+          "cameraFileURI": "unresolved://latest-video",
+          "bleUuid": "AAAA",
+          "bleName": "GO 3S A",
+          "role": "left",
+          "bleAckMonotonicNs": 99,
+          "savedAt": "2026-05-13T00:00:00Z",
+          "stopFailureReason": "legacy"
+        }
+        """.data(using: .utf8)!
+
+        let decoded = try JSONDecoder().decode(Insta360PendingSidecar.self, from: json)
+        XCTAssertEqual(decoded.streamId, "cam_wrist_left")
+        XCTAssertNil(decoded.bleAckWallClockMs)
+        XCTAssertNil(decoded.stopWallClockMs)
+        XCTAssertNil(decoded.cameraDurationSec)
+        XCTAssertNil(decoded.cameraFileSize)
+        XCTAssertNil(decoded.expectedSegments)
+    }
+
+    func test_decodePartialLongRecordingMetadata() throws {
+        let json = """
+        {
+          "streamId": "cam_wrist_left",
+          "cameraFileURI": "unresolved://latest-video",
+          "bleUuid": "AAAA",
+          "bleName": "GO 3S A",
+          "role": "left",
+          "bleAckMonotonicNs": 99,
+          "savedAt": "2026-05-13T00:00:00Z",
+          "bleAckWallClockMs": 1778688000000,
+          "cameraDurationSec": 360
+        }
+        """.data(using: .utf8)!
+
+        let decoded = try JSONDecoder().decode(Insta360PendingSidecar.self, from: json)
+        XCTAssertEqual(decoded.bleAckWallClockMs, 1_778_688_000_000)
+        XCTAssertEqual(decoded.cameraDurationSec, 360)
+        XCTAssertNil(decoded.stopWallClockMs)
+        XCTAssertNil(decoded.cameraFileSize)
+        XCTAssertNil(decoded.expectedSegments)
     }
 
     func test_scan_ignoresNonPendingJson() throws {
@@ -70,13 +146,22 @@ final class Insta360PendingSidecarTests: XCTestCase {
             bleName: "GO 3S A",
             role: "left",
             bleAckNs: 99,
-            stopFailureReason: "stopCapture returned no videoInfo.uri")
+            stopFailureReason: "stopCapture returned no videoInfo.uri",
+            bleAckWallClockMs: 1_778_688_000_000,
+            stopWallClockMs: 1_778_688_360_000,
+            cameraDurationSec: 360,
+            cameraFileSize: nil,
+            expectedSegments: 1)
 
         let scanned = try Insta360PendingSidecar.scan(tempDir)
         XCTAssertEqual(scanned.count, 1)
         XCTAssertTrue(scanned[0].needsCameraFileURIResolution)
         XCTAssertEqual(scanned[0].cameraFileURI, Insta360PendingSidecar.unresolvedCameraFileURI)
         XCTAssertEqual(scanned[0].stopFailureReason, "stopCapture returned no videoInfo.uri")
+        XCTAssertEqual(scanned[0].bleAckWallClockMs, 1_778_688_000_000)
+        XCTAssertEqual(scanned[0].stopWallClockMs, 1_778_688_360_000)
+        XCTAssertEqual(scanned[0].cameraDurationSec, 360)
+        XCTAssertEqual(scanned[0].expectedSegments, 1)
     }
 
     // MARK: - scanRecursive

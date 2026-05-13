@@ -15,6 +15,11 @@ public struct Insta360PendingSidecar: Codable, Sendable {
     public let bleAckMonotonicNs: UInt64
     public let savedAt: String           // ISO8601
     public let stopFailureReason: String?
+    public let bleAckWallClockMs: UInt64?
+    public let stopWallClockMs: UInt64?
+    public let cameraDurationSec: UInt?
+    public let cameraFileSize: UInt64?
+    public let expectedSegments: Int?
 
     public init(
         streamId: String,
@@ -24,7 +29,12 @@ public struct Insta360PendingSidecar: Codable, Sendable {
         role: String,
         bleAckMonotonicNs: UInt64,
         savedAt: String,
-        stopFailureReason: String? = nil
+        stopFailureReason: String? = nil,
+        bleAckWallClockMs: UInt64? = nil,
+        stopWallClockMs: UInt64? = nil,
+        cameraDurationSec: UInt? = nil,
+        cameraFileSize: UInt64? = nil,
+        expectedSegments: Int? = nil
     ) {
         self.streamId = streamId
         self.cameraFileURI = cameraFileURI
@@ -34,6 +44,11 @@ public struct Insta360PendingSidecar: Codable, Sendable {
         self.bleAckMonotonicNs = bleAckMonotonicNs
         self.savedAt = savedAt
         self.stopFailureReason = stopFailureReason
+        self.bleAckWallClockMs = bleAckWallClockMs
+        self.stopWallClockMs = stopWallClockMs
+        self.cameraDurationSec = cameraDurationSec
+        self.cameraFileSize = cameraFileSize
+        self.expectedSegments = expectedSegments
     }
 
     public var needsCameraFileURIResolution: Bool {
@@ -61,7 +76,12 @@ public struct Insta360PendingSidecar: Codable, Sendable {
         bleName: String,
         role: String,
         bleAckNs: UInt64,
-        stopFailureReason: String? = nil
+        stopFailureReason: String? = nil,
+        bleAckWallClockMs: UInt64? = nil,
+        stopWallClockMs: UInt64? = nil,
+        cameraDurationSec: UInt? = nil,
+        cameraFileSize: UInt64? = nil,
+        expectedSegments: Int? = nil
     ) throws {
         let sidecar = Insta360PendingSidecar(
             streamId: streamId,
@@ -71,7 +91,12 @@ public struct Insta360PendingSidecar: Codable, Sendable {
             role: role,
             bleAckMonotonicNs: bleAckNs,
             savedAt: ISO8601DateFormatter().string(from: Date()),
-            stopFailureReason: stopFailureReason)
+            stopFailureReason: stopFailureReason,
+            bleAckWallClockMs: bleAckWallClockMs,
+            stopWallClockMs: stopWallClockMs,
+            cameraDurationSec: cameraDurationSec,
+            cameraFileSize: cameraFileSize,
+            expectedSegments: expectedSegments)
 
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -89,7 +114,12 @@ public struct Insta360PendingSidecar: Codable, Sendable {
         bleName: String,
         role: String,
         bleAckNs: UInt64,
-        stopFailureReason: String
+        stopFailureReason: String,
+        bleAckWallClockMs: UInt64? = nil,
+        stopWallClockMs: UInt64? = nil,
+        cameraDurationSec: UInt? = nil,
+        cameraFileSize: UInt64? = nil,
+        expectedSegments: Int? = nil
     ) throws {
         try write(
             to: episodeDirectory,
@@ -99,7 +129,12 @@ public struct Insta360PendingSidecar: Codable, Sendable {
             bleName: bleName,
             role: role,
             bleAckNs: bleAckNs,
-            stopFailureReason: stopFailureReason)
+            stopFailureReason: stopFailureReason,
+            bleAckWallClockMs: bleAckWallClockMs,
+            stopWallClockMs: stopWallClockMs,
+            cameraDurationSec: cameraDurationSec,
+            cameraFileSize: cameraFileSize,
+            expectedSegments: expectedSegments)
     }
 
     // MARK: - Scan

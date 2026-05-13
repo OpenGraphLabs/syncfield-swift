@@ -182,7 +182,8 @@ public actor Insta360Collector {
                         remoteFileURI: item.sidecar.cameraFileURI,
                         destination: item.episodeDir.appendingPathComponent(
                             "\(item.sidecar.streamId).mp4"),
-                        bleAckMonotonicNs: item.sidecar.bleAckMonotonicNs)
+                        bleAckMonotonicNs: item.sidecar.bleAckMonotonicNs,
+                        sidecar: item.sidecar)
                 }
 
                 let downloader = Insta360WiFiDownloader()
@@ -214,7 +215,7 @@ public actor Insta360Collector {
                             episodeDir: owner.episodeDir,
                             streamId: owner.sidecar.streamId,
                             bleUuid: uuid,
-                            filePath: br.item.destination,
+                            filePath: br.filePaths.first ?? br.item.destination,
                             error: nil))
                     } else {
                         results.append(Result(

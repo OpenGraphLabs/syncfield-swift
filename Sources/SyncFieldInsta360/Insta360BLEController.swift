@@ -135,6 +135,9 @@ internal struct Insta360StopCaptureResult: Sendable {
     let confirmedStopped: Bool
     let attempts: Int
     let diagnostic: String?
+    let cameraDurationSec: UInt?
+    let cameraFileSize: UInt64?
+    let stopWallClockMs: UInt64?
 }
 
 #if canImport(INSCameraServiceSDK)
@@ -250,15 +253,86 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
 
     /// Returns true iff a scanned device should be paired with.
     ///
-    /// - Accepts if the advertised `name` contains "go" (case-insensitive) AND
+    /// - Accepts if the advertised `name` matches a Go-family BLE name AND
     ///   `uuid` is not in the caller's `excluding` set.
     /// - Pure function, no Core Bluetooth dependencies — exposed `internal` so
     ///   `OGSkillTests` can cover every branch.
     public static func shouldAcceptDevice(name: String?,
                                           uuid: String,
                                           excluding: Set<String>) -> Bool {
-        guard let name = name, name.lowercased().contains("go") else { return false }
+        guard isGoFamilyBLEName(name) else { return false }
         return !excluding.contains(uuid)
+    }
+
+    public static func isGoFamilyBLEName(_ name: String?) -> Bool {
+        guard let normalized = normalizedMetadata(name)?.lowercased() else {
+            return false
+        }
+        return normalized.hasPrefix("go ") || normalized.contains("insta360 go")
+    }
+
+    public static func isGo3SActionCamHost(
+        cameraType: String?,
+        go3Version: String?
+    ) -> Bool {
+        if normalizedMetadata(go3Version) != nil { return true }
+        return isGo3CameraType(cameraType)
+    }
+
+    internal static func isAcceptableGo3SRecordingEndpoint(
+        name: String?,
+        cameraType: String?,
+        go3Version: String?,
+        boxVersion: String?
+    ) -> Bool {
+        actionCamHostDecision(
+            name: name,
+            cameraType: cameraType,
+            go3Version: go3Version,
+            boxVersion: boxVersion
+        ).isAccepted
+    }
+
+    private enum ActionCamHostDecision: Equatable {
+        case verified
+        case provisionalMetadataUnavailable
+        case rejected
+
+        var isAccepted: Bool {
+            switch self {
+            case .verified, .provisionalMetadataUnavailable: return true
+            case .rejected: return false
+            }
+        }
+    }
+
+    private static func actionCamHostDecision(
+        name: String?,
+        cameraType: String?,
+        go3Version: String?,
+        boxVersion: String?
+    ) -> ActionCamHostDecision {
+        if normalizedMetadata(go3Version) != nil { return .verified }
+        if isGo3CameraType(cameraType) { return .verified }
+        if normalizedMetadata(cameraType) != nil { return .rejected }
+        if normalizedMetadata(boxVersion) != nil { return .rejected }
+        if isGoFamilyBLEName(name) { return .provisionalMetadataUnavailable }
+        return .rejected
+    }
+
+    private static func isGo3CameraType(_ cameraType: String?) -> Bool {
+        guard let cameraType = normalizedMetadata(cameraType)?.lowercased() else {
+            return false
+        }
+        let compact = cameraType.replacingOccurrences(of: " ", with: "")
+        return compact.contains("go3")
+    }
+
+    private static func normalizedMetadata(_ value: String?) -> String? {
+        guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty
+        else { return nil }
+        return trimmed
     }
 
     internal static func encodeWakeId(serialLast6: String) -> String {
@@ -439,7 +513,7 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
             throw Insta360Error.commandFailed("Bluetooth not ready")
         }
 
-        let excluding = excludingUUIDs.union(Self.currentlyPairedUUIDs())
+        let baseExcluding = excludingUUIDs.union(Self.currentlyPairedUUIDs())
         let preferredSerial = await preferredWakeSerial(excludingUUIDs: excludingUUIDs)
 
         // Scan while sending wake pulses. A Go 3S can advertise late when
@@ -466,50 +540,110 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
         }
         defer { wakeTask.cancel() }
 
-        try Task.checkCancellation()
-        let device = try await withTimeout(seconds: 15) {
-            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<INSBluetoothDevice, Error>) in
-                var found = false
-                self.bluetoothManager.scanCameras { [weak self] device, _, _ in
-                    guard let self = self, !found else { return }
-                    let uuid = device.identifierUUIDStringSafe
-                    guard Insta360BLEController.shouldAcceptDevice(
-                        name: device.name, uuid: uuid, excluding: excluding
-                    ) else { return }
-                    found = true
-                    self.bluetoothManager.stopScan()
-                    self.scannedDevices[uuid] = device
-                    cont.resume(returning: device)
+        var rejectedUUIDs = Set<String>()
+        var lastInvalidHostError: Error?
+        for attempt in 1...4 {
+            try Task.checkCancellation()
+            let excluding = baseExcluding.union(rejectedUUIDs)
+            let scanTimeout = rejectedUUIDs.isEmpty ? 15.0 : 6.0
+            let device: INSBluetoothDevice
+            do {
+                device = try await scanForPairCandidate(
+                    excluding: excluding,
+                    timeout: scanTimeout)
+            } catch {
+                if let lastInvalidHostError {
+                    throw lastInvalidHostError
                 }
+                throw error
             }
+
+            // BLE connect.
+            try Task.checkCancellation()
+            do {
+                try await connectScannedDevice(device)
+            } catch {
+                throw error
+            }
+
+            let readyNs = try await Self.waitForCommandManagerReady(
+                manager: bluetoothManager,
+                device: device)
+            NSLog("[Insta360BLE.timing] commandManager ready after pair elapsedMs=\(String(format: "%.0f", Double(readyNs) / 1_000_000.0))")
+
+            do {
+                try await Self.assertActionCamHost(
+                    device,
+                    context: "pair attempt \(attempt)",
+                    timeout: 1.0)
+            } catch {
+                lastInvalidHostError = error
+                rejectedUUIDs.insert(device.identifierUUIDStringSafe)
+                bluetoothManager.disconnectDevice(device)
+                connectedDevice = nil
+                NSLog("[Insta360BLE] rejected non-ActionCam candidate uuid=\(device.identifierUUIDStringSafe); retrying scan")
+                continue
+            }
+
+            connectedDevice = device
+            rememberIdentity(of: device)
+            await persistIdentity(of: device)
+            Self.registerPaired(device.identifierUUIDStringSafe)
+            startHeartbeat()
+            configureWakeOnBluetoothIfPossible(for: device)
+            NSLog("[Insta360BLE] Paired with \(Self.displayName(for: device))")
+            return
         }
 
-        // BLE connect.
-        try Task.checkCancellation()
-        try await withTimeout(seconds: 15) {
-            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-                self.bluetoothManager.connect(device) { error in
-                    if let error = error {
-                        cont.resume(throwing: Insta360Error.commandFailed(error.localizedDescription))
-                        return
+        throw lastInvalidHostError ?? Insta360Error.commandFailed(
+            "no recording ActionCam found after rejecting non-host BLE peripherals")
+    }
+
+    private func scanForPairCandidate(
+        excluding: Set<String>,
+        timeout: TimeInterval
+    ) async throws -> INSBluetoothDevice {
+        do {
+            return try await withTimeout(seconds: timeout) {
+                try await withCheckedThrowingContinuation { (cont: CheckedContinuation<INSBluetoothDevice, Error>) in
+                    var found = false
+                    self.bluetoothManager.scanCameras { [weak self] device, _, _ in
+                        guard let self = self, !found else { return }
+                        let uuid = device.identifierUUIDStringSafe
+                        guard Insta360BLEController.shouldAcceptDevice(
+                            name: device.name, uuid: uuid, excluding: excluding
+                        ) else { return }
+                        found = true
+                        self.bluetoothManager.stopScan()
+                        self.scannedDevices[uuid] = device
+                        cont.resume(returning: device)
                     }
-                    cont.resume()
                 }
             }
+        } catch {
+            bluetoothManager.stopScan()
+            throw error
         }
+    }
 
-        connectedDevice = device
-        rememberIdentity(of: device)
-        await persistIdentity(of: device)
-        Self.registerPaired(device.identifierUUIDStringSafe)
-        startHeartbeat()
-
-        let readyNs = try await Self.waitForCommandManagerReady(
-            manager: bluetoothManager,
-            device: device)
-        NSLog("[Insta360BLE.timing] commandManager ready after pair elapsedMs=\(String(format: "%.0f", Double(readyNs) / 1_000_000.0))")
-        configureWakeOnBluetoothIfPossible(for: device)
-        NSLog("[Insta360BLE] Paired with \(Self.displayName(for: device))")
+    public func syncCameraClock(dTimeMaxMs: UInt = 2_000) async {
+        guard let cmd = try? commandManager() else { return }
+        do {
+            try await withTimeout(seconds: 3) {
+                await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                    cmd.syncTimeMsToCamera(withTryCount: 3, dTimeMsMax: dTimeMaxMs) { drift, error in
+                        if let error {
+                            NSLog("[Insta360BLE] syncTimeMs failed: \(error.localizedDescription)")
+                        } else {
+                            NSLog("[Insta360BLE] syncTimeMs OK driftMs=\(drift)")
+                        }
+                        cont.resume()
+                    }
+                }
+            }
+        } catch {
+            NSLog("[Insta360BLE] syncTimeMs timed out/skipped: \(error.localizedDescription)")
+        }
     }
 
     /// Disconnect the active BLE session.
@@ -533,6 +667,59 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
         Task { await self.persistIdentity(of: device) }
         Self.registerPaired(device.identifierUUIDStringSafe)
         startHeartbeat()
+    }
+
+    public func adoptVerifiedActionCamDevice(_ device: INSBluetoothDevice) async throws {
+        try await Self.assertActionCamHost(
+            device,
+            context: "adoptConnectedDevice",
+            timeout: 1.0)
+        adoptConnectedDevice(device)
+    }
+
+    internal static func waitForActionCamHostMetadata(
+        device: INSBluetoothDevice,
+        timeout: TimeInterval = 1.0,
+        pollNs: UInt64 = 100_000_000
+    ) async throws {
+        let started = DispatchTime.now().uptimeNanoseconds
+        let timeoutNs = UInt64(max(0, timeout) * 1_000_000_000)
+        while DispatchTime.now().uptimeNanoseconds &- started < timeoutNs {
+            try Task.checkCancellation()
+            if normalizedMetadata(device.go3Version) != nil
+                || normalizedMetadata(device.cameraType) != nil
+                || normalizedMetadata(device.boxVersion) != nil {
+                return
+            }
+            try await Task.sleep(nanoseconds: pollNs)
+        }
+    }
+
+    internal static func assertActionCamHost(
+        _ device: INSBluetoothDevice,
+        context: String,
+        timeout: TimeInterval = 1.0
+    ) async throws {
+        try await waitForActionCamHostMetadata(device: device, timeout: timeout)
+        switch actionCamHostDecision(
+            name: device.name,
+            cameraType: device.cameraType,
+            go3Version: device.go3Version,
+            boxVersion: device.boxVersion) {
+        case .verified:
+            return
+        case .provisionalMetadataUnavailable:
+            NSLog("[Insta360BLE] \(context): GO-family endpoint metadata unavailable; accepting provisionally (\(actionCamHostDiagnostic(for: device)))")
+            return
+        case .rejected:
+            let detail = actionCamHostDiagnostic(for: device)
+            NSLog("[Insta360BLE] \(context): paired peripheral is NOT an ActionCam host (\(detail)); rejecting")
+            throw Insta360Error.notRecordingActionCam(detail)
+        }
+    }
+
+    private static func actionCamHostDiagnostic(for device: INSBluetoothDevice) -> String {
+        "name=\(displayName(for: device)) cameraType=\(normalizedMetadata(device.cameraType) ?? "nil") go3Version=\(normalizedMetadata(device.go3Version) ?? "nil") boxVersion=\(normalizedMetadata(device.boxVersion) ?? "nil") bluetoothType=\(device.bluetoothType.rawValue) isGo=\(device.isGOPeripheral()) powerOn=\(device.powerOn) powerOnForQC=\(device.powerOnForQC) lowBattery=\(device.powerForLowBatteryStatus)"
     }
 
     /// Cache the live device's identity so it survives a later disconnect.
@@ -713,44 +900,76 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
 
     private func stopRemoteRecordingLocked() async throws -> Insta360StopCaptureResult {
         var lastError: Error?
-        var sentStopCommand = false
 
         for attempt in 1...Insta360CaptureRetryPolicy.maxStopAttempts {
             try Task.checkCancellation()
+
             do {
                 try await ensureCommandReady(
                     reason: "stopRemoteRecording attempt \(attempt)",
-                    maxCachedAgeSeconds: 0)
+                    maxCachedAgeSeconds: attempt == 1 ? 8 : 0)
+            } catch {
+                lastError = error
+                if attempt < Insta360CaptureRetryPolicy.maxStopAttempts {
+                    try? await Task.sleep(
+                        nanoseconds: Insta360CaptureRetryPolicy.stopBackoffNs(afterAttempt: attempt))
+                    continue
+                }
+                break
+            }
+
+            let stopWallClockMs = UInt64(Date().timeIntervalSince1970 * 1000)
+            do {
                 let cmd = try commandManager()
-                sentStopCommand = true
-                let uri = try await performStopCapture(
+                let result = try await performStopCapture(
                     cmd: cmd,
                     timeoutSeconds: Insta360CaptureRetryPolicy.stopTimeoutSeconds(attempt: attempt),
                     attempt: attempt)
+                let uri = result.uri.trimmingCharacters(in: .whitespacesAndNewlines)
                 return Insta360StopCaptureResult(
-                    cameraFileURI: uri,
+                    cameraFileURI: uri.isEmpty ? nil : uri,
                     confirmedStopped: true,
                     attempts: attempt,
-                    diagnostic: nil)
+                    diagnostic: uri.isEmpty ? "stopCapture acked without uri" : nil,
+                    cameraDurationSec: result.totalTime > 0 ? UInt(result.totalTime) : nil,
+                    cameraFileSize: result.fileSize > 0 ? result.fileSize : nil,
+                    stopWallClockMs: stopWallClockMs)
             } catch {
                 lastError = error
-                if Insta360CaptureRetryPolicy.indicatesAlreadyStopped(error), sentStopCommand {
+                if Insta360CaptureRetryPolicy.indicatesAlreadyStopped(error) {
+                    let status = await waitForCameraToStopRecording(maxSeconds: 3)
                     NSLog("[Insta360BLE.timing] stopCapture already stopped after attempt=\(attempt): \(error.localizedDescription)")
                     return Insta360StopCaptureResult(
                         cameraFileURI: nil,
                         confirmedStopped: true,
                         attempts: attempt,
-                        diagnostic: error.localizedDescription)
+                        diagnostic: error.localizedDescription,
+                        cameraDurationSec: status.captureTime > 0 ? status.captureTime : nil,
+                        cameraFileSize: nil,
+                        stopWallClockMs: stopWallClockMs)
                 }
 
-                guard attempt < Insta360CaptureRetryPolicy.maxStopAttempts,
-                      Insta360CaptureRetryPolicy.isRecoverableCommandError(error) else {
+                let status = await waitForCameraToStopRecording(maxSeconds: 10)
+                if status.didStop {
+                    return Insta360StopCaptureResult(
+                        cameraFileURI: nil,
+                        confirmedStopped: true,
+                        attempts: attempt,
+                        diagnostic: "stopCapture callback failed but captureState reports stopped (\(error.localizedDescription))",
+                        cameraDurationSec: status.captureTime > 0 ? status.captureTime : nil,
+                        cameraFileSize: nil,
+                        stopWallClockMs: stopWallClockMs)
+                }
+
+                guard attempt < Insta360CaptureRetryPolicy.maxStopAttempts else {
                     break
                 }
 
-                NSLog("[Insta360BLE.timing] stopCapture recoverable failure attempt=\(attempt): \(error.localizedDescription); forcing wake/reconnect before retry")
+                NSLog("[Insta360BLE.timing] stop attempt=\(attempt) still recording per state probe; cycling BLE")
                 if let device = connectedDevice {
-                    markConnectedDeviceStale(device, reason: "stopCapture attempt \(attempt) failed")
+                    markConnectedDeviceStale(
+                        device,
+                        reason: "stopCapture attempt \(attempt) failed AND state still recording")
                 }
                 await wakeKnownCamera(window: attempt == 1 ? 0.8 : 1.2)
                 try? await Task.sleep(
@@ -759,24 +978,21 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
         }
 
         let diagnostic = lastError?.localizedDescription ?? "stopCapture failed without an SDK error"
-        if sentStopCommand {
-            throw Insta360Error.commandFailed(
-                "stopCapture could not confirm camera stop after \(Insta360CaptureRetryPolicy.maxStopAttempts) attempts; last error: \(diagnostic)")
-        }
-        throw lastError ?? Insta360Error.commandFailed("stopCapture failed before command send")
+        throw Insta360Error.commandFailed(
+            "stopCapture could not confirm camera stop after \(Insta360CaptureRetryPolicy.maxStopAttempts) attempts; last error: \(diagnostic)")
     }
 
     private func performStopCapture(
         cmd: INSCameraBasicCommands,
         timeoutSeconds: TimeInterval,
         attempt: Int
-    ) async throws -> String {
+    ) async throws -> (uri: String, totalTime: UInt32, fileSize: UInt64) {
         let deviceTag = connectedDevice?.name ?? "(unknown)"
         let sendUptimeNs = DispatchTime.now().uptimeNanoseconds
         NSLog("[Insta360BLE.timing] stopCapture SEND device=\(deviceTag) attempt=\(attempt)")
 
         return try await withTimeout(seconds: timeoutSeconds) {
-            try await withUnsafeThrowingContinuation { (cont: UnsafeContinuation<String, Error>) in
+            try await withUnsafeThrowingContinuation { (cont: UnsafeContinuation<(String, UInt32, UInt64), Error>) in
                 cmd.stopCapture(with: nil) { error, videoInfo in
                     let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds - sendUptimeNs) / 1_000_000.0
                     if let error = error {
@@ -784,12 +1000,11 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
                         cont.resume(throwing: Insta360Error.commandFailed(error.localizedDescription))
                         return
                     }
-                    guard let uri = videoInfo?.uri, !uri.isEmpty else {
-                        cont.resume(throwing: Insta360Error.commandFailed("stopCapture returned nil videoInfo.uri"))
-                        return
-                    }
-                    NSLog("[Insta360BLE.timing] stopCapture ACK device=\(deviceTag) elapsedMs=\(String(format: "%.0f", elapsedMs)) uri=\(uri)")
-                    cont.resume(returning: uri)
+                    let uri = videoInfo?.uri ?? ""
+                    let totalTime = videoInfo?.totalTime ?? 0
+                    let fileSize = videoInfo?.fileSize ?? 0
+                    NSLog("[Insta360BLE.timing] stopCapture ACK device=\(deviceTag) elapsedMs=\(String(format: "%.0f", elapsedMs)) uri=\(uri.isEmpty ? "<empty>" : uri) totalTime=\(totalTime) fileSize=\(fileSize)")
+                    cont.resume(returning: (uri, totalTime, fileSize))
                 }
             }
         }
@@ -1121,6 +1336,49 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
         }
     }
 
+    private func currentCaptureState(
+        timeout: TimeInterval = 3
+    ) async throws -> (stateRaw: UInt, captureTime: UInt) {
+        let cmd = try commandManager()
+        return try await withTimeout(seconds: timeout) {
+            try await withUnsafeThrowingContinuation { (cont: UnsafeContinuation<(UInt, UInt), Error>) in
+                cmd.getCurrentCaptureStatus { error, status in
+                    if let error {
+                        cont.resume(throwing: Insta360Error.commandFailed(error.localizedDescription))
+                        return
+                    }
+                    guard let status else {
+                        cont.resume(throwing: Insta360Error.commandFailed(
+                            "getCurrentCaptureStatus returned nil"))
+                        return
+                    }
+                    cont.resume(returning: (
+                        UInt(status.state.rawValue),
+                        UInt(status.captureTime)))
+                }
+            }
+        }
+    }
+
+    private func waitForCameraToStopRecording(
+        maxSeconds: TimeInterval = 10
+    ) async -> (didStop: Bool, captureTime: UInt) {
+        let deadline = DispatchTime.now().uptimeNanoseconds
+            + UInt64(maxSeconds * 1_000_000_000)
+        var lastCaptureTime: UInt = 0
+        while DispatchTime.now().uptimeNanoseconds < deadline {
+            if let result = try? await currentCaptureState(timeout: 2) {
+                lastCaptureTime = result.captureTime
+                if result.stateRaw == 0 {
+                    NSLog("[Insta360BLE.timing] captureState confirmed stop captureTime=\(result.captureTime)")
+                    return (true, result.captureTime)
+                }
+            }
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+        }
+        return (false, lastCaptureTime)
+    }
+
     private func cleanupAmbiguousStartFailure(reason: String) async {
         if let device = connectedDevice {
             markConnectedDeviceStale(device, reason: reason)
@@ -1310,14 +1568,25 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
     private func finishReconnect(with device: INSBluetoothDevice) async throws {
         try Task.checkCancellation()
         connectedDevice = device
-        rememberIdentity(of: device)
-        await persistIdentity(of: device)
-        Self.registerPaired(device.identifierUUIDStringSafe)
-        startHeartbeat()
         let readyNs = try await Self.waitForCommandManagerReady(
             manager: bluetoothManager,
             device: device)
         NSLog("[Insta360BLE.timing] commandManager ready after reconnect elapsedMs=\(String(format: "%.0f", Double(readyNs) / 1_000_000.0))")
+        do {
+            try await Self.assertActionCamHost(
+                device,
+                context: "reconnect",
+                timeout: 1.0)
+        } catch {
+            bluetoothManager.disconnectDevice(device)
+            connectedDevice = nil
+            Self.unregisterPaired(device.identifierUUIDStringSafe)
+            throw error
+        }
+        rememberIdentity(of: device)
+        await persistIdentity(of: device)
+        Self.registerPaired(device.identifierUUIDStringSafe)
+        startHeartbeat()
         configureWakeOnBluetoothIfPossible(for: device)
         NSLog("[Insta360BLE] reconnectIfNeeded — re-paired \(Self.displayName(for: device))")
     }
@@ -1481,8 +1750,79 @@ public final class Insta360BLEController: @unchecked Sendable {
     public static func shouldAcceptDevice(name: String?,
                                           uuid: String,
                                           excluding: Set<String>) -> Bool {
-        guard let name = name, name.lowercased().contains("go") else { return false }
+        guard isGoFamilyBLEName(name) else { return false }
         return !excluding.contains(uuid)
+    }
+
+    public static func isGoFamilyBLEName(_ name: String?) -> Bool {
+        guard let normalized = normalizedMetadata(name)?.lowercased() else {
+            return false
+        }
+        return normalized.hasPrefix("go ") || normalized.contains("insta360 go")
+    }
+
+    public static func isGo3SActionCamHost(
+        cameraType: String?,
+        go3Version: String?
+    ) -> Bool {
+        if normalizedMetadata(go3Version) != nil { return true }
+        return isGo3CameraType(cameraType)
+    }
+
+    internal static func isAcceptableGo3SRecordingEndpoint(
+        name: String?,
+        cameraType: String?,
+        go3Version: String?,
+        boxVersion: String?
+    ) -> Bool {
+        actionCamHostDecision(
+            name: name,
+            cameraType: cameraType,
+            go3Version: go3Version,
+            boxVersion: boxVersion
+        ).isAccepted
+    }
+
+    private enum ActionCamHostDecision: Equatable {
+        case verified
+        case provisionalMetadataUnavailable
+        case rejected
+
+        var isAccepted: Bool {
+            switch self {
+            case .verified, .provisionalMetadataUnavailable: return true
+            case .rejected: return false
+            }
+        }
+    }
+
+    private static func actionCamHostDecision(
+        name: String?,
+        cameraType: String?,
+        go3Version: String?,
+        boxVersion: String?
+    ) -> ActionCamHostDecision {
+        if normalizedMetadata(go3Version) != nil { return .verified }
+        if isGo3CameraType(cameraType) { return .verified }
+        if normalizedMetadata(cameraType) != nil { return .rejected }
+        if normalizedMetadata(boxVersion) != nil { return .rejected }
+        if isGoFamilyBLEName(name) { return .provisionalMetadataUnavailable }
+        return .rejected
+    }
+
+    private static func isGo3CameraType(_ cameraType: String?) -> Bool {
+        guard let cameraType = normalizedMetadata(cameraType)?.lowercased() else {
+            return false
+        }
+        let compact = cameraType.replacingOccurrences(of: " ", with: "")
+        return compact.contains("go3")
+    }
+
+    private static func normalizedMetadata(_ value: String?) -> String? {
+        guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty
+        else { return nil }
+        return trimmed
     }
 
     internal static func encodeWakeId(serialLast6: String) -> String {
@@ -1514,6 +1854,8 @@ public final class Insta360BLEController: @unchecked Sendable {
     }
 
     public func unpair() async throws {}
+
+    public func syncCameraClock(dTimeMaxMs _: UInt = 2_000) async {}
 
     public func startRemoteRecording(clock _: SessionClock) async throws -> UInt64 {
         throw Insta360Error.frameworkNotLinked

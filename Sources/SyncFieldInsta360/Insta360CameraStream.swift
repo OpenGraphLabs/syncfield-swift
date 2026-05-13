@@ -131,6 +131,7 @@ public final class Insta360CameraStream: SyncFieldStream, SyncFieldRecordingPref
                     bleName: preferredBLEName))
             wireWarningChannel()
             do {
+                await ble.syncCameraClock()
                 self.cachedCreds = try await ble.wifiCredentials()
                 await healthBus?.publish(.streamConnected(streamId: streamId))
             } catch {
@@ -144,6 +145,7 @@ public final class Insta360CameraStream: SyncFieldStream, SyncFieldRecordingPref
         }
         wireWarningChannel()
         try await ble.pair(excludingUUIDs: [])
+        await ble.syncCameraClock()
         self.cachedCreds = try await ble.wifiCredentials()
         await healthBus?.publish(.streamConnected(streamId: streamId))
         #else
@@ -184,6 +186,7 @@ public final class Insta360CameraStream: SyncFieldStream, SyncFieldRecordingPref
                     uuid: boundUUID,
                     bleName: preferredBLEName))
             do {
+                await ble.syncCameraClock()
                 self.cachedCreds = try await ble.wifiCredentials()
             } catch {
                 if let bindingKey {
@@ -194,6 +197,7 @@ public final class Insta360CameraStream: SyncFieldStream, SyncFieldRecordingPref
             }
         } else {
             try await ble.pair(excludingUUIDs: excludingUUIDs)
+            await ble.syncCameraClock()
             self.cachedCreds = try await ble.wifiCredentials()
         }
         // Snapshot WiFi creds while BLE is freshly connected so `ingest` can
@@ -231,7 +235,8 @@ public final class Insta360CameraStream: SyncFieldStream, SyncFieldRecordingPref
         self.onHealthEvent = onHealthEvent
         self.onCameraWarning = onCameraWarning
         wireWarningChannel()
-        ble.adoptConnectedDevice(bt)
+        try await ble.adoptVerifiedActionCamDevice(bt)
+        await ble.syncCameraClock()
         self.cachedCreds = try await ble.wifiCredentials()
         onHealthEvent(.streamConnected(streamId: streamId))
         #else
@@ -318,25 +323,34 @@ public final class Insta360CameraStream: SyncFieldStream, SyncFieldRecordingPref
                 NSLog("[Insta360CameraStream] WARNING pending sidecar for \(streamId) has weak identity: uuid='\(resolvedUUID)' name='\(resolvedName)' (live uuid=\(liveUUID ?? "nil") lastKnown uuid=\(ble.lastKnownDeviceUUID ?? "nil") boundUUID=\(boundUUID ?? "nil"))")
             }
             do {
-                if Insta360PendingSidecar.needsCameraFileURIResolution(uri) {
-                    try Insta360PendingSidecar.writeUnresolved(
-                        to: epDir,
-                        streamId: streamId,
-                        bleUuid: resolvedUUID,
-                        bleName: resolvedName,
-                        role: role,
-                        bleAckNs: bleAckMonotonicNs,
-                        stopFailureReason: stopResult.diagnostic ?? "stopCapture returned no video URI after \(stopResult.attempts) attempt(s)")
-                } else {
-                    try Insta360PendingSidecar.write(
-                        to: epDir,
-                        streamId: streamId,
-                        cameraFileURI: uri,
-                        bleUuid: resolvedUUID,
-                        bleName: resolvedName,
-                        role: role,
-                        bleAckNs: bleAckMonotonicNs)
+                let nowMonotonic = DispatchTime.now().uptimeNanoseconds
+                let nowWallMs = UInt64(Date().timeIntervalSince1970 * 1000)
+                let elapsedMs = nowMonotonic >= bleAckMonotonicNs
+                    ? (nowMonotonic - bleAckMonotonicNs) / 1_000_000
+                    : 0
+                let startWallMs = nowWallMs > elapsedMs ? nowWallMs - elapsedMs : nowWallMs
+                let segmentLimitSec: UInt = 18 * 60
+                let expectedSegments = stopResult.cameraDurationSec.map {
+                    max(1, Int(($0 + segmentLimitSec - 1) / segmentLimitSec))
                 }
+                let diagnostic = Insta360PendingSidecar.needsCameraFileURIResolution(uri)
+                    ? (stopResult.diagnostic ?? "stopCapture returned no video URI after \(stopResult.attempts) attempt(s)")
+                    : stopResult.diagnostic
+
+                try Insta360PendingSidecar.write(
+                    to: epDir,
+                    streamId: streamId,
+                    cameraFileURI: uri,
+                    bleUuid: resolvedUUID,
+                    bleName: resolvedName,
+                    role: role,
+                    bleAckNs: bleAckMonotonicNs,
+                    stopFailureReason: diagnostic,
+                    bleAckWallClockMs: startWallMs,
+                    stopWallClockMs: stopResult.stopWallClockMs,
+                    cameraDurationSec: stopResult.cameraDurationSec,
+                    cameraFileSize: stopResult.cameraFileSize,
+                    expectedSegments: expectedSegments)
             } catch {
                 NSLog("[Insta360CameraStream] WARNING pending sidecar write failed for \(streamId): \(error.localizedDescription)")
             }
@@ -368,12 +382,15 @@ public final class Insta360CameraStream: SyncFieldStream, SyncFieldRecordingPref
 
         // 2. Switch iPhone onto the camera's AP, download the clip, restore previous WiFi.
         let destination = episodeDirectory.appendingPathComponent("\(streamId).mp4")
+        let sidecar = (try? Insta360PendingSidecar.scan(episodeDirectory))
+            .flatMap { sidecars in sidecars.first { $0.streamId == streamId } }
         try await withoutActuallyEscaping(progress) { escaping in
             _ = try await wifi.download(
                 remoteFileURI: uri,
                 to: destination,
                 ssid: creds.ssid,
                 passphrase: creds.passphrase,
+                sidecar: sidecar,
                 progress: escaping)
         }
 

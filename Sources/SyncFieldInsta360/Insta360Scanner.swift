@@ -48,12 +48,11 @@ public actor Insta360Scanner {
 
     // MARK: - Pure helpers (unit-tested)
 
-    /// Accept predicate for scan callbacks. Accepts iff name contains
-    /// "go" case-insensitively. UUID exclusion is handled at a higher layer
+    /// Accept predicate for scan callbacks. Accepts iff the advertised name
+    /// matches the Go-family BLE pattern. UUID exclusion is handled at a higher layer
     /// (the UI passes already-paired UUIDs to filter out).
     public static func shouldEmitDevice(name: String?) -> Bool {
-        guard let name = name else { return false }
-        return name.lowercased().contains("go")
+        Insta360BLEController.isGoFamilyBLEName(name)
     }
 
     // MARK: - Scanning
@@ -195,6 +194,10 @@ public actor Insta360Scanner {
                     manager: bluetoothManager,
                     device: device)
                 NSLog("[Insta360Scanner.timing] commandManager ready binding=\(bindingKey) elapsedMs=\(String(format: "%.0f", Double(readyNs) / 1_000_000.0))")
+                try await Insta360BLEController.assertActionCamHost(
+                    device,
+                    context: "scanner pair \(bindingKey)",
+                    timeout: 1.0)
                 pairedDevices[bindingKey] = device
                 let controller = Insta360BLEController()
                 controller.adoptConnectedDevice(device)
@@ -217,6 +220,9 @@ public actor Insta360Scanner {
                 // keeps the retry from succeeding.
                 if let connectedDeviceForCleanup {
                     bluetoothManager.disconnectDevice(connectedDeviceForCleanup)
+                }
+                if case Insta360Error.notRecordingActionCam = error {
+                    throw error
                 }
                 if attempt < 3 {
                     let backoffNs = UInt64(attempt) * 1_000_000_000
@@ -527,8 +533,7 @@ public actor Insta360Scanner {
     private init() {}
 
     public static func shouldEmitDevice(name: String?) -> Bool {
-        guard let name = name else { return false }
-        return name.lowercased().contains("go")
+        Insta360BLEController.isGoFamilyBLEName(name)
     }
 
     public func scan() async throws -> AsyncStream<DiscoveredInsta360> {

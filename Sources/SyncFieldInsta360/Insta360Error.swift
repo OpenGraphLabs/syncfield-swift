@@ -41,6 +41,7 @@ public enum Insta360Error: Error, CustomStringConvertible, LocalizedError {
     case hotspotApplyFailedWithKind(kind: UploadWiFiApplyFailureKind, detail: String)
     case downloadFailed(String)
     case commandFailed(String)
+    case notRecordingActionCam(String)
     case cameraNotReachable
 
     // Bridge-level wrist-pairing errors
@@ -81,6 +82,8 @@ public enum Insta360Error: Error, CustomStringConvertible, LocalizedError {
             return "Insta360Error: \(detail)"
         case .commandFailed(let detail):
             return "Insta360Error: BLE command failed (\(detail))"
+        case .notRecordingActionCam(let detail):
+            return "Insta360Error: paired BLE peripheral is not a recording ActionCam (\(detail))"
         case .cameraNotReachable:
             return "Insta360Error: camera AP reachable timeout at 192.168.42.1"
         case .invalidWristRole(let raw):

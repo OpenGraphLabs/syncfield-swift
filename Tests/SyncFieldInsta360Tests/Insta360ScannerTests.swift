@@ -10,6 +10,11 @@ final class Insta360ScannerTests: XCTestCase {
         XCTAssertFalse(Insta360Scanner.shouldEmitDevice(name: "OGLO 100"))
     }
 
+    func test_shouldEmitDevice_rejectsGoAsSubstring() {
+        XCTAssertFalse(Insta360Scanner.shouldEmitDevice(name: "Govee Sensor"))
+        XCTAssertFalse(Insta360Scanner.shouldEmitDevice(name: "GoPro 12"))
+    }
+
     func test_shouldEmitDevice_rejectsNil() {
         XCTAssertFalse(Insta360Scanner.shouldEmitDevice(name: nil))
     }
@@ -23,6 +28,46 @@ final class Insta360ScannerTests: XCTestCase {
             name: "GO 3S A",
             uuid: "AAAA-0005",
             excluding: ["AAAA-0005"]))
+    }
+
+    func test_actionCamHost_acceptsGo3Version() {
+        XCTAssertTrue(Insta360BLEController.isGo3SActionCamHost(
+            cameraType: nil,
+            go3Version: "v1.0.63"))
+    }
+
+    func test_actionCamHost_acceptsGo3CameraTypeFallback() {
+        XCTAssertTrue(Insta360BLEController.isGo3SActionCamHost(
+            cameraType: "Insta360 GO 3S",
+            go3Version: nil))
+    }
+
+    func test_actionCamHost_rejectsPodOnlyMetadata() {
+        XCTAssertFalse(Insta360BLEController.isGo3SActionCamHost(
+            cameraType: nil,
+            go3Version: nil))
+    }
+
+    func test_recordingEndpoint_acceptsGoNameWhenMetadataUnavailable() {
+        XCTAssertTrue(Insta360BLEController.isAcceptableGo3SRecordingEndpoint(
+            name: "GO 3S 2BNMWH",
+            cameraType: nil,
+            go3Version: nil,
+            boxVersion: nil))
+    }
+
+    func test_recordingEndpoint_rejectsBoxOnlyMetadata() {
+        XCTAssertFalse(Insta360BLEController.isAcceptableGo3SRecordingEndpoint(
+            name: "GO 3S 2BNMWH",
+            cameraType: nil,
+            go3Version: nil,
+            boxVersion: "v1.0.1"))
+    }
+
+    func test_actionCamHost_rejectsOtherInsta360Models() {
+        XCTAssertFalse(Insta360BLEController.isGo3SActionCamHost(
+            cameraType: "Insta360 X4",
+            go3Version: nil))
     }
 
     func test_withTimeout_successReturnsValueBeforeDeadline() async throws {

@@ -2,6 +2,22 @@
 
 All notable changes to **syncfield-swift** are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.2] — 2026-05-13
+
+Patch release that hardens `SyncFieldInsta360` for long Go 3S recordings. Public stream APIs remain source-compatible with 0.9.x.
+
+### Changed
+- **Insta360 stop now treats camera state as authoritative.** `stopCapture` callbacks may arrive without `videoInfo.uri` or time out while the camera has already stopped. The controller now accepts empty-URI ACKs, records an unresolved sidecar, and uses `getCurrentCaptureStatus` polling before cycling BLE.
+- **Go 3S pairing now verifies the connected peripheral without rejecting docked cameras whose SDK metadata is delayed.** After BLE command readiness, the controller accepts definite ActionCam metadata (`go3Version` or Go 3 camera type), rejects definite box-only/other-model metadata, and provisionally accepts GO-family endpoints when all SDK host metadata is still nil so docked first-pair flows do not fail before a real command can run.
+- **Pending sidecars now persist long-recording match metadata.** New optional fields capture start/stop wall-clock windows, camera duration, file size, and expected segment count while preserving decode compatibility with 0.9.1 sidecars.
+- **Unresolved collect now prefers time-window matching.** New sidecars resolve camera media by filename timestamp inside the recorded wall-clock window, including multi-segment recordings. Legacy sidecars without the new fields keep the previous latest-video fallback.
+- `SyncFieldVersion.current` bumped to `0.9.2`.
+
+### Fixed
+- Long recordings no longer fail user-visible stop solely because `stopCapture` omitted `videoInfo.uri`.
+- Multiple unresolved sidecars on the same camera no longer silently resolve to the same newest mp4 when the new sidecar metadata is present.
+- 18+ minute split recordings can download every matched segment as `<streamId>_segNN.mp4` before the pending sidecar is deleted.
+
 ## [0.9.1] — 2026-05-13
 
 Patch release that hardens cross-host audio sync for ego + Insta360 wrist setups by guaranteeing the stop chirp is captured with usable post-chirp silence on every host. Source-compatible with 0.9.0; recompile and ship.

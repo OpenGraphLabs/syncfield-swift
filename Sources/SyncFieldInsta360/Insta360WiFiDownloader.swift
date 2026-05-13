@@ -47,6 +47,7 @@ public final class Insta360WiFiDownloader: @unchecked Sendable {
                          to destination: URL,
                          ssid: String,
                          passphrase: String,
+                         sidecar: Insta360PendingSidecar? = nil,
                          progress: @escaping @Sendable (Double) -> Void) async throws -> Int64 {
         try await applyHotspot(ssid: ssid, passphrase: passphrase)
 
@@ -65,10 +66,14 @@ public final class Insta360WiFiDownloader: @unchecked Sendable {
             try await Task.sleep(nanoseconds: 500_000_000) // 0.5 s for socket init
             INSCameraManager.socket().commandsImpl.sendHeartbeats(with: nil)
 
-            let resolvedURI = try await resolveRemoteFileURIIfNeeded(remoteFileURI)
-            bytes = try await fetchResource(remoteFileURI: resolvedURI,
-                                             destination: destination,
-                                             progress: progress)
+            let resolvedURIs = try await resolveRemoteFileURIIfNeeded(
+                remoteFileURI,
+                sidecar: sidecar)
+            bytes = try await fetchResolvedURIs(
+                resolvedURIs,
+                originalDestination: destination,
+                timeoutSeconds: 600,
+                progress: progress)
         } catch {
             downloadError = error
         }
@@ -98,15 +103,18 @@ public final class Insta360WiFiDownloader: @unchecked Sendable {
         public let remoteFileURI: String
         public let destination: URL
         public let bleAckMonotonicNs: UInt64
+        public let sidecar: Insta360PendingSidecar?
 
         public init(episodeDir: URL, streamId: String,
                     remoteFileURI: String, destination: URL,
-                    bleAckMonotonicNs: UInt64) {
+                    bleAckMonotonicNs: UInt64,
+                    sidecar: Insta360PendingSidecar? = nil) {
             self.episodeDir = episodeDir
             self.streamId = streamId
             self.remoteFileURI = remoteFileURI
             self.destination = destination
             self.bleAckMonotonicNs = bleAckMonotonicNs
+            self.sidecar = sidecar
         }
     }
 
@@ -114,6 +122,19 @@ public final class Insta360WiFiDownloader: @unchecked Sendable {
         public let item: BatchItem
         public let success: Bool
         public let error: String?
+        public let filePaths: [URL]
+
+        public init(
+            item: BatchItem,
+            success: Bool,
+            error: String?,
+            filePaths: [URL] = []
+        ) {
+            self.item = item
+            self.success = success
+            self.error = error
+            self.filePaths = filePaths
+        }
     }
 
     /// Download a batch of files from a single camera AP. Applies the
@@ -183,14 +204,18 @@ public final class Insta360WiFiDownloader: @unchecked Sendable {
             INSCameraManager.socket().commandsImpl.sendHeartbeats(with: nil)
 
             let item: BatchItem
+            let resolvedURIs: [String]
             do {
-                let resolvedURI = try await resolveRemoteFileURIIfNeeded(originalItem.remoteFileURI)
+                resolvedURIs = try await resolveRemoteFileURIIfNeeded(
+                    originalItem.remoteFileURI,
+                    sidecar: originalItem.sidecar)
                 item = BatchItem(
                     episodeDir: originalItem.episodeDir,
                     streamId: originalItem.streamId,
-                    remoteFileURI: resolvedURI,
+                    remoteFileURI: resolvedURIs[0],
                     destination: originalItem.destination,
-                    bleAckMonotonicNs: originalItem.bleAckMonotonicNs)
+                    bleAckMonotonicNs: originalItem.bleAckMonotonicNs,
+                    sidecar: originalItem.sidecar)
             } catch {
                 NSLog("[WiFiDownloader] downloadBatch item \(originalItem.streamId) URI resolution failed: \(error.localizedDescription)")
                 results.append(BatchResult(
@@ -223,9 +248,12 @@ public final class Insta360WiFiDownloader: @unchecked Sendable {
                 // when (a) the SDK exposes a working serialization API, or
                 // (b) we move to high-bitrate 5K360 recording where raw
                 // .insv files are 5–10× larger.
-                _ = try await fetchResourceWithTimeout(
-                    remoteFileURI: item.remoteFileURI,
-                    destination: item.destination,
+                let filePaths = destinations(
+                    for: resolvedURIs,
+                    originalDestination: item.destination)
+                _ = try await fetchResolvedURIs(
+                    resolvedURIs,
+                    originalDestination: item.destination,
                     timeoutSeconds: 600,
                     progress: { f in
                         if throttle.shouldEmit() {
@@ -236,7 +264,11 @@ public final class Insta360WiFiDownloader: @unchecked Sendable {
                 // UI hits a clean "done" state even if the throttle dropped
                 // the final fractional update.
                 progress(item, 1.0)
-                results.append(BatchResult(item: item, success: true, error: nil))
+                results.append(BatchResult(
+                    item: item,
+                    success: true,
+                    error: nil,
+                    filePaths: filePaths))
             } catch {
                 NSLog("[WiFiDownloader] downloadBatch item \(item.streamId) failed: \(error.localizedDescription)")
                 results.append(BatchResult(
@@ -626,18 +658,83 @@ public final class Insta360WiFiDownloader: @unchecked Sendable {
         Set(try await fetchVideoURIList())
     }
 
-    private func resolveRemoteFileURIIfNeeded(_ remoteFileURI: String) async throws -> String {
+    private func resolveRemoteFileURIIfNeeded(
+        _ remoteFileURI: String,
+        sidecar: Insta360PendingSidecar? = nil
+    ) async throws -> [String] {
         guard Insta360PendingSidecar.needsCameraFileURIResolution(remoteFileURI) else {
-            return remoteFileURI
+            return [remoteFileURI]
         }
 
         let uris = try await fetchVideoURIList()
+
+        if let sidecar,
+           let start = sidecar.bleAckWallClockMs,
+           let stop = sidecar.stopWallClockMs {
+            let window = Insta360PendingResolver.Window(
+                startWallMs: start,
+                endWallMs: stop,
+                expectedDurationSec: sidecar.cameraDurationSec,
+                expectedSegments: sidecar.expectedSegments)
+            let matched = Insta360PendingResolver.matchSegments(
+                uris: uris,
+                window: window)
+            if !matched.isEmpty {
+                NSLog("[WiFiDownloader] resolved \(matched.count) URI(s) by time-window match for \(sidecar.streamId)")
+                return matched
+            }
+            throw Insta360Error.downloadFailed(
+                "no camera mp4 in expected window [\(start)..\(stop)] for \(sidecar.streamId); camera has \(uris.count) files")
+        }
+
         guard let resolved = Insta360VideoURIFallback.bestCandidate(from: uris) else {
             throw Insta360Error.downloadFailed(
                 "could not resolve camera video URI after stopCapture returned no URI")
         }
-        NSLog("[WiFiDownloader] resolved missing camera URI to \(resolved)")
-        return resolved
+        NSLog("[WiFiDownloader] resolved missing camera URI to \(resolved) via legacy bestCandidate")
+        return [resolved]
+    }
+
+    private func destinations(
+        for uris: [String],
+        originalDestination: URL
+    ) -> [URL] {
+        guard uris.count > 1 else { return [originalDestination] }
+        let parent = originalDestination.deletingLastPathComponent()
+        let stem = originalDestination.deletingPathExtension().lastPathComponent
+        return uris.indices.map { idx in
+            parent.appendingPathComponent(
+                "\(stem)_seg\(String(format: "%02d", idx + 1)).mp4")
+        }
+    }
+
+    private func fetchResolvedURIs(
+        _ uris: [String],
+        originalDestination: URL,
+        timeoutSeconds: TimeInterval,
+        progress: @escaping @Sendable (Double) -> Void
+    ) async throws -> Int64 {
+        let destinations = destinations(for: uris, originalDestination: originalDestination)
+        var totalBytes: Int64 = 0
+        for (idx, uri) in uris.enumerated() {
+            let destination = destinations[idx]
+            let segmentBase = Double(idx) / Double(uris.count)
+            let segmentScale = 1.0 / Double(uris.count)
+            totalBytes += try await fetchResourceWithTimeout(
+                remoteFileURI: uri,
+                destination: destination,
+                timeoutSeconds: timeoutSeconds,
+                progress: { fraction in
+                    progress(segmentBase + (fraction * segmentScale))
+                })
+            if idx < uris.count - 1 {
+                INSCameraManager.socket().shutdown()
+                INSCameraManager.socket().setup()
+                try? await Task.sleep(nanoseconds: 150_000_000)
+                INSCameraManager.socket().commandsImpl.sendHeartbeats(with: nil)
+            }
+        }
+        return totalBytes
     }
 
     /// `ProgressThrottle` equivalent local to this file. Nested type so the

@@ -3,7 +3,7 @@ import Foundation
 internal enum Insta360CaptureRetryPolicy {
     static let maxStartAttempts = 3
     static let maxStopAttempts = 4
-    static let recordingSafetyLimitSeconds: UInt32 = 3_600
+    static let recordingSafetyLimitSeconds: UInt32 = 1_800
 
     static func startTimeoutSeconds(attempt: Int) -> TimeInterval {
         switch attempt {
@@ -15,10 +15,10 @@ internal enum Insta360CaptureRetryPolicy {
 
     static func stopTimeoutSeconds(attempt: Int) -> TimeInterval {
         switch attempt {
-        case 1: return 15
-        case 2: return 20
-        case 3: return 25
-        default: return 30
+        case 1: return 6
+        case 2: return 10
+        case 3: return 14
+        default: return 18
         }
     }
 
@@ -46,8 +46,6 @@ internal enum Insta360CaptureRetryPolicy {
             || normalized.contains("execute err")
             || normalized.contains("busy")
             || normalized.contains("444")
-            || normalized.contains("nil videoinfo")
-            || normalized.contains("nil video info")
     }
 
     static func indicatesAlreadyStopped(_ error: Error) -> Bool {
