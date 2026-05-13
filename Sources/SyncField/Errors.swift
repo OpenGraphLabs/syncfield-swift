@@ -6,6 +6,7 @@ public enum SessionError: Error, CustomStringConvertible, LocalizedError {
     case duplicateStreamId(String)
     case noStreamsRegistered
     case startFailed(cause: Error, rolledBack: [String])
+    case manualStopRecoveryUnsupported(streamId: String)
     case notRunning
 
     public var description: String {
@@ -18,6 +19,8 @@ public enum SessionError: Error, CustomStringConvertible, LocalizedError {
             return "SessionError: no streams registered"
         case .startFailed(let cause, let rolledBack):
             return "SessionError: startRecording failed (\(cause)); rolled back \(rolledBack)"
+        case .manualStopRecoveryUnsupported(let streamId):
+            return "SessionError: stream '\(streamId)' does not support manual stop recovery"
         case .notRunning:
             return "SessionError: operation requires the session to be running"
         }

@@ -18,7 +18,7 @@ import INSCameraServiceSDK
 ///
 /// When `INSCameraServiceSDK.xcframework` is not linked, every method throws
 /// `Insta360Error.frameworkNotLinked` — the rest of SyncField is unaffected.
-public final class Insta360CameraStream: SyncFieldStream, SyncFieldRecordingPreflightStream, @unchecked Sendable {
+public final class Insta360CameraStream: SyncFieldStream, SyncFieldRecordingPreflightStream, SyncFieldRecordingStopPreparationStream, SyncFieldManualStopRecoveryStream, @unchecked Sendable {
     public nonisolated let streamId: String
     public nonisolated let capabilities = StreamCapabilities(
         requiresIngest: true, producesFile: true,
@@ -111,6 +111,12 @@ public final class Insta360CameraStream: SyncFieldStream, SyncFieldRecordingPref
         try await ble.refreshConnection()
         #else
         throw Insta360Error.frameworkNotLinked
+        #endif
+    }
+
+    public func prepareToStopRecording() async {
+        #if canImport(INSCameraServiceSDK)
+        await ble.prepareForStopRecording()
         #endif
     }
 
@@ -296,61 +302,17 @@ public final class Insta360CameraStream: SyncFieldStream, SyncFieldRecordingPref
             ?? Insta360PendingSidecar.unresolvedCameraFileURI
         if let epDir = currentEpisodeDirectory,
            let uri = cameraFileURI {
-            let role = streamId.hasSuffix("_ego")   ? "ego"
-                       : streamId.hasSuffix("_left")  ? "left"
-                       : streamId.hasSuffix("_right") ? "right"
-                       : ""
-            // BLE can drop between recording start and stop (Go-family
-            // radios go quiet on RSSI dip / camera-side sleep), which
-            // leaves `connectedDeviceUUID` / `connectedDeviceName` nil at
-            // write time. Without a fallback the sidecar gets empty
-            // strings — the collect path then groups multiple wrist
-            // streams under the same "" key and can no longer route each
-            // pending file back to its camera over WiFi. We fall through
-            // to identity captured at pair time (`lastKnownDevice*`,
-            // survives disconnect) and finally to `boundUUID` (passed at
-            // construction for UUID-bound streams). `device.name` is
-            // non-optional but may be empty before GAP name resolves —
-            // treat empty as missing.
-            let liveUUID = ble.connectedDeviceUUID
-            let liveName: String? = {
-                guard let n = ble.connectedDeviceName, !n.isEmpty else { return nil }
-                return n
-            }()
-            let resolvedUUID = liveUUID ?? ble.lastKnownDeviceUUID ?? boundUUID ?? ""
-            let resolvedName = liveName ?? ble.lastKnownDeviceName ?? ""
-            if resolvedUUID.isEmpty || resolvedName.isEmpty {
-                NSLog("[Insta360CameraStream] WARNING pending sidecar for \(streamId) has weak identity: uuid='\(resolvedUUID)' name='\(resolvedName)' (live uuid=\(liveUUID ?? "nil") lastKnown uuid=\(ble.lastKnownDeviceUUID ?? "nil") boundUUID=\(boundUUID ?? "nil"))")
-            }
             do {
-                let nowMonotonic = DispatchTime.now().uptimeNanoseconds
-                let nowWallMs = UInt64(Date().timeIntervalSince1970 * 1000)
-                let elapsedMs = nowMonotonic >= bleAckMonotonicNs
-                    ? (nowMonotonic - bleAckMonotonicNs) / 1_000_000
-                    : 0
-                let startWallMs = nowWallMs > elapsedMs ? nowWallMs - elapsedMs : nowWallMs
-                let segmentLimitSec: UInt = 18 * 60
-                let expectedSegments = stopResult.cameraDurationSec.map {
-                    max(1, Int(($0 + segmentLimitSec - 1) / segmentLimitSec))
-                }
                 let diagnostic = Insta360PendingSidecar.needsCameraFileURIResolution(uri)
                     ? (stopResult.diagnostic ?? "stopCapture returned no video URI after \(stopResult.attempts) attempt(s)")
                     : stopResult.diagnostic
-
-                try Insta360PendingSidecar.write(
+                try writePendingSidecar(
                     to: epDir,
-                    streamId: streamId,
                     cameraFileURI: uri,
-                    bleUuid: resolvedUUID,
-                    bleName: resolvedName,
-                    role: role,
-                    bleAckNs: bleAckMonotonicNs,
                     stopFailureReason: diagnostic,
-                    bleAckWallClockMs: startWallMs,
                     stopWallClockMs: stopResult.stopWallClockMs,
                     cameraDurationSec: stopResult.cameraDurationSec,
-                    cameraFileSize: stopResult.cameraFileSize,
-                    expectedSegments: expectedSegments)
+                    cameraFileSize: stopResult.cameraFileSize)
             } catch {
                 NSLog("[Insta360CameraStream] WARNING pending sidecar write failed for \(streamId): \(error.localizedDescription)")
             }
@@ -360,6 +322,106 @@ public final class Insta360CameraStream: SyncFieldStream, SyncFieldRecordingPref
         throw Insta360Error.frameworkNotLinked
         #endif
     }
+
+    public func recoverUnconfirmedManualStop(
+        stopWallClockMs: UInt64,
+        reason: String
+    ) async throws -> StreamStopReport {
+        #if canImport(INSCameraServiceSDK)
+        guard let epDir = currentEpisodeDirectory else {
+            throw Insta360Error.commandFailed(
+                "manual stop recovery has no active episode directory")
+        }
+        self.cameraFileURI = Insta360PendingSidecar.unresolvedCameraFileURI
+        let startWallMs = estimatedStartWallClockMs(stopWallClockMs: stopWallClockMs)
+        let durationSec: UInt? = startWallMs.flatMap { start in
+            guard stopWallClockMs > start else { return nil }
+            return max(1, UInt((stopWallClockMs - start + 999) / 1000))
+        }
+        try writePendingSidecar(
+            to: epDir,
+            cameraFileURI: Insta360PendingSidecar.unresolvedCameraFileURI,
+            stopFailureReason: reason,
+            bleAckWallClockMs: startWallMs,
+            stopWallClockMs: stopWallClockMs,
+            cameraDurationSec: durationSec,
+            cameraFileSize: nil)
+        return StreamStopReport(streamId: streamId, frameCount: 0, kind: "video")
+        #else
+        throw Insta360Error.frameworkNotLinked
+        #endif
+    }
+
+    #if canImport(INSCameraServiceSDK)
+    private func writePendingSidecar(
+        to episodeDirectory: URL,
+        cameraFileURI: String,
+        stopFailureReason: String?,
+        bleAckWallClockMs explicitBleAckWallClockMs: UInt64? = nil,
+        stopWallClockMs: UInt64?,
+        cameraDurationSec: UInt?,
+        cameraFileSize: UInt64?
+    ) throws {
+        let (resolvedUUID, resolvedName) = resolvedSidecarIdentity()
+        if resolvedUUID.isEmpty || resolvedName.isEmpty {
+            NSLog("[Insta360CameraStream] WARNING pending sidecar for \(streamId) has weak identity: uuid='\(resolvedUUID)' name='\(resolvedName)' (live uuid=\(ble.connectedDeviceUUID ?? "nil") lastKnown uuid=\(ble.lastKnownDeviceUUID ?? "nil") boundUUID=\(boundUUID ?? "nil"))")
+        }
+        let bleAckWallClockMs = explicitBleAckWallClockMs
+            ?? stopWallClockMs.flatMap { estimatedStartWallClockMs(stopWallClockMs: $0) }
+            ?? estimatedStartWallClockMs(stopWallClockMs: UInt64(Date().timeIntervalSince1970 * 1000))
+        let expectedSegments = cameraDurationSec.map(Self.expectedSegments(for:))
+        try Insta360PendingSidecar.write(
+            to: episodeDirectory,
+            streamId: streamId,
+            cameraFileURI: cameraFileURI,
+            bleUuid: resolvedUUID,
+            bleName: resolvedName,
+            role: sidecarRole(),
+            bleAckNs: bleAckMonotonicNs,
+            stopFailureReason: stopFailureReason,
+            bleAckWallClockMs: bleAckWallClockMs,
+            stopWallClockMs: stopWallClockMs,
+            cameraDurationSec: cameraDurationSec,
+            cameraFileSize: cameraFileSize,
+            expectedSegments: expectedSegments)
+    }
+
+    private func resolvedSidecarIdentity() -> (uuid: String, name: String) {
+        // BLE can drop between recording start and stop (Go-family radios go
+        // quiet on RSSI dip / camera-side sleep), which leaves live identity
+        // nil. Fall back to identity captured at pair time and finally to the
+        // UUID passed at construction for UUID-bound streams.
+        let liveUUID = ble.connectedDeviceUUID
+        let liveName: String? = {
+            guard let n = ble.connectedDeviceName, !n.isEmpty else { return nil }
+            return n
+        }()
+        let resolvedUUID = liveUUID ?? ble.lastKnownDeviceUUID ?? boundUUID ?? ""
+        let resolvedName = liveName ?? ble.lastKnownDeviceName ?? ""
+        return (resolvedUUID, resolvedName)
+    }
+
+    private func sidecarRole() -> String {
+        streamId.hasSuffix("_ego") ? "ego"
+        : streamId.hasSuffix("_left") ? "left"
+        : streamId.hasSuffix("_right") ? "right"
+        : ""
+    }
+
+    private func estimatedStartWallClockMs(stopWallClockMs: UInt64) -> UInt64? {
+        guard bleAckMonotonicNs > 0 else { return nil }
+        let nowMonotonic = DispatchTime.now().uptimeNanoseconds
+        let elapsedMs = nowMonotonic >= bleAckMonotonicNs
+            ? (nowMonotonic - bleAckMonotonicNs) / 1_000_000
+            : 0
+        return stopWallClockMs > elapsedMs ? stopWallClockMs - elapsedMs : stopWallClockMs
+    }
+
+    private static func expectedSegments(for durationSec: UInt) -> Int {
+        let segmentLimitSec: UInt = 18 * 60
+        return max(1, Int((durationSec + segmentLimitSec - 1) / segmentLimitSec))
+    }
+    #endif
 
     public func ingest(into episodeDirectory: URL,
                        progress: @Sendable (Double) -> Void) async throws -> StreamIngestReport {

@@ -58,3 +58,28 @@ public protocol SyncFieldStream: Sendable {
 public protocol SyncFieldRecordingPreflightStream: SyncFieldStream {
     func preflightRecording() async throws
 }
+
+/// Optional stream contract for hardware that can cheaply improve stop
+/// reliability without changing the stop state machine.
+///
+/// This hook is best-effort and must not be required for correctness. The
+/// orchestrator starts it as soon as stop begins, overlapping it with the stop
+/// chirp/tail window, then still calls `stopRecording()` on every stream. Use it
+/// for lightweight wake/keepalive nudges, not for blocking command probes.
+public protocol SyncFieldRecordingStopPreparationStream: SyncFieldStream {
+    func prepareToStopRecording() async
+}
+
+/// Optional stream contract for recordings that can be salvaged after the
+/// normal stop command fails.
+///
+/// Host apps use this only after `SessionOrchestrator.stopRecording()` has
+/// already moved the session into `.stopping` and returned an error. The user
+/// can then manually stop the external device, and the stream writes whatever
+/// durable metadata is needed so later ingest/collect can find the file.
+public protocol SyncFieldManualStopRecoveryStream: SyncFieldStream {
+    func recoverUnconfirmedManualStop(
+        stopWallClockMs: UInt64,
+        reason: String
+    ) async throws -> StreamStopReport
+}

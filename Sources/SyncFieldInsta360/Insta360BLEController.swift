@@ -122,7 +122,8 @@ internal enum Insta360CommandReadinessPolicy {
         if normalized.contains("wificredentials")
             || normalized.contains("enablewififordownload")
             || normalized.contains("refreshconnection")
-            || normalized.contains("startremoterecording") {
+            || normalized.contains("startremoterecording")
+            || normalized.contains("stopremoterecording") {
             return .commandChannel
         }
         return .bleLinkOnly
@@ -132,6 +133,7 @@ internal enum Insta360CommandReadinessPolicy {
         let normalized = reason.lowercased()
         return normalized.contains("refreshconnection")
             || normalized.contains("startremoterecording")
+            || normalized.contains("stopremoterecording")
     }
 
     static func requiresPoweredGoCamera(for reason: String) -> Bool {
@@ -1186,6 +1188,16 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
                 reason: "refreshConnection",
                 maxCachedAgeSeconds: 0)
         }
+    }
+
+    /// Best-effort stop warmup that does not acquire the command gate.
+    ///
+    /// The actual stop path still performs `ensureCommandReady` and confirms
+    /// capture state. This method only sends a short targeted wake burst so a
+    /// Go-series camera whose low-power BLE radio got quiet during a long take
+    /// is more likely to be advertising by the time `stopCapture` runs.
+    public func prepareForStopRecording() async {
+        await wakeKnownCamera(window: 0.8)
     }
 
     // MARK: - Private Helpers

@@ -315,6 +315,16 @@ public actor SessionOrchestrator {
         }
         let t0 = DispatchTime.now().uptimeNanoseconds
 
+        // Give external wireless cameras a head start on waking their BLE
+        // control radio while the stop chirp/tail is being captured. This is a
+        // best-effort nudge only; the real stop confirmation and retry logic
+        // still lives in each stream's `stopRecording()`.
+        let stopPreparationTask = Task { [streams, stopReportsByStreamId] in
+            await Self.prepareStreamsForStopRecording(
+                streams: streams,
+                alreadyStoppedStreamIds: Set(stopReportsByStreamId.keys))
+        }
+
         // Stop chirp: emit first, wait for tail to be captured
         if !isRetryingStop, let spec = stopChirpSpec {
             self.stopEmission = await chirpPlayer.play(spec)
@@ -331,6 +341,7 @@ public actor SessionOrchestrator {
         }
         let tAfterChirp = DispatchTime.now().uptimeNanoseconds
         NSLog("[SDK.stopRecording] chirp+tail done elapsedMs=\((tAfterChirp - t0) / 1_000_000)")
+        await stopPreparationTask.value
 
         // Run each stream's stopRecording concurrently. Rationale:
         // - iPhoneCameraStream / iPhoneMotionStream / TactileStream are
@@ -408,17 +419,70 @@ public actor SessionOrchestrator {
         // is derived from the stream-stop report when the stream has
         // already closed its file, falling back to the conventional
         // `<streamId>.jsonl` path for sensor streams.
-        let manifestResults: [String: Result<StreamIngestReport, Error>] =
-            Dictionary(uniqueKeysWithValues: stopReportsInStreamOrder().map { r in
-                (r.streamId, .success(StreamIngestReport(
-                    streamId: r.streamId,
-                    filePath: Self.defaultFilePath(streamId: r.streamId, kind: r.kind),
-                    frameCount: r.frameCount)))
-            })
-        try? writeManifest(from: manifestResults)
+        try? writeStopManifest()
 
         // State is already `.stopping` (set at the top before any await
         // to gate concurrent callers).
+        if let error = firstError { throw error }
+        return StopReport(streamReports: stopReportsInStreamOrder())
+    }
+
+    /// Complete a stop that was already attempted but could not be confirmed
+    /// for one or more recoverable external streams.
+    ///
+    /// This is the durable counterpart to a host-app "I manually stopped the
+    /// camera" UX. It must only be called while the session is `.stopping`,
+    /// after `stopRecording()` has failed. Streams that already produced a stop
+    /// report are left untouched; missing reports are filled only for streams
+    /// that explicitly support manual recovery.
+    public func recoverUnconfirmedStops(
+        manualStopWallClockMs: UInt64 = UInt64(Date().timeIntervalSince1970 * 1000),
+        reason: String = "manual_stop_confirmed_after_stop_failure"
+    ) async throws -> StopReport {
+        guard state == .stopping else {
+            throw SessionError.invalidTransition(from: state, to: .stopping)
+        }
+
+        var firstError: Error?
+        await withTaskGroup(of: (StreamStopReport?, Error?).self) { group in
+            for stream in streams {
+                if stopReportsByStreamId[stream.streamId] != nil { continue }
+                guard let recoverable = stream as? any SyncFieldManualStopRecoveryStream else {
+                    let error = StreamError(
+                        streamId: stream.streamId,
+                        underlying: SessionError.manualStopRecoveryUnsupported(
+                            streamId: stream.streamId))
+                    group.addTask { (nil, error) }
+                    continue
+                }
+                group.addTask { [stream, recoverable] in
+                    let t0 = DispatchTime.now().uptimeNanoseconds
+                    do {
+                        let report = try await recoverable.recoverUnconfirmedManualStop(
+                            stopWallClockMs: manualStopWallClockMs,
+                            reason: reason)
+                        let elapsedMs = (DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000
+                        NSLog("[SDK.manualStopRecovery] stream=\(stream.streamId) recovered elapsedMs=\(elapsedMs)")
+                        return (report, nil)
+                    } catch {
+                        let elapsedMs = (DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000
+                        NSLog("[SDK.manualStopRecovery] stream=\(stream.streamId) failed elapsedMs=\(elapsedMs)")
+                        return (nil, StreamError(streamId: stream.streamId, underlying: error))
+                    }
+                }
+            }
+
+            for await (report, error) in group {
+                if let report {
+                    stopReportsByStreamId[report.streamId] = report
+                }
+                if let error, firstError == nil {
+                    firstError = error
+                }
+            }
+        }
+
+        try? writeStopManifest()
         if let error = firstError { throw error }
         return StopReport(streamReports: stopReportsInStreamOrder())
     }
@@ -561,8 +625,39 @@ public actor SessionOrchestrator {
         }
     }
 
+    private static func prepareStreamsForStopRecording(
+        streams: [any SyncFieldStream],
+        alreadyStoppedStreamIds: Set<String>
+    ) async {
+        await withTaskGroup(of: Void.self) { group in
+            for stream in streams {
+                if alreadyStoppedStreamIds.contains(stream.streamId) { continue }
+                guard let preparable = stream as? any SyncFieldRecordingStopPreparationStream else {
+                    continue
+                }
+                group.addTask { [stream, preparable] in
+                    let t0 = DispatchTime.now().uptimeNanoseconds
+                    await preparable.prepareToStopRecording()
+                    let elapsedMs = (DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000
+                    NSLog("[SDK.stopRecording] stream=\(stream.streamId) stop prep elapsedMs=\(elapsedMs)")
+                }
+            }
+        }
+    }
+
     private func stopReportsInStreamOrder() -> [StreamStopReport] {
         streams.compactMap { stopReportsByStreamId[$0.streamId] }
+    }
+
+    private func writeStopManifest() throws {
+        let manifestResults: [String: Result<StreamIngestReport, Error>] =
+            Dictionary(uniqueKeysWithValues: stopReportsInStreamOrder().map { r in
+                (r.streamId, .success(StreamIngestReport(
+                    streamId: r.streamId,
+                    filePath: Self.defaultFilePath(streamId: r.streamId, kind: r.kind),
+                    frameCount: r.frameCount)))
+            })
+        try writeManifest(from: manifestResults)
     }
 
     /// Run the pre-start countdown. For each tick: fire `onTick(remaining)`

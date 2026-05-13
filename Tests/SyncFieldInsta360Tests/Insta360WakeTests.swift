@@ -86,7 +86,7 @@ final class Insta360WakeTests: XCTestCase {
             .commandChannel)
         XCTAssertEqual(
             Insta360CommandReadinessPolicy.probe(for: "stopRemoteRecording"),
-            .bleLinkOnly)
+            .commandChannel)
         XCTAssertEqual(
             Insta360CommandReadinessPolicy.probe(for: "startCapture attempt 1 failed cleanup"),
             .bleLinkOnly)
@@ -94,6 +94,8 @@ final class Insta360WakeTests: XCTestCase {
             Insta360CommandReadinessPolicy.requiresCaptureControlProbe(for: "refreshConnection"))
         XCTAssertTrue(
             Insta360CommandReadinessPolicy.requiresCaptureControlProbe(for: "startRemoteRecording attempt 1"))
+        XCTAssertTrue(
+            Insta360CommandReadinessPolicy.requiresCaptureControlProbe(for: "stopRemoteRecording attempt 1"))
         XCTAssertFalse(
             Insta360CommandReadinessPolicy.requiresCaptureControlProbe(for: "wifiCredentials"))
     }
