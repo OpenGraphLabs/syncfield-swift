@@ -32,6 +32,7 @@ let localInsta360SDKCandidates: [URL] = ([
         root.appendingPathComponent(insta360SDKRelativePath),
     ]
 } + [
+    homeDirectory?.appendingPathComponent("og-skill/\(insta360SDKRelativePath)"),
     homeDirectory?.appendingPathComponent("Documents/og-skill/\(insta360SDKRelativePath)"),
 ]).compactMap { $0?.standardizedFileURL }
 let localInsta360SDK = localInsta360SDKCandidates.first {
