@@ -70,25 +70,25 @@ final class Insta360ScannerTests: XCTestCase {
             go3Version: nil))
     }
 
-    func test_dockStatus_resolvesConnectedChargeBoxAsDocked() {
+    func test_dockStatus_resolvesUsbConnectionAsDocked() {
         XCTAssertEqual(Insta360BLEController.resolveDockStatus(
             chargeBoxStateRaw: 1,
-            chargeboxUsbConnectedRaw: 1,
+            chargeboxUsbConnectedRaw: 2,
             chargeboxBtConnectedRaw: 1
         ), .docked)
     }
 
-    func test_dockStatus_resolvesPeripheralConnectionAsDocked() {
+    func test_dockStatus_ignoresStateAndBtWhenUsbIsNotConnected() {
         XCTAssertEqual(Insta360BLEController.resolveDockStatus(
-            chargeBoxStateRaw: nil,
-            chargeboxUsbConnectedRaw: 2,
-            chargeboxBtConnectedRaw: 1
-        ), .docked)
-        XCTAssertEqual(Insta360BLEController.resolveDockStatus(
-            chargeBoxStateRaw: nil,
+            chargeBoxStateRaw: 1,
             chargeboxUsbConnectedRaw: 1,
             chargeboxBtConnectedRaw: 2
-        ), .docked)
+        ), .separated)
+        XCTAssertEqual(Insta360BLEController.resolveDockStatus(
+            chargeBoxStateRaw: 1,
+            chargeboxUsbConnectedRaw: nil,
+            chargeboxBtConnectedRaw: 2
+        ), .unknown)
     }
 
     func test_dockStatus_resolvesExplicitNoConnectionAsSeparated() {
@@ -100,11 +100,6 @@ final class Insta360ScannerTests: XCTestCase {
     }
 
     func test_dockStatus_keepsAmbiguousValuesUnknown() {
-        XCTAssertEqual(Insta360BLEController.resolveDockStatus(
-            chargeBoxStateRaw: nil,
-            chargeboxUsbConnectedRaw: 1,
-            chargeboxBtConnectedRaw: 1
-        ), .unknown)
         XCTAssertEqual(Insta360BLEController.resolveDockStatus(
             chargeBoxStateRaw: nil,
             chargeboxUsbConnectedRaw: nil,

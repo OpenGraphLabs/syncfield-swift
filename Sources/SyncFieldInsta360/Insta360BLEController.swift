@@ -1932,16 +1932,19 @@ extension Insta360BLEController {
         chargeboxBtConnectedRaw: UInt?
     ) -> Insta360DockStatus {
         let noConnection: UInt = 0
-        let connected: UInt = 1
+        let peripheralDisconnected: UInt = 1
         let peripheralConnected: UInt = 2
 
-        if chargeBoxStateRaw == connected
-            || chargeboxUsbConnectedRaw == peripheralConnected
-            || chargeboxBtConnectedRaw == peripheralConnected {
+        // Physical dock uses the Action Pod's USB/pogo-pin connection.
+        // `state == connected` and `bt == connected` can also appear while the
+        // ActionCam is separated but still wirelessly linked to the Action Pod,
+        // so they are not strong enough to show a docked warning.
+        if chargeboxUsbConnectedRaw == peripheralConnected {
             return .docked
         }
 
-        if chargeBoxStateRaw == noConnection {
+        if chargeboxUsbConnectedRaw == peripheralDisconnected
+            || chargeBoxStateRaw == noConnection {
             return .separated
         }
 
@@ -2004,9 +2007,7 @@ extension Insta360BLEController {
             let optionConfirmed = response.successTypes.contains {
                 $0.intValue == chargeBoxStatusType.intValue
             }
-            let trustedStatus: Insta360DockStatus = optionConfirmed || resolved == .docked
-                ? resolved
-                : .unknown
+            let trustedStatus: Insta360DockStatus = optionConfirmed ? resolved : .unknown
             NSLog("[Insta360BLE] dockStatus device=\(deviceName) status=\(trustedStatus.rawValue) state=\(stateRaw) usb=\(usbRaw) bt=\(btRaw) optionConfirmed=\(optionConfirmed)")
             return trustedStatus
         } catch {
