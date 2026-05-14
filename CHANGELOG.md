@@ -2,6 +2,26 @@
 
 All notable changes to **syncfield-swift** are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.5] — 2026-05-14
+
+Patch release that stabilizes Go 3S BLE pair/reconnect for dual-wrist setups. Source-compatible with 0.9.x.
+
+### Changed
+- **Go 3S `pair()` and `reconnectIfNeeded()` now try a wake-free 1.5 s pre-scan before starting the `keepWaking` loop.** When the target camera is already advertising (the common case — host calls `assignWristRole` while the camera is powered on), the controller now connects to the first matching ad without ever calling `wakeUpSpecificCamera`. Previous behaviour started the keepWaking loop unconditionally, which stressed the shared `CBPeripheralManager` and (with two concurrent pair flows) ended in `API MISUSE`, `XPC connection invalid`, and a dead GATT channel that survived `assertActionCamHost` as a `provisionalMetadataUnavailable` false-success.
+- **`Insta360Scanner.pair()` now has a two-layer fast path.** Layer 1 is the existing `resolveScannedDevice` cache lookup. Layer 2 is a new `briefWakeFreeScan(matching:timeout:)` helper that runs a 1.5 s wake-free `scanCameras` and registers any hit into `scannedDevices` so the downstream `connect()` call also takes the cached path. This covers the case where the host jumps straight from JS into `prePairInsta360` / `bindController` without first calling `Scanner.scan()`, so the cache layer alone would always miss.
+- **`Insta360BLEController.scanForPairCandidate(excluding:timeout:)` gained an optional `requirePoweredOn` parameter** for callers that want to filter scan hits by the advertisement's `powerOn` flag. `pair()` calls it with `false` because the SDK does not always set the flag on the first ad packet — gating on it caused every fast-path check to silently miss in production.
+- **Diagnostic logs reshaped.** Added `[Insta360Scanner.pair] attempt N fastPathCheck: cache=… scan=… device=… powerOn=… eligible=…`, `[Insta360BLE.pair] fastPath …`, and `[Insta360BLE.reconnect] fastPath …` so the fast-path decision is always visible in console. Removed success-path noise from `[Insta360BLE.gate]`, RSSI/power probes, WiFi creds resolution, command/capture probe ACKs, `commandManager ready after pair/reconnect` (duplicated by `Insta360Scanner.timing`), `Wake auth data written`, dockStatus success, and `Device connected` so failure signals stay readable.
+- `SyncFieldVersion.current` bumped to `0.9.5`.
+
+### Fixed
+- **Dual-wrist Go 3S pairing no longer reliably ends in `SYNCFIELD_CAMERA_NOT_READY` at recording start.** In repro testing the fast path triggers (`cache=hit eligible=true`), the keepWaking task cancels within milliseconds (`STOP elapsedMs=4`), and `startCapture` ACKs around 2.6 s instead of timing out.
+
+### Known issues
+- `assertActionCamHost` still falls back to `provisionalMetadataUnavailable` for some pair flows and `syncTimeMs` / first dockStatus may time out immediately after pair before recovering. Production-ready stability requires a follow-up post-pair hello probe and review of the heartbeat / dockStatus auto-wake path. See `docs/ble-stabilization.md`.
+
+### Compatibility
+- API-source-compatible with 0.9.x. No public API additions or removals; `scanForPairCandidate` is internal. Hosts pinned to 0.9.4 can upgrade by bumping the package version only.
+
 ## [0.9.2] — 2026-05-13
 
 Patch release that hardens `SyncFieldInsta360` for long Go 3S recordings. Public stream APIs remain source-compatible with 0.9.x.

@@ -183,10 +183,27 @@ public actor Insta360Scanner {
             try Task.checkCancellation()
             var connectedDeviceForCleanup: INSBluetoothDevice?
             do {
-                let wakeTask = Task { [identity] in
+                // Phase A — wake-free fast path. Two layers:
+                //   1) the cached scan hit from any previous `Scanner.scan()`
+                //   2) a fresh 1.5s wake-free scan that runs only on attempt 1
+                //      (when JS jumps straight to `prePairInsta360` without
+                //      first starting a hardware scan, scannedDevices is empty
+                //      and the cache layer always misses). If either layer
+                //      returns a peripheral handle, we skip the keepWaking loop
+                //      entirely. Wake spam during connect is what kills the
+                //      GATT channel and ends in `metadata unavailable; accepting
+                //      provisionally` + XPC invalid.
+                var fastPathDevice = await resolveScannedDevice(identity: identity)
+                let cacheHit = fastPathDevice != nil
+                if fastPathDevice == nil && attempt == 1 {
+                    fastPathDevice = await briefWakeFreeScan(matching: identity, timeout: 1.5)
+                }
+                let fastPathEligible = (fastPathDevice != nil)
+                NSLog("[Insta360Scanner.pair] attempt \(attempt) fastPathCheck: cache=\(cacheHit ? "hit" : "miss") scan=\(!cacheHit && fastPathDevice != nil ? "hit" : "miss") device=\(fastPathDevice?.name ?? "nil") powerOn=\(fastPathDevice.map { String($0.powerOn) } ?? "nil") eligible=\(fastPathEligible)")
+                let wakeTask: Task<Void, Never>? = fastPathEligible ? nil : Task { [identity] in
                     await Self.keepWaking(identity: identity)
                 }
-                defer { wakeTask.cancel() }
+                defer { wakeTask?.cancel() }
                 let device = try await connect(identity: identity, attempt: attempt)
                 connectedDeviceForCleanup = device
 
@@ -343,6 +360,49 @@ public actor Insta360Scanner {
                 cont.resume(returning: device)
             }
         }
+    }
+
+    /// Fast-path helper for `pair()`: run a short BLE scan with NO wake
+    /// advertising and return the first peripheral whose advertisement
+    /// matches `identity` by UUID or by 6-char serial. Returns nil on
+    /// timeout. Side-effect: populates `scannedDevices` for the hit so
+    /// downstream `resolveScannedDevice` lookups also see it.
+    private func briefWakeFreeScan(
+        matching identity: Insta360KnownCameraIdentity,
+        timeout: TimeInterval
+    ) async -> INSBluetoothDevice? {
+        let targetUUID = identity.uuid
+        let targetSerial = identity.serialLast6
+        let manager = bluetoothManager
+        defer { manager.stopScan() }
+        do {
+            return try await Insta360BLEController.withTimeout(seconds: timeout) {
+                try await withCheckedThrowingContinuation {
+                    (cont: CheckedContinuation<INSBluetoothDevice, Error>) in
+                    var found = false
+                    manager.scanCameras { [weak self] device, _, _ in
+                        guard !found else { return }
+                        let scanUUID = device.identifierUUIDStringSafe
+                        let scanSerial = Insta360BLEController.extractSerialLast6(fromBLEName: device.name)
+                        let uuidMatches = targetUUID.map { scanUUID == $0 } ?? false
+                        let serialMatches = targetSerial.map { scanSerial == $0 } ?? false
+                        guard uuidMatches || serialMatches else { return }
+                        found = true
+                        manager.stopScan()
+                        Task { [scanUUID, device] in
+                            await self?.recordScannedDevice(uuid: scanUUID, device: device)
+                        }
+                        cont.resume(returning: device)
+                    }
+                }
+            }
+        } catch {
+            return nil
+        }
+    }
+
+    private func recordScannedDevice(uuid: String, device: INSBluetoothDevice) {
+        scannedDevices[uuid] = device
     }
 
     private func scanAndConnect(identity: Insta360KnownCameraIdentity) async throws -> INSBluetoothDevice {
