@@ -37,15 +37,21 @@ public actor Insta360Collector {
         public let bleUuid: String
         public let phase: String
         public let fraction: Double
+        public let ssid: String?
+        public let cameraLabel: String?
 
         public init(episodeDir: URL, streamId: String,
                     bleUuid: String, phase: String = "downloading",
-                    fraction: Double) {
+                    fraction: Double,
+                    ssid: String? = nil,
+                    cameraLabel: String? = nil) {
             self.episodeDir = episodeDir
             self.streamId = streamId
             self.bleUuid = bleUuid
             self.phase = phase
             self.fraction = fraction
+            self.ssid = ssid
+            self.cameraLabel = cameraLabel
         }
     }
 
@@ -318,6 +324,25 @@ public actor Insta360Collector {
 
     // MARK: - Private orchestration
 
+    static func progressEvents(
+        for group: (uuid: String, items: [Insta360PendingSidecar.WithDir]),
+        phase: String,
+        fraction: Double = 0,
+        ssid: String? = nil,
+        cameraLabel: String? = nil
+    ) -> [Progress] {
+        group.items.map { item in
+            Progress(
+                episodeDir: item.episodeDir,
+                streamId: item.sidecar.streamId,
+                bleUuid: group.uuid,
+                phase: phase,
+                fraction: fraction,
+                ssid: ssid,
+                cameraLabel: cameraLabel)
+        }
+    }
+
     #if canImport(INSCameraServiceSDK)
     /// 15-second BLE scan budget — long enough for a sleeping Go-family
     /// camera to wake and advertise after the user picks it up, short
@@ -334,15 +359,18 @@ public actor Insta360Collector {
         func emitGroupPhase(
             _ group: (uuid: String, items: [Insta360PendingSidecar.WithDir]),
             phase: String,
-            fraction: Double = 0
+            fraction: Double = 0,
+            ssid: String? = nil,
+            cameraLabel: String? = nil
         ) {
-            for item in group.items {
-                progress(Progress(
-                    episodeDir: item.episodeDir,
-                    streamId: item.sidecar.streamId,
-                    bleUuid: group.uuid,
-                    phase: phase,
-                    fraction: fraction))
+            for event in Self.progressEvents(
+                for: group,
+                phase: phase,
+                fraction: fraction,
+                ssid: ssid,
+                cameraLabel: cameraLabel
+            ) {
+                progress(event)
             }
         }
 
@@ -403,7 +431,11 @@ public actor Insta360Collector {
                         sidecar: item.sidecar)
                 }
 
-                emitGroupPhase((uuid, group), phase: "joiningWifi")
+                emitGroupPhase(
+                    (uuid, group),
+                    phase: "awaiting_wifi_join",
+                    ssid: creds.ssid,
+                    cameraLabel: group.first?.sidecar.bleName)
                 let downloader = Insta360WiFiDownloader()
                 let batchResults = await downloader.downloadBatch(
                     ssid: creds.ssid,

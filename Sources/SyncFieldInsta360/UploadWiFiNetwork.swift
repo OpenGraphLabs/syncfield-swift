@@ -122,21 +122,38 @@ public actor UploadWiFiReconnector {
         timeoutSeconds: TimeInterval = 30,
         pollIntervalSeconds: TimeInterval = 1
     ) async -> UploadWiFiRejoinResult {
+        var applyFailure: Error?
         do {
             try await apply(
                 profile: profile,
                 applyTimeoutSeconds: min(max(timeoutSeconds, 0), 8))
         } catch {
-            return UploadWiFiRejoinResult(
-                state: .failed,
-                status: await currentStatus(),
-                message: error.localizedDescription)
+            applyFailure = error
         }
 
-        return await waitForUploadReady(
+        let readiness = await waitForUploadReady(
             profile: profile,
             timeoutSeconds: timeoutSeconds,
             pollIntervalSeconds: pollIntervalSeconds)
+        if let applyFailure {
+            return Self.rejoinResultAfterApplyFailure(
+                applyFailure,
+                readiness: readiness)
+        }
+        return readiness
+    }
+
+    static func rejoinResultAfterApplyFailure(
+        _ error: Error,
+        readiness: UploadWiFiRejoinResult
+    ) -> UploadWiFiRejoinResult {
+        if readiness.state == .ready {
+            return readiness
+        }
+        return UploadWiFiRejoinResult(
+            state: .failed,
+            status: readiness.status,
+            message: error.localizedDescription)
     }
 
     public func waitForUploadReady(

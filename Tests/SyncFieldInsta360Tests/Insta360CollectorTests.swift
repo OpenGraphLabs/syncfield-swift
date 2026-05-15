@@ -93,6 +93,28 @@ final class Insta360CollectorTests: XCTestCase {
                        "file:///cam_wrist_left")
     }
 
+    func test_awaitingWiFiJoinProgressCarriesSSIDAndCameraLabelForEveryQueuedFile() {
+        let group = (
+            uuid: "U_LEFT",
+            items: [
+                item(at: "/ep_A", streamId: "cam_wrist_left", bleUuid: "U_LEFT"),
+                item(at: "/ep_B", streamId: "cam_wrist_left", bleUuid: "U_LEFT"),
+            ]
+        )
+
+        let events = Insta360Collector.progressEvents(
+            for: group,
+            phase: "awaiting_wifi_join",
+            ssid: "GO 3S ABC123.OSC",
+            cameraLabel: "Left wrist")
+
+        XCTAssertEqual(events.count, 2)
+        XCTAssertEqual(events.map(\.phase), ["awaiting_wifi_join", "awaiting_wifi_join"])
+        XCTAssertEqual(Set(events.map(\.ssid)), ["GO 3S ABC123.OSC"])
+        XCTAssertEqual(Set(events.map(\.cameraLabel)), ["Left wrist"])
+        XCTAssertEqual(events.map(\.fraction), [0, 0])
+    }
+
     func test_prefetchPairingPlan_matchesGroupOrderAndPreferredNames() async {
         let items = [
             item(at: "/ep_B", streamId: "cam_wrist_left",  bleUuid: "U_LEFT"),

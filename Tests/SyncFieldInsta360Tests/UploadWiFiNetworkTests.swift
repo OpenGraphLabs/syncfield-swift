@@ -85,6 +85,45 @@ final class UploadWiFiNetworkTests: XCTestCase {
         XCTAssertEqual(status.ssid, "Office")
     }
 
+    func test_rejoinApplyFailureRecoversWhenReadinessPollSucceeds() {
+        let ready = UploadWiFiRejoinResult(
+            state: .ready,
+            status: UploadNetworkStatus(
+                interface: .wifi,
+                ssid: "Office",
+                isExpensive: false,
+                isConstrained: false))
+        let result = UploadWiFiReconnector.rejoinResultAfterApplyFailure(
+            NSError(domain: "test", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "apply timed out",
+            ]),
+            readiness: ready)
+
+        XCTAssertEqual(result.state, .ready)
+        XCTAssertEqual(result.status.ssid, "Office")
+        XCTAssertNil(result.message)
+    }
+
+    func test_rejoinApplyFailurePreservesApplyErrorWhenReadinessNeverSucceeds() {
+        let notReady = UploadWiFiRejoinResult(
+            state: .timedOut,
+            status: UploadNetworkStatus(
+                interface: .cellular,
+                ssid: nil,
+                isExpensive: true,
+                isConstrained: false),
+            message: "upload Wi-Fi was not ready before timeout")
+        let result = UploadWiFiReconnector.rejoinResultAfterApplyFailure(
+            NSError(domain: "test", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "apply timed out",
+            ]),
+            readiness: notReady)
+
+        XCTAssertEqual(result.state, .failed)
+        XCTAssertEqual(result.message, "apply timed out")
+        XCTAssertEqual(result.status.interface, .cellular)
+    }
+
     func test_cameraHotspotPredicateOnlyTargetsInsta360APs() {
         XCTAssertTrue(Insta360WiFiDownloader.isLikelyCameraHotspotSSID("GO 3S ABC123.OSC"))
         XCTAssertTrue(Insta360WiFiDownloader.isLikelyCameraHotspotSSID("X4 123456.OSC"))

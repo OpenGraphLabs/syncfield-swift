@@ -1,6 +1,10 @@
 import Foundation
 import Network
 
+#if os(iOS) && canImport(UIKit)
+import UIKit
+#endif
+
 #if canImport(INSCameraServiceSDK)
 import INSCameraServiceSDK
 #endif
@@ -67,18 +71,11 @@ public final class Insta360WiFiDownloader: @unchecked Sendable {
                                   passphrase: String,
                                   sidecar: Insta360PendingSidecar? = nil,
                                   progress: @escaping @Sendable (Double) -> Void) async throws -> Int64 {
-        try await applyHotspot(ssid: ssid, passphrase: passphrase)
+        try await joinCameraHotspot(ssid: ssid, passphrase: passphrase)
 
         var downloadError: Error?
         var bytes: Int64 = 0
         do {
-            // 8 attempts × 1 s = 8 s. The AP's DHCP-assigned IP appears
-            // 1–5 s after `NEHotspotConfiguration.apply` resolves on most
-            // hardware, and during that window every probe returns false;
-            // the previous 3-attempt budget was fragile when iOS took
-            // longer to swing the default route.
-            try await waitForReachability(attempts: 8)
-
             NSLog("[WiFiDownloader] Camera reachable — connecting SDK socket")
             INSCameraManager.socket().setup()
             try await Task.sleep(nanoseconds: 500_000_000) // 0.5 s for socket init
@@ -292,8 +289,7 @@ public final class Insta360WiFiDownloader: @unchecked Sendable {
         if items.isEmpty { return [] }
 
         do {
-            try await applyHotspot(ssid: ssid, passphrase: passphrase)
-            try await waitForReachability(attempts: 8)
+            try await joinCameraHotspot(ssid: ssid, passphrase: passphrase)
         } catch {
             NSLog("[WiFiDownloader] downloadBatch failed to join \(ssid): \(error.localizedDescription)")
             let msg = error.localizedDescription
@@ -323,85 +319,99 @@ public final class Insta360WiFiDownloader: @unchecked Sendable {
 
         var results: [BatchResult] = []
         for (idx, originalItem) in items.enumerated() {
-            // Fresh SDK socket per file (SDK doesn't support back-to-back
-            // fetchResource on one socket). First file sleeps 300 ms after
-            // setup to let the socket init; subsequent files only need 150 ms
-            // because the AP's already warm. Previously we slept 500 ms
-            // blindly — saved ~1–2 s across a typical batch.
-            INSCameraManager.socket().setup()
-            try? await Task.sleep(nanoseconds: idx == 0 ? 300_000_000 : 150_000_000)
-            INSCameraManager.socket().commandsImpl.sendHeartbeats(with: nil)
+            var attempt = 1
+            while true {
+                let item: BatchItem
+                let resolvedURIs: [String]
+                do {
+                    try await waitForForegroundIfNeeded(reason: "download \(originalItem.streamId) from \(ssid)")
+                    // Fresh SDK socket per file (SDK doesn't support back-to-back
+                    // fetchResource on one socket). First file sleeps 300 ms after
+                    // setup to let the socket init; subsequent files only need 150 ms
+                    // because the AP's already warm. Previously we slept 500 ms
+                    // blindly — saved ~1–2 s across a typical batch.
+                    INSCameraManager.socket().setup()
+                    try? await Task.sleep(nanoseconds: idx == 0 ? 300_000_000 : 150_000_000)
+                    INSCameraManager.socket().commandsImpl.sendHeartbeats(with: nil)
 
-            let item: BatchItem
-            let resolvedURIs: [String]
-            do {
-                resolvedURIs = try await resolveRemoteFileURIIfNeeded(
-                    originalItem.remoteFileURI,
-                    sidecar: originalItem.sidecar)
-                item = BatchItem(
-                    episodeDir: originalItem.episodeDir,
-                    streamId: originalItem.streamId,
-                    remoteFileURI: resolvedURIs[0],
-                    destination: originalItem.destination,
-                    bleAckMonotonicNs: originalItem.bleAckMonotonicNs,
-                    sidecar: originalItem.sidecar)
-            } catch {
-                NSLog("[WiFiDownloader] downloadBatch item \(originalItem.streamId) URI resolution failed: \(error.localizedDescription)")
-                results.append(BatchResult(
-                    item: originalItem,
-                    success: false,
-                    error: error.localizedDescription))
-                INSCameraManager.socket().shutdown()
-                continue
-            }
+                    resolvedURIs = try await resolveRemoteFileURIIfNeeded(
+                        originalItem.remoteFileURI,
+                        sidecar: originalItem.sidecar)
+                    item = BatchItem(
+                        episodeDir: originalItem.episodeDir,
+                        streamId: originalItem.streamId,
+                        remoteFileURI: resolvedURIs[0],
+                        destination: originalItem.destination,
+                        bleAckMonotonicNs: originalItem.bleAckMonotonicNs,
+                        sidecar: originalItem.sidecar)
 
-            // Signal "this item is the one actively downloading now" so the
-            // UI can move the progress bar to it. Queued siblings stay in
-            // their prior phase (pairing) until their turn comes up.
-            onItemStart(item)
-            do {
-                try FileManager.default.createDirectory(
-                    at: item.destination.deletingLastPathComponent(),
-                    withIntermediateDirectories: true)
+                    // Signal "this item is the one actively downloading now" so the
+                    // UI can move the progress bar to it. Queued siblings stay in
+                    // their prior phase (pairing) until their turn comes up.
+                    onItemStart(item)
+                    try FileManager.default.createDirectory(
+                        at: item.destination.deletingLastPathComponent(),
+                        withIntermediateDirectories: true)
 
-                let throttle = ProgressThrottle(minIntervalNs: 250_000_000)
-                // NOTE: camera-side transcode (transcodeAndFetch) is currently
-                // disabled — the SDK shipping with this app version doesn't
-                // expose `INSEditProject.toPbData` and `fetchVideoList` returns
-                // empty for the Go 3S, so the transcode path can't run.
-                // Documented in the spec at §9 "Risks" — fallback to raw
-                // fetchResource. For 1080p flat recordings the camera-side
-                // file is already a small standard mp4 (~5 MB/s of recording
-                // = a few-MB-per-second transfer), so the speed cost is
-                // marginal vs. the transcode path. Switch back to transcode
-                // when (a) the SDK exposes a working serialization API, or
-                // (b) we move to high-bitrate 5K360 recording where raw
-                // .insv files are 5–10× larger.
-                let filePaths = destinations(
-                    for: resolvedURIs,
-                    originalDestination: item.destination)
-                _ = try await fetchResolvedURIs(
-                    resolvedURIs,
-                    originalDestination: item.destination,
-                    timeoutSeconds: 600,
-                    progress: { f in
-                        if throttle.shouldEmit() {
-                            progress(item, f)
+                    let throttle = ProgressThrottle(minIntervalNs: 250_000_000)
+                    // NOTE: camera-side transcode (transcodeAndFetch) is currently
+                    // disabled — the SDK shipping with this app version doesn't
+                    // expose `INSEditProject.toPbData` and `fetchVideoList` returns
+                    // empty for the Go 3S, so the transcode path can't run.
+                    // Documented in the spec at §9 "Risks" — fallback to raw
+                    // fetchResource. For 1080p flat recordings the camera-side
+                    // file is already a small standard mp4 (~5 MB/s of recording
+                    // = a few-MB-per-second transfer), so the speed cost is
+                    // marginal vs. the transcode path. Switch back to transcode
+                    // when (a) the SDK exposes a working serialization API, or
+                    // (b) we move to high-bitrate 5K360 recording where raw
+                    // .insv files are 5–10× larger.
+                    let filePaths = destinations(
+                        for: resolvedURIs,
+                        originalDestination: item.destination)
+                    _ = try await fetchResolvedURIs(
+                        resolvedURIs,
+                        originalDestination: item.destination,
+                        timeoutSeconds: 600,
+                        progress: { f in
+                            if throttle.shouldEmit() {
+                                progress(item, f)
+                            }
+                        })
+                    // Always emit a 100% tick before signalling success so the
+                    // UI hits a clean "done" state even if the throttle dropped
+                    // the final fractional update.
+                    progress(item, 1.0)
+                    results.append(BatchResult(
+                        item: item,
+                        success: true,
+                        error: nil,
+                        filePaths: filePaths))
+                    INSCameraManager.socket().shutdown()
+                    break
+                } catch {
+                    INSCameraManager.socket().shutdown()
+                    if shouldRetryAfterForegroundRecovery(error, attempt: attempt, maxAttempts: 2) {
+                        NSLog("[WiFiDownloader] downloadBatch item \(originalItem.streamId) interrupted while app/network state changed; waiting foreground and retrying attempt \(attempt + 1)/2: \(error.localizedDescription)")
+                        attempt += 1
+                        do {
+                            try await joinCameraHotspot(ssid: ssid, passphrase: passphrase)
+                        } catch {
+                            NSLog("[WiFiDownloader] downloadBatch item \(originalItem.streamId) failed to rejoin before retry: \(error.localizedDescription)")
+                            results.append(BatchResult(
+                                item: originalItem,
+                                success: false,
+                                error: error.localizedDescription))
+                            break
                         }
-                    })
-                // Always emit a 100% tick before signalling success so the
-                // UI hits a clean "done" state even if the throttle dropped
-                // the final fractional update.
-                progress(item, 1.0)
-                results.append(BatchResult(
-                    item: item,
-                    success: true,
-                    error: nil,
-                    filePaths: filePaths))
-            } catch {
-                NSLog("[WiFiDownloader] downloadBatch item \(item.streamId) failed: \(error.localizedDescription)")
-                results.append(BatchResult(
-                    item: item, success: false, error: error.localizedDescription))
+                        continue
+                    }
+
+                    NSLog("[WiFiDownloader] downloadBatch item \(originalItem.streamId) failed: \(error.localizedDescription)")
+                    results.append(BatchResult(
+                        item: originalItem, success: false, error: error.localizedDescription))
+                    break
+                }
             }
 
             // Tear down the SDK socket. No sleep here — the next `setup()`
@@ -1353,6 +1363,87 @@ public final class Insta360WiFiDownloader: @unchecked Sendable {
     }
 
     // MARK: - Hotspot
+
+    private func joinCameraHotspot(
+        ssid: String,
+        passphrase: String,
+        maxAttempts: Int = 2
+    ) async throws {
+        var lastError: Error?
+        for attempt in 1...max(1, maxAttempts) {
+            do {
+                try await waitForForegroundIfNeeded(reason: "join camera Wi-Fi \(ssid)")
+                try await applyHotspot(ssid: ssid, passphrase: passphrase)
+                // 8 attempts × 1 s = 8 s. The AP's DHCP-assigned IP appears
+                // 1–5 s after `NEHotspotConfiguration.apply` resolves on most
+                // hardware, and during that window every probe returns false.
+                try await waitForReachability(attempts: 8)
+                return
+            } catch {
+                lastError = error
+                guard shouldRetryAfterForegroundRecovery(
+                    error,
+                    attempt: attempt,
+                    maxAttempts: maxAttempts
+                ) else {
+                    throw error
+                }
+                NSLog("[WiFiDownloader] camera Wi-Fi join interrupted; waiting foreground and retrying attempt \(attempt + 1)/\(maxAttempts): \(error.localizedDescription)")
+                NEHotspotConfigurationManager.shared.removeConfiguration(forSSID: ssid)
+            }
+        }
+        throw lastError ?? Insta360Error.hotspotApplyFailedWithKind(
+            kind: .unknown,
+            detail: "camera Wi-Fi join failed")
+    }
+
+    private func waitForForegroundIfNeeded(reason: String) async throws {
+        #if os(iOS) && canImport(UIKit)
+        try Task.checkCancellation()
+        if await isApplicationActive() { return }
+
+        NSLog("[WiFiDownloader] waiting for foreground before \(reason)")
+        for await _ in NotificationCenter.default.notifications(
+            named: UIApplication.didBecomeActiveNotification
+        ) {
+            try Task.checkCancellation()
+            if await isApplicationActive() {
+                NSLog("[WiFiDownloader] foreground restored; continuing \(reason)")
+                return
+            }
+        }
+        #else
+        _ = reason
+        #endif
+    }
+
+    #if os(iOS) && canImport(UIKit)
+    @MainActor
+    private func isApplicationActive() -> Bool {
+        UIApplication.shared.applicationState == .active
+    }
+    #endif
+
+    private func shouldRetryAfterForegroundRecovery(
+        _ error: Error,
+        attempt: Int,
+        maxAttempts: Int
+    ) -> Bool {
+        guard attempt < maxAttempts else { return false }
+        if Task.isCancelled { return false }
+
+        if case Insta360Error.hotspotApplyFailedWithKind(let kind, _) = error,
+           kind == .notInForeground {
+            return true
+        }
+
+        let message = error.localizedDescription.lowercased()
+        return message.contains("not in the foreground") ||
+            message.contains("notinforeground") ||
+            message.contains("network connection was lost") ||
+            message.contains("no network route") ||
+            message.contains("camera ap reachable timeout")
+    }
 
     private func applyHotspot(
         ssid: String,
