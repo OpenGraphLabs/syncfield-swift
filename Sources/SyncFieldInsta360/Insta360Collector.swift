@@ -63,6 +63,11 @@ public actor Insta360Collector {
         }
     }
 
+    struct PrefetchPairingOutcome: Equatable {
+        let prefetchedUUIDs: [String]
+        let wasCancelled: Bool
+    }
+
     /// Collect every pending file inside one episode directory.
     ///
     /// Returns `[]` when no `.pending.json` files exist (idempotent: a
@@ -127,6 +132,34 @@ public actor Insta360Collector {
         }
     }
 
+    static func prefetchPairCameras(
+        _ groups: [(uuid: String, items: [Insta360PendingSidecar.WithDir])],
+        pair: (String, String?) async throws -> Void
+    ) async -> PrefetchPairingOutcome {
+        var prefetchedUUIDs: [String] = []
+        var wasCancelled = false
+        for (uuid, group) in groups {
+            if Task.isCancelled {
+                wasCancelled = true
+                break
+            }
+            do {
+                try await pair(uuid, group.first?.sidecar.bleName)
+                prefetchedUUIDs.append(uuid)
+                NSLog("[Insta360Collector] prefetch pair ok uuid=\(uuid)")
+            } catch is CancellationError {
+                wasCancelled = true
+                NSLog("[Insta360Collector] prefetch pair cancelled uuid=\(uuid)")
+                break
+            } catch {
+                NSLog("[Insta360Collector] prefetch pair failed uuid=\(uuid): \(error.localizedDescription); will retry at per-camera step")
+            }
+        }
+        return PrefetchPairingOutcome(
+            prefetchedUUIDs: prefetchedUUIDs,
+            wasCancelled: wasCancelled)
+    }
+
     public static func itemsForEpisodeDirs(
         _ episodeDirs: [URL]
     ) throws -> [Insta360PendingSidecar.WithDir] {
@@ -159,6 +192,33 @@ public actor Insta360Collector {
     ) async throws -> [Result] {
         try Task.checkCancellation()
         let groups = Self.groupByCamera(items)
+
+        // Cameras are collected sequentially because iOS can join only one
+        // camera Wi-Fi AP at a time. Prefetch every target BLE pairing first
+        // so the existing per-controller heartbeat keeps waiting cameras
+        // awake while an earlier camera is downloading.
+        var prefetchedUUIDs: [String] = []
+        defer {
+            let toCleanup = prefetchedUUIDs
+            if !toCleanup.isEmpty {
+                Task { [toCleanup] in
+                    for uuid in toCleanup {
+                        try? await Insta360Scanner.shared.unpair(uuid: uuid)
+                    }
+                }
+            }
+        }
+
+        let prefetch = await Self.prefetchPairCameras(groups) { uuid, preferredName in
+            try await Insta360Scanner.shared.pair(
+                uuid: uuid,
+                preferredName: preferredName)
+        }
+        prefetchedUUIDs = prefetch.prefetchedUUIDs
+        if prefetch.wasCancelled {
+            throw CancellationError()
+        }
+        try Task.checkCancellation()
 
         var results: [Result] = []
 

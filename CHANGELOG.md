@@ -2,6 +2,18 @@
 
 All notable changes to **syncfield-swift** are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.7] — 2026-05-15
+
+Patch release that keeps queued Insta360 wrist cameras awake during batched multi-camera collect. Source-compatible with 0.9.x.
+
+### Fixed
+- **`Insta360Collector.collectAll` now prefetch-pairs every target camera before sequential Wi-Fi downloads.** Waiting wrist cameras keep their existing BLE heartbeat alive while another camera is on Wi-Fi, preventing idle power-off before their turn starts.
+- Prefetch pairing is fail-soft: a failed prefetch logs and the existing per-camera pair step still retries that camera, preserving previous collect behavior as the fallback path.
+- Successfully prefetched cameras are scheduled for best-effort unpair at collect completion, error, or cancellation so the normal post-`disconnect()` host flow is restored.
+
+### Changed
+- `SyncFieldVersion.current` bumped to `0.9.7`.
+
 ## [0.9.6] — 2026-05-15
 
 Phone authorization support for Insta360 GO 3S pair/reconnect flows. Source-compatible with 0.9.x.

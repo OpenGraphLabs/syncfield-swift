@@ -93,6 +93,65 @@ final class Insta360CollectorTests: XCTestCase {
                        "file:///cam_wrist_left")
     }
 
+    func test_prefetchPairingPlan_matchesGroupOrderAndPreferredNames() async {
+        let items = [
+            item(at: "/ep_B", streamId: "cam_wrist_left",  bleUuid: "U_LEFT"),
+            item(at: "/ep_A", streamId: "cam_wrist_right", bleUuid: "U_RIGHT"),
+            item(at: "/ep_A", streamId: "cam_wrist_left",  bleUuid: "U_LEFT"),
+        ]
+        let groups = Insta360Collector.groupByCamera(items)
+
+        var attempts: [(uuid: String, preferredName: String?)] = []
+        let outcome = await Insta360Collector.prefetchPairCameras(groups) { uuid, preferredName in
+            attempts.append((uuid, preferredName))
+        }
+
+        XCTAssertEqual(outcome.prefetchedUUIDs, ["U_LEFT", "U_RIGHT"])
+        XCTAssertFalse(outcome.wasCancelled)
+        XCTAssertEqual(attempts.map(\.uuid), ["U_LEFT", "U_RIGHT"])
+        XCTAssertEqual(attempts.map(\.preferredName), ["GO 3S U_LEFT", "GO 3S U_RIGHT"])
+    }
+
+    func test_prefetchPairingFailure_isFailSoftAndContinues() async {
+        let groups = Insta360Collector.groupByCamera([
+            item(at: "/ep_A", streamId: "cam_wrist_left", bleUuid: "U_A"),
+            item(at: "/ep_A", streamId: "cam_wrist_right", bleUuid: "U_B"),
+            item(at: "/ep_B", streamId: "cam_wrist_right", bleUuid: "U_C"),
+        ])
+
+        var attempts: [String] = []
+        let outcome = await Insta360Collector.prefetchPairCameras(groups) { uuid, _ in
+            attempts.append(uuid)
+            if uuid == "U_B" {
+                throw Insta360Error.commandFailed("pair failed")
+            }
+        }
+
+        XCTAssertEqual(attempts, ["U_A", "U_B", "U_C"])
+        XCTAssertEqual(outcome.prefetchedUUIDs, ["U_A", "U_C"])
+        XCTAssertFalse(outcome.wasCancelled)
+    }
+
+    func test_prefetchPairingCancellation_returnsPartialAndStops() async {
+        let groups = Insta360Collector.groupByCamera([
+            item(at: "/ep_A", streamId: "cam_wrist_left", bleUuid: "U_A"),
+            item(at: "/ep_A", streamId: "cam_wrist_right", bleUuid: "U_B"),
+            item(at: "/ep_B", streamId: "cam_wrist_right", bleUuid: "U_C"),
+        ])
+
+        var attempts: [String] = []
+        let outcome = await Insta360Collector.prefetchPairCameras(groups) { uuid, _ in
+            attempts.append(uuid)
+            if uuid == "U_B" {
+                throw CancellationError()
+            }
+        }
+
+        XCTAssertEqual(attempts, ["U_A", "U_B"])
+        XCTAssertEqual(outcome.prefetchedUUIDs, ["U_A"])
+        XCTAssertTrue(outcome.wasCancelled)
+    }
+
     func test_itemsForEpisodeDirs_scansOnlyRequestedEpisodeDirs() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("collector_requested_\(UUID().uuidString)")
