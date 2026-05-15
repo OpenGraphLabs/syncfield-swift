@@ -586,6 +586,10 @@ og-skill 측에서 RN config flag(예: `EXPERIMENTAL_PHONE_AUTH`)로 게이팅. 
 
 구현 첫 빌드의 검증 항목: 공장 초기화 카메라로 우리 SDK가 호출 시 동일 LCD 흐름이 재현되는지만 확인. 일러스트는 사용하지 않으므로 시각 자산 작업 불필요.
 
+### 로컬 SDK 링크
+
+og-skill의 syncfield-swift 의존성을 remote에서 **local path로 전환해둠**. 따라서 본 문서의 변경을 syncfield-swift에 반영하면 og-skill을 Xcode로 빌드만 해도 즉시 함께 들어간다. 별도 syncfield-swift 릴리즈/태그/`pod update` 없이 syncfield-swift ↔ og-skill 양쪽을 동시에 수정해가며 테스트 가능. production 배포 직전에 다시 remote 의존성으로 되돌리면 됨.
+
 ### 로컬 테스트용 카메라 리셋 방법
 
 반복 테스트로 first-time 인증 흐름을 도려면 카메라 측 authorized list를 비워야 한다. SDK에는 GO 3S용 deauth API가 노출되어 있지 않으므로:
@@ -593,7 +597,7 @@ og-skill 측에서 RN config flag(예: `EXPERIMENTAL_PHONE_AUTH`)로 게이팅. 
 - **방법: 공장 초기화 (Option A).** Action Pod 설정 메뉴 → Reset → Factory Reset. paired 폰 + WiFi + 설정이 모두 초기화되므로 베타 사용자가 새 박스를 푼 상태와 동일해진다. 본 작업의 표준 reset 방법으로 채택.
 - 폰 측 캐시(`identities.json`)는 앱 재설치 또는 Xcode container 삭제로 비움.
 
-> `[INSConnectionUtils authorizationId]`는 Keychain 영속으로 추정 (앱 재설치 후에도 같은 deviceId 유지 확인됨). 따라서 앱 재설치만으로는 first-time 흐름을 재현할 수 없으며 카메라 측 리셋이 필수.
+> 카메라 측 authorized list는 펌웨어가 영속 보관 → 공장 초기화로만 비울 수 있음. 폰 측 `[INSConnectionUtils authorizationId]`는 재설치에도 같은 값을 돌려주는 것으로 관찰되지만(앞선 사용자 확인), 백킹 메커니즘은 헤더로 단정 불가. 따라서 앱 재설치만으로는 first-time 흐름이 재현되지 않으며 카메라 측 리셋이 필수.
 
 ### PostHog 계측 (베타 모니터링)
 
