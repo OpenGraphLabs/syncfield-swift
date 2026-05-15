@@ -267,6 +267,7 @@ public final class Insta360WiFiDownloader: @unchecked Sendable {
         passphrase: String,
         items: [BatchItem],
         onItemStart: @escaping @Sendable (BatchItem) -> Void,
+        onForegroundWait: @escaping @Sendable (BatchItem?) -> Void = { _ in },
         progress: @escaping @Sendable (BatchItem, Double) -> Void
     ) async -> [BatchResult] {
         await Self.operationGate.withLock {
@@ -275,6 +276,7 @@ public final class Insta360WiFiDownloader: @unchecked Sendable {
                 passphrase: passphrase,
                 items: items,
                 onItemStart: onItemStart,
+                onForegroundWait: onForegroundWait,
                 progress: progress)
         }
     }
@@ -284,12 +286,18 @@ public final class Insta360WiFiDownloader: @unchecked Sendable {
         passphrase: String,
         items: [BatchItem],
         onItemStart: @escaping @Sendable (BatchItem) -> Void,
+        onForegroundWait: @escaping @Sendable (BatchItem?) -> Void,
         progress: @escaping @Sendable (BatchItem, Double) -> Void
     ) async -> [BatchResult] {
         if items.isEmpty { return [] }
 
         do {
-            try await joinCameraHotspot(ssid: ssid, passphrase: passphrase)
+            try await joinCameraHotspot(
+                ssid: ssid,
+                passphrase: passphrase,
+                onForegroundWait: {
+                    onForegroundWait(nil)
+                })
         } catch {
             NSLog("[WiFiDownloader] downloadBatch failed to join \(ssid): \(error.localizedDescription)")
             let msg = error.localizedDescription
@@ -324,7 +332,11 @@ public final class Insta360WiFiDownloader: @unchecked Sendable {
                 let item: BatchItem
                 let resolvedURIs: [String]
                 do {
-                    try await waitForForegroundIfNeeded(reason: "download \(originalItem.streamId) from \(ssid)")
+                    try await waitForForegroundIfNeeded(
+                        reason: "download \(originalItem.streamId) from \(ssid)",
+                        onWait: {
+                            onForegroundWait(originalItem)
+                        })
                     // Fresh SDK socket per file (SDK doesn't support back-to-back
                     // fetchResource on one socket). First file sleeps 300 ms after
                     // setup to let the socket init; subsequent files only need 150 ms
@@ -395,7 +407,12 @@ public final class Insta360WiFiDownloader: @unchecked Sendable {
                         NSLog("[WiFiDownloader] downloadBatch item \(originalItem.streamId) interrupted while app/network state changed; waiting foreground and retrying attempt \(attempt + 1)/2: \(error.localizedDescription)")
                         attempt += 1
                         do {
-                            try await joinCameraHotspot(ssid: ssid, passphrase: passphrase)
+                            try await joinCameraHotspot(
+                                ssid: ssid,
+                                passphrase: passphrase,
+                                onForegroundWait: {
+                                    onForegroundWait(originalItem)
+                                })
                         } catch {
                             NSLog("[WiFiDownloader] downloadBatch item \(originalItem.streamId) failed to rejoin before retry: \(error.localizedDescription)")
                             results.append(BatchResult(
@@ -1367,12 +1384,15 @@ public final class Insta360WiFiDownloader: @unchecked Sendable {
     private func joinCameraHotspot(
         ssid: String,
         passphrase: String,
-        maxAttempts: Int = 2
+        maxAttempts: Int = 2,
+        onForegroundWait: @escaping @Sendable () -> Void = {}
     ) async throws {
         var lastError: Error?
         for attempt in 1...max(1, maxAttempts) {
             do {
-                try await waitForForegroundIfNeeded(reason: "join camera Wi-Fi \(ssid)")
+                try await waitForForegroundIfNeeded(
+                    reason: "join camera Wi-Fi \(ssid)",
+                    onWait: onForegroundWait)
                 try await applyHotspot(ssid: ssid, passphrase: passphrase)
                 // 8 attempts × 1 s = 8 s. The AP's DHCP-assigned IP appears
                 // 1–5 s after `NEHotspotConfiguration.apply` resolves on most
@@ -1397,12 +1417,16 @@ public final class Insta360WiFiDownloader: @unchecked Sendable {
             detail: "camera Wi-Fi join failed")
     }
 
-    private func waitForForegroundIfNeeded(reason: String) async throws {
+    private func waitForForegroundIfNeeded(
+        reason: String,
+        onWait: @escaping @Sendable () -> Void = {}
+    ) async throws {
         #if os(iOS) && canImport(UIKit)
         try Task.checkCancellation()
         if await isApplicationActive() { return }
 
         NSLog("[WiFiDownloader] waiting for foreground before \(reason)")
+        onWait()
         for await _ in NotificationCenter.default.notifications(
             named: UIApplication.didBecomeActiveNotification
         ) {

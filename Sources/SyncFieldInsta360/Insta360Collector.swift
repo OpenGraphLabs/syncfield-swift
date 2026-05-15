@@ -176,6 +176,33 @@ public actor Insta360Collector {
         #endif
     }
 
+    static func foregroundWaitProgressEvents(
+        for group: (uuid: String, items: [Insta360PendingSidecar.WithDir]),
+        ssid: String,
+        cameraLabel: String?,
+        episodeDir: URL? = nil,
+        streamId: String? = nil
+    ) -> [Progress] {
+        if let episodeDir, let streamId {
+            return [
+                Progress(
+                    episodeDir: episodeDir,
+                    streamId: streamId,
+                    bleUuid: group.uuid,
+                    phase: "awaiting_wifi_join",
+                    fraction: 0,
+                    ssid: ssid,
+                    cameraLabel: cameraLabel),
+            ]
+        }
+
+        return progressEvents(
+            for: group,
+            phase: "awaiting_wifi_join",
+            ssid: ssid,
+            cameraLabel: cameraLabel)
+    }
+
     #if canImport(INSCameraServiceSDK)
     private static func enrichMissingThumbnailsWithBLE(
         _ files: [Insta360FileInfo],
@@ -374,6 +401,23 @@ public actor Insta360Collector {
             }
         }
 
+        func emitForegroundWait(
+            for group: (uuid: String, items: [Insta360PendingSidecar.WithDir]),
+            ssid: String,
+            cameraLabel: String?,
+            item: Insta360WiFiDownloader.BatchItem?
+        ) {
+            for event in Self.foregroundWaitProgressEvents(
+                for: group,
+                ssid: ssid,
+                cameraLabel: cameraLabel,
+                episodeDir: item?.episodeDir,
+                streamId: item?.streamId
+            ) {
+                progress(event)
+            }
+        }
+
         // Cameras are collected sequentially because iOS can join only one
         // camera Wi-Fi AP at a time. Prefetch every target BLE pairing first
         // so the existing per-controller heartbeat keeps waiting cameras
@@ -448,6 +492,13 @@ public actor Insta360Collector {
                             bleUuid: uuid,
                             phase: "downloading",
                             fraction: 0))
+                    },
+                    onForegroundWait: { batchItem in
+                        emitForegroundWait(
+                            for: (uuid, group),
+                            ssid: creds.ssid,
+                            cameraLabel: group.first?.sidecar.bleName,
+                            item: batchItem)
                     },
                     progress: { batchItem, fraction in
                         progress(Progress(

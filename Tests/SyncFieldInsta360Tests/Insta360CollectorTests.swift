@@ -115,6 +115,30 @@ final class Insta360CollectorTests: XCTestCase {
         XCTAssertEqual(events.map(\.fraction), [0, 0])
     }
 
+    func test_foregroundWaitProgressCanTargetCurrentFile() {
+        let group = (
+            uuid: "U_RIGHT",
+            items: [
+                item(at: "/ep_A", streamId: "cam_wrist_right", bleUuid: "U_RIGHT"),
+                item(at: "/ep_B", streamId: "cam_wrist_right", bleUuid: "U_RIGHT"),
+            ]
+        )
+
+        let events = Insta360Collector.foregroundWaitProgressEvents(
+            for: group,
+            ssid: "GO 3S 1TEBJJ.OSC",
+            cameraLabel: "Right wrist",
+            episodeDir: URL(fileURLWithPath: "/ep_B"),
+            streamId: "cam_wrist_right")
+
+        XCTAssertEqual(events.count, 1)
+        XCTAssertEqual(events[0].episodeDir.path, "/ep_B")
+        XCTAssertEqual(events[0].streamId, "cam_wrist_right")
+        XCTAssertEqual(events[0].phase, "awaiting_wifi_join")
+        XCTAssertEqual(events[0].ssid, "GO 3S 1TEBJJ.OSC")
+        XCTAssertEqual(events[0].cameraLabel, "Right wrist")
+    }
+
     func test_prefetchPairingPlan_matchesGroupOrderAndPreferredNames() async {
         let items = [
             item(at: "/ep_B", streamId: "cam_wrist_left",  bleUuid: "U_LEFT"),
