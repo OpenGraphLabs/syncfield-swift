@@ -123,7 +123,7 @@ typedef NS_ENUM(NSUInteger, INSPhoneAuthorizationResult) {
 };
 ```
 
-`completion`이 통보하는 카메라 측 사용자 응답.
+실기기 검증 결과, GO 3S에서는 `checkPhoneAuthorization`의 `completion`이 최종 사용자 응답이 아니라 **초기 authorization state**를 먼저 반환할 수 있다. 특히 `.Unauthorized`는 "거절"이 아니라 "카메라 LCD에 승인 요청을 표시했고 사용자 결정을 기다려야 함"으로 처리해야 한다. 최종 성공/거절/타임아웃은 `INSCameraAuthorizationResultNotification`의 `userInfo["result"]` (`INSPhoneAuthorizationResult`)를 기다려 확정한다.
 
 ---
 
@@ -132,7 +132,7 @@ typedef NS_ENUM(NSUInteger, INSPhoneAuthorizationResult) {
 iOS 시스템 권한(`CLLocationManager`, `AVCaptureDevice.requestAccess`) 패턴과 동형:
 
 1. `Insta360CameraStream.connect(context:)`가 BLE 페어링 후 phone authorization 상태를 **자동 점검**한다.
-2. 캐시 hit → 곧장 통과. 캐시 miss + 빠른 probe `.Authorized` → 자동 캐시 + 통과. 그 외 → **`Insta360Error.phoneAuthorizationRequired(uuid:deviceId:)` throw**.
+2. 캐시 hit → 곧장 통과. 캐시 miss → **`Insta360Error.phoneAuthorizationRequired(uuid:deviceId:)` throw**.
 3. 호스트 앱이 이 에러를 catch → UX 표시 → `Insta360CameraStream.requestPhoneAuthorization()` **명시 호출** → 성공 시 `connect(context:)` 재호출.
 4. 한 번 승인된 페어는 `Insta360IdentityStore`에 영구 캐시 → 다음부터 자동 통과.
 
@@ -191,11 +191,9 @@ public enum PhoneAuthorizationCacheState: Sendable, Equatable {
 
 5. **NEW** — `IdentityStore.isPhoneAuthorized(serialLast6:)` 조회.
 6. **NEW** — 캐시 hit → return.
-7. **NEW** — 캐시 miss → 짧은 timeout(5s)으로 `checkPhoneAuthorization` 1회 quick probe.
-   - 응답 `.Authorized` → `IdentityStore.markPhoneAuthorized` 작성 + return.
-   - 응답 `.Unauthorized` 또는 `.SystemBusy` 또는 timeout → `throw .phoneAuthorizationRequired(uuid:deviceId:)`.
+7. **NEW** — 캐시 miss → `throw .phoneAuthorizationRequired(uuid:deviceId:)`.
 
-> **Note (graceful degrade).** API 미지원 펌웨어가 응답을 안 줄 가능성은 헤더만으로는 단정 못 한다. 현 설계는 timeout을 보수적으로 `phoneAuthorizationRequired` throw로 surface하여, 호스트가 `requestPhoneAuthorization`을 명시 호출하도록 유도한다. 그 호출도 timeout이면 `phoneAuthorizationTimedOut`이 surface되어 사용자가 인지 가능한 명확한 실패가 된다. (현재의 silent fail보다 엄격하게 나음.)
+> **Note.** `checkPhoneAuthorization`은 카메라 LCD 승인 UI를 띄우는 interactive 호출이다. 숨은 5초 probe로 사용하면 호스트 앱의 30초 UX와 카메라 UI가 어긋나므로, 반드시 호스트 modal이 열린 뒤 `requestPhoneAuthorization()`의 명시 호출에서만 실행한다.
 
 ### `Insta360Error` 신규 케이스
 
@@ -254,7 +252,7 @@ public actor Insta360IdentityStore {
 **캐시 무효화 조건:**
 
 - `phoneAuthorizationRejected` / `phoneAuthorizationTimedOut` throw 직전에 `clearPhoneAuthorization` 자동 호출.
-- 카메라 펌웨어 업데이트 후 auth list 초기화 가능성은 quick probe가 항상 진실 source이므로 자동 회복 (캐시 stale → probe `.Unauthorized` → 정상 throw 경로).
+- 카메라 펌웨어 업데이트나 공장 초기화로 auth list가 초기화될 수 있다. 운영 중 stale cache가 확인되면 command failure를 phone authorization required로 승격하는 별도 복구 경로를 추가한다.
 
 ### `Insta360BLEController` 내부 헬퍼 (구현 메모, public 아님)
 
@@ -271,7 +269,7 @@ extension Insta360BLEController {
 }
 ```
 
-내부 호출 시점: `Insta360Scanner.pair()`(`Insta360Scanner.swift:210-213`)에서 `waitForCommandManagerReady`가 끝난 직후가 BLE link + command channel ready 보장 시점이다. 그 시점에 quick probe(5s) 1회 시도. 호스트 명시 호출(`requestPhoneAuthorization`)도 동일 헬퍼를 timeoutSeconds만 늘려 사용.
+내부 호출 시점: 호스트가 `requestPhoneAuthorization`을 명시 호출한 뒤 `ensureCommandReady`가 끝난 시점. `checkPhoneAuthorization` completion의 `.Unauthorized`는 final reject가 아니라 `INSCameraAuthorizationResultNotification` 대기로 이어진다.
 
 ---
 
@@ -292,17 +290,16 @@ Host App                  syncfield-swift             Camera
    │                          ├── writeWakeupAuthData ──►│
    │                          ├── isPhoneAuthorized(cache)
    │                          │     → false
-   │                          ├── checkPhoneAuthorization (5s quick probe)
-   │                          │     → .Unauthorized
    │◄── throws phoneAuthorizationRequired(uuid, deviceId)
    │
    │── (호스트 앱 UX: PhoneAuthorizationModal "카메라에서 승인해주세요")
    │
    ├── stream.requestPhoneAuthorization() ──┐
-   │                          ├── checkPhoneAuthorization (30s with UI)
+   │                          ├── ensureCommandReady
+   │                          ├── checkPhoneAuthorization
    │                          ├──────────────────────────►│ (LCD: 승인?)
    │                          │                          │ ← user taps OK
-   │                          │◄─── .Success ────────────│
+   │                          │◄─── notification .Success │
    │                          ├── IdentityStore.markPhoneAuthorized
    │◄── return ────────────────┤
    │
@@ -511,16 +508,16 @@ await SyncFieldBridge.cancelPhoneAuthorization(uuid);
 
 ### 캐시 만료
 
-현재 가정: 카메라 측 authorized list는 영구 (헤더로 단정 불가). 만료/초기화가 운영 중 발견되면:
+현재 가정: 카메라 측 authorized list는 장기 유지된다. 만료/초기화가 운영 중 발견되면:
 
-- 카메라 공장 초기화 → 다음 `connect()`의 quick probe가 `.Unauthorized` 반환 → 자동 throw → modal 재표시 → 정상 회복.
-- `IdentityStore.phoneAuthorizedAt`은 stale로 남지만 quick probe가 항상 진실 source이므로 사용자 경험에 영향 없음.
+- 카메라 공장 초기화 → cached authorized가 stale일 수 있음.
+- 운영 중 stale cache가 확인되면 clock sync / Wi-Fi credential command failure를 `phoneAuthorizationRequired`로 승격하고 cache를 clear하는 복구 경로를 추가한다.
 
 ### 펌웨어 미지원 / API 미응답
 
 `availability(go3)` 명시이지만 옛 펌웨어가 API에 응답하지 않을 가능성:
 
-- Quick probe 5s timeout → `.phoneAuthorizationRequired` throw → modal → `requestPhoneAuthorization`도 timeout (30s) → `.phoneAuthorizationTimedOut`.
+- `requestPhoneAuthorization`의 `checkPhoneAuthorization` 시작 또는 authorization notification 대기가 timeout → `.phoneAuthorizationTimedOut`.
 - 사용자에게 "카메라 펌웨어 업데이트 권장" 별도 메시지를 띄울지는 firmware 버전 조회 후 결정 (현재 코드는 `INSBluetoothConnection.readFirmwareWithCompletion`을 사용 가능). 본 작업의 범위는 throw 흐름까지, firmware 가이드 분기는 운영 데이터 모으고 별도 작업.
 
 ### BLE 끊김 도중 인증 진행
@@ -543,9 +540,9 @@ await SyncFieldBridge.cancelPhoneAuthorization(uuid);
 
 `IdentityStore`의 모든 기존 record는 `phoneAuthorizedAt == nil` → `isPhoneAuthorized → false`. 따라서:
 
-- 신규 빌드 첫 실행 → 첫 connect → quick probe 자동 수행.
-- 사용자가 (예전에 공식 앱에서) 이미 카메라에 인증한 상태 → probe `.Authorized` → **자동 캐시 작성, modal 미표시**.
-- 인증 안 된 사용자 → probe `.Unauthorized` → modal 1회 → 승인 → 캐시.
+- 신규 빌드 첫 실행 → 첫 connect에서 cache miss → modal 표시.
+- 사용자가 (예전에 공식 앱에서) 이미 카메라에 인증한 상태 → modal 직후 `requestPhoneAuthorization`이 `.Authorized`를 받아 캐시 작성 후 자동 진행.
+- 인증 안 된 사용자 → modal → Action Pod 승인 → notification success → 캐시.
 
 **모든 기존 사용자가 첫 사용 시 자연스럽게 마이그레이션**된다 — 별도 onboarding 화면 불필요.
 

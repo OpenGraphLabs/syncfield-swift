@@ -5,6 +5,120 @@ import SyncField
 @preconcurrency import INSCameraServiceSDK
 #endif
 
+#if canImport(INSCameraServiceSDK)
+private final class Insta360PhoneAuthorizationResultObserver: @unchecked Sendable {
+    private let lock = NSLock()
+    private var observer: NSObjectProtocol?
+    private var timeoutTask: Task<Void, Never>?
+    private var continuation: UnsafeContinuation<UInt, Error>?
+    private var completion: Result<UInt, Error>?
+
+    init() {
+        observer = NotificationCenter.default.addObserver(
+            forName: NSNotification.Name.INSCameraAuthorizationResult,
+            object: nil,
+            queue: nil
+        ) { [weak self] note in
+            guard let raw = Self.rawAuthorizationResult(from: note) else { return }
+            self?.complete(.success(raw))
+        }
+    }
+
+    deinit {
+        if let observer {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        timeoutTask?.cancel()
+    }
+
+    func wait(timeoutSeconds: TimeInterval) async throws -> UInt {
+        try await withTaskCancellationHandler {
+            try await withUnsafeThrowingContinuation {
+                (cont: UnsafeContinuation<UInt, Error>) in
+                var immediate: Result<UInt, Error>?
+                lock.lock()
+                if let completion {
+                    immediate = completion
+                } else {
+                    continuation = cont
+                    timeoutTask = Task.detached { [weak self] in
+                        let ns = UInt64(max(0, timeoutSeconds) * 1_000_000_000)
+                        try? await Task.sleep(nanoseconds: ns)
+                        if Task.isCancelled { return }
+                        self?.complete(.failure(Insta360Error.phoneAuthorizationTimedOut))
+                    }
+                }
+                lock.unlock()
+
+                if let immediate {
+                    Self.resume(cont, with: immediate)
+                }
+            }
+        } onCancel: {
+            complete(.failure(CancellationError()))
+        }
+    }
+
+    func cancel() {
+        complete(.failure(Insta360Error.phoneAuthorizationCanceled))
+    }
+
+    private func complete(_ result: Result<UInt, Error>) {
+        var cont: UnsafeContinuation<UInt, Error>?
+        var observerToRemove: NSObjectProtocol?
+        var taskToCancel: Task<Void, Never>?
+
+        lock.lock()
+        if completion != nil {
+            lock.unlock()
+            return
+        }
+        completion = result
+        cont = continuation
+        continuation = nil
+        observerToRemove = observer
+        observer = nil
+        taskToCancel = timeoutTask
+        timeoutTask = nil
+        lock.unlock()
+
+        if let observerToRemove {
+            NotificationCenter.default.removeObserver(observerToRemove)
+        }
+        taskToCancel?.cancel()
+        if let cont {
+            Self.resume(cont, with: result)
+        }
+    }
+
+    private static func resume(
+        _ continuation: UnsafeContinuation<UInt, Error>,
+        with result: Result<UInt, Error>
+    ) {
+        switch result {
+        case .success(let raw):
+            continuation.resume(returning: raw)
+        case .failure(let error):
+            continuation.resume(throwing: error)
+        }
+    }
+
+    private static func rawAuthorizationResult(from note: Notification) -> UInt? {
+        guard let raw = note.userInfo?["result"] else { return nil }
+        if let value = raw as? NSNumber {
+            return value.uintValue
+        }
+        if let value = raw as? UInt {
+            return value
+        }
+        if let value = raw as? Int {
+            return UInt(value)
+        }
+        return nil
+    }
+}
+#endif
+
 private final class Insta360TimeoutResumeGate<T>: @unchecked Sendable {
     private let lock = NSLock()
     private var didResume = false
@@ -149,6 +263,7 @@ internal enum Insta360CommandReadinessPolicy {
         let normalized = reason.lowercased()
         if normalized.contains("wificredentials")
             || normalized.contains("enablewififordownload")
+            || normalized.contains("phoneauthorization")
             || normalized.contains("refreshconnection")
             || normalized.contains("startremoterecording")
             || normalized.contains("stopremoterecording") {
@@ -246,6 +361,9 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
     private var lastCommandReadyUptimeNs: UInt64 = 0
     private var lastCommandReadyProbe: Insta360CommandReadinessProbe?
     private let commandGate = Insta360SDKCommandGate()
+    private let phoneAuthorizationLock = NSLock()
+    private var phoneAuthorizationCancelRequested = false
+    private var phoneAuthorizationResultObserver: Insta360PhoneAuthorizationResultObserver?
 
     private static let pairRegistryLock = NSLock()
     private static var pairedUUIDs = Set<String>()
@@ -455,6 +573,10 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
 
     internal func wake(serialLast6 serial: String, window: TimeInterval = 1.5) async {
         await Self.wake(serialLast6: serial, window: window)
+    }
+
+    public static func phoneAuthorizationDeviceId() -> String {
+        INSConnectionUtils.authorizationId()
     }
 
     @discardableResult
@@ -1248,6 +1370,119 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
         }
     }
 
+    internal func performPhoneAuthorization(
+        deviceId: String,
+        timeoutSeconds: TimeInterval,
+        onCameraPromptStarted: (@Sendable () -> Void)? = nil
+    ) async throws -> Insta360PhoneAuthorizationProbeResult {
+        try Task.checkCancellation()
+        return try await withControllerCommandGate(label: "phoneAuthorization") {
+            self.setPhoneAuthorizationCancelRequested(false)
+            defer { self.setPhoneAuthorizationCancelRequested(false) }
+
+            try await self.ensureCommandReady(
+                reason: "phoneAuthorization",
+                maxCachedAgeSeconds: 0)
+            let cmd = try self.commandManager()
+            let notificationObserver = Insta360PhoneAuthorizationResultObserver()
+            self.setPhoneAuthorizationResultObserver(notificationObserver)
+            defer { self.setPhoneAuthorizationResultObserver(nil) }
+            do {
+                let commandTimeoutSeconds = min(max(timeoutSeconds, 1), 10)
+                let stateRaw: UInt = try await self.withTimeout(seconds: commandTimeoutSeconds) {
+                    try await withUnsafeThrowingContinuation {
+                        (cont: UnsafeContinuation<UInt, Error>) in
+                        let options: INSCameraRequestOptions? = nil
+                        let initiator = INSCheckAuthorizationInitiatorType(rawValue: 1)!
+                        cmd.checkPhoneAuthorization(
+                            with: options,
+                            initiatorType: initiator,
+                            deviceId: deviceId
+                        ) { error, status in
+                            if let error {
+                                cont.resume(throwing: Insta360Error.commandFailed(error.localizedDescription))
+                                return
+                            }
+                            guard let status else {
+                                cont.resume(throwing: Insta360Error.commandFailed(
+                                    "phone authorization returned nil status"))
+                                return
+                            }
+                            cont.resume(returning: UInt(status.state.rawValue))
+                        }
+                    }
+                }
+                if self.isPhoneAuthorizationCancelRequested() {
+                    notificationObserver.cancel()
+                    throw Insta360Error.phoneAuthorizationCanceled
+                }
+
+                switch insta360PhoneAuthorizationInitialAction(rawState: stateRaw) {
+                case .authorized:
+                    notificationObserver.cancel()
+                    NSLog("[Insta360BLE.phoneAuth] already authorized")
+                    return .authorized
+                case .waitForUserDecision:
+                    NSLog("[Insta360BLE.phoneAuth] waiting for camera user decision")
+                    onCameraPromptStarted?()
+                    let resultRaw = try await notificationObserver.wait(
+                        timeoutSeconds: timeoutSeconds)
+                    let userResult = insta360PhoneAuthorizationUserResult(
+                        rawResult: resultRaw)
+                    NSLog("[Insta360BLE.phoneAuth] user result raw=\(resultRaw) mapped=\(userResult)")
+                    switch userResult {
+                    case .success:
+                        return .authorized
+                    case .reject:
+                        return .unauthorized
+                    case .timeout:
+                        throw Insta360Error.phoneAuthorizationTimedOut
+                    case .systemBusy:
+                        return .systemBusy
+                    case .unknown:
+                        throw Insta360Error.commandFailed(
+                            "unknown phone authorization result \(resultRaw)")
+                    }
+                case .fail(let result):
+                    notificationObserver.cancel()
+                    NSLog("[Insta360BLE.phoneAuth] immediate failure state=\(result)")
+                    return result
+                }
+            } catch {
+                if self.isPhoneAuthorizationCancelRequested() {
+                    notificationObserver.cancel()
+                    throw Insta360Error.phoneAuthorizationCanceled
+                }
+                if Self.isTimeoutError(error) {
+                    notificationObserver.cancel()
+                    await Self.cancelCheckPhoneAuthorization(on: cmd)
+                    throw Insta360Error.phoneAuthorizationTimedOut
+                }
+                notificationObserver.cancel()
+                throw error
+            }
+        }
+    }
+
+    internal func cancelPendingPhoneAuthorization() async {
+        setPhoneAuthorizationCancelRequested(true)
+        currentPhoneAuthorizationResultObserver()?.cancel()
+        guard let cmd = try? commandManager() else { return }
+        await Self.cancelCheckPhoneAuthorization(on: cmd)
+    }
+
+    private static func cancelCheckPhoneAuthorization(on cmd: INSCameraBasicCommands) async {
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            let options: INSCameraRequestOptions? = nil
+            cmd.cancelCheckPhoneAuthorization(with: options) { error in
+                if let error {
+                    NSLog("[Insta360BLE] cancel phone authorization failed: \(error.localizedDescription)")
+                }
+                cont.resume()
+            }
+        }
+    }
+
     /// Best-effort stop warmup that does not acquire the command gate.
     ///
     /// The actual stop path still performs `ensureCommandReady` and confirms
@@ -1548,6 +1783,47 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
             throw Insta360Error.commandFailed("BLE command manager unavailable for \(Self.displayName(for: device))")
         }
         return cmd
+    }
+
+    private func setPhoneAuthorizationCancelRequested(_ value: Bool) {
+        phoneAuthorizationLock.lock()
+        phoneAuthorizationCancelRequested = value
+        phoneAuthorizationLock.unlock()
+    }
+
+    private func isPhoneAuthorizationCancelRequested() -> Bool {
+        phoneAuthorizationLock.lock()
+        let value = phoneAuthorizationCancelRequested
+        phoneAuthorizationLock.unlock()
+        return value
+    }
+
+    private func setPhoneAuthorizationResultObserver(
+        _ observer: Insta360PhoneAuthorizationResultObserver?
+    ) {
+        phoneAuthorizationLock.lock()
+        phoneAuthorizationResultObserver = observer
+        phoneAuthorizationLock.unlock()
+    }
+
+    private func currentPhoneAuthorizationResultObserver()
+        -> Insta360PhoneAuthorizationResultObserver? {
+        phoneAuthorizationLock.lock()
+        let observer = phoneAuthorizationResultObserver
+        phoneAuthorizationLock.unlock()
+        return observer
+    }
+
+    private static func isTimeoutError(_ error: Error) -> Bool {
+        if case Insta360Error.phoneAuthorizationTimedOut = error {
+            return true
+        }
+        if case Insta360Error.commandFailed(let detail) = error {
+            return detail.localizedCaseInsensitiveContains("timed out")
+                || detail.localizedCaseInsensitiveContains("timeout")
+        }
+        return error.localizedDescription.localizedCaseInsensitiveContains("timed out")
+            || error.localizedDescription.localizedCaseInsensitiveContains("timeout")
     }
 
     /// Best-effort BLE reconnect using the cached identity. Called as a
@@ -1991,6 +2267,10 @@ public final class Insta360BLEController: @unchecked Sendable {
 
     internal func wake(serialLast6 _: String, window _: TimeInterval = 1.5) async {}
 
+    public static func phoneAuthorizationDeviceId() -> String {
+        "INSCameraServiceSDK-not-linked"
+    }
+
     public func pair(excludingUUIDs _: Set<String> = []) async throws {
         throw Insta360Error.frameworkNotLinked
     }
@@ -2018,6 +2298,16 @@ public final class Insta360BLEController: @unchecked Sendable {
     public func refreshConnection() async throws {
         throw Insta360Error.frameworkNotLinked
     }
+
+    internal func performPhoneAuthorization(
+        deviceId _: String,
+        timeoutSeconds _: TimeInterval,
+        onCameraPromptStarted _: (@Sendable () -> Void)? = nil
+    ) async throws -> Insta360PhoneAuthorizationProbeResult {
+        throw Insta360Error.frameworkNotLinked
+    }
+
+    internal func cancelPendingPhoneAuthorization() async {}
 
     public static func withTimeout<T: Sendable>(
         seconds: TimeInterval,

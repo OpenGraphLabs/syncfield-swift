@@ -120,6 +120,52 @@ public final class Insta360CameraStream: SyncFieldStream, SyncFieldRecordingPref
         #endif
     }
 
+    public var phoneAuthorizationStatus: PhoneAuthorizationCacheState {
+        #if canImport(INSCameraServiceSDK)
+        return Insta360IdentityStore.cachedPhoneAuthorizationState(
+            uuid: ble.lastKnownDeviceUUID ?? ble.connectedDeviceUUID ?? boundUUID,
+            bleName: ble.lastKnownDeviceName ?? ble.connectedDeviceName ?? preferredBLEName)
+        #else
+        return .unknown
+        #endif
+    }
+
+    public func requestPhoneAuthorization(
+        timeoutSeconds: TimeInterval = 30,
+        onCameraPromptStarted: (@Sendable () -> Void)? = nil
+    ) async throws {
+        #if canImport(INSCameraServiceSDK)
+        let identity = await phoneAuthorizationIdentity()
+        let deviceId = Insta360BLEController.phoneAuthorizationDeviceId()
+        do {
+            let result = try await ble.performPhoneAuthorization(
+                deviceId: deviceId,
+                timeoutSeconds: timeoutSeconds,
+                onCameraPromptStarted: onCameraPromptStarted)
+            try await handleExplicitPhoneAuthorizationResult(
+                result,
+                identity: identity,
+                deviceId: deviceId)
+        } catch Insta360Error.phoneAuthorizationTimedOut {
+            if let serial = identity.serialLast6 {
+                await Insta360IdentityStore.shared.clearPhoneAuthorization(
+                    serialLast6: serial)
+            }
+            throw Insta360Error.phoneAuthorizationTimedOut
+        } catch {
+            throw error
+        }
+        #else
+        throw Insta360Error.frameworkNotLinked
+        #endif
+    }
+
+    public func cancelPhoneAuthorization() async {
+        #if canImport(INSCameraServiceSDK)
+        await ble.cancelPendingPhoneAuthorization()
+        #endif
+    }
+
     public func connect(context: StreamConnectContext) async throws {
         self.healthBus = context.healthBus
         #if canImport(INSCameraServiceSDK)
@@ -133,10 +179,11 @@ public final class Insta360CameraStream: SyncFieldStream, SyncFieldRecordingPref
         if bindingKey != nil {
             ble = try await Insta360Scanner.shared.bindController(
                 identity: Insta360KnownCameraIdentity(
-                    uuid: boundUUID,
-                    bleName: preferredBLEName))
+                uuid: boundUUID,
+                bleName: preferredBLEName))
             wireWarningChannel()
             do {
+                try await ensurePhoneAuthorization()
                 await ble.syncCameraClock()
                 self.cachedCreds = try await ble.wifiCredentials()
                 await healthBus?.publish(.streamConnected(streamId: streamId))
@@ -151,6 +198,7 @@ public final class Insta360CameraStream: SyncFieldStream, SyncFieldRecordingPref
         }
         wireWarningChannel()
         try await ble.pair(excludingUUIDs: [])
+        try await ensurePhoneAuthorization()
         await ble.syncCameraClock()
         self.cachedCreds = try await ble.wifiCredentials()
         await healthBus?.publish(.streamConnected(streamId: streamId))
@@ -192,6 +240,7 @@ public final class Insta360CameraStream: SyncFieldStream, SyncFieldRecordingPref
                     uuid: boundUUID,
                     bleName: preferredBLEName))
             do {
+                try await ensurePhoneAuthorization()
                 await ble.syncCameraClock()
                 self.cachedCreds = try await ble.wifiCredentials()
             } catch {
@@ -203,6 +252,7 @@ public final class Insta360CameraStream: SyncFieldStream, SyncFieldRecordingPref
             }
         } else {
             try await ble.pair(excludingUUIDs: excludingUUIDs)
+            try await ensurePhoneAuthorization()
             await ble.syncCameraClock()
             self.cachedCreds = try await ble.wifiCredentials()
         }
@@ -242,6 +292,7 @@ public final class Insta360CameraStream: SyncFieldStream, SyncFieldRecordingPref
         self.onCameraWarning = onCameraWarning
         wireWarningChannel()
         try await ble.adoptVerifiedActionCamDevice(bt)
+        try await ensurePhoneAuthorization()
         await ble.syncCameraClock()
         self.cachedCreds = try await ble.wifiCredentials()
         onHealthEvent(.streamConnected(streamId: streamId))
@@ -268,7 +319,94 @@ public final class Insta360CameraStream: SyncFieldStream, SyncFieldRecordingPref
             }
         }
     }
+
+    private struct PhoneAuthorizationIdentity: Sendable {
+        let uuid: String
+        let serialLast6: String?
+    }
+
+    private func phoneAuthorizationIdentity() async -> PhoneAuthorizationIdentity {
+        let uuid = ble.lastKnownDeviceUUID
+            ?? ble.connectedDeviceUUID
+            ?? boundUUID
+            ?? ""
+        let name = ble.lastKnownDeviceName
+            ?? ble.connectedDeviceName
+            ?? preferredBLEName
+        var serial = name.flatMap(Insta360BLEController.extractSerialLast6(fromBLEName:))
+        if serial == nil, !uuid.isEmpty {
+            serial = await Insta360IdentityStore.shared.record(forUUID: uuid)?.serialLast6
+        }
+        return PhoneAuthorizationIdentity(uuid: uuid, serialLast6: serial)
+    }
+
+    private func ensurePhoneAuthorization() async throws {
+        let identity = await phoneAuthorizationIdentity()
+        let isCachedAuthorized: Bool
+        if let serial = identity.serialLast6 {
+            isCachedAuthorized = await Insta360IdentityStore.shared
+                .isPhoneAuthorized(serialLast6: serial)
+        } else {
+            isCachedAuthorized = false
+        }
+        guard Self.shouldRequestExplicitPhoneAuthorization(
+            serialLast6: identity.serialLast6,
+            isCachedAuthorized: isCachedAuthorized)
+        else {
+            return
+        }
+
+        let deviceId = Insta360BLEController.phoneAuthorizationDeviceId()
+        throw Insta360Error.phoneAuthorizationRequired(
+            uuid: identity.uuid,
+            deviceId: deviceId)
+    }
+
+    private func handleExplicitPhoneAuthorizationResult(
+        _ result: Insta360PhoneAuthorizationProbeResult,
+        identity: PhoneAuthorizationIdentity,
+        deviceId _: String
+    ) async throws {
+        guard let serial = identity.serialLast6 else {
+            throw Insta360Error.commandFailed(
+                "phone authorization cannot resolve camera serial")
+        }
+
+        switch result {
+        case .authorized:
+            await Insta360IdentityStore.shared.markPhoneAuthorized(
+                serialLast6: serial)
+        case .unauthorized:
+            await Insta360IdentityStore.shared.clearPhoneAuthorization(
+                serialLast6: serial)
+            throw Insta360Error.phoneAuthorizationRejected
+        case .systemBusy:
+            await Insta360IdentityStore.shared.clearPhoneAuthorization(
+                serialLast6: serial)
+            throw Insta360Error.phoneAuthorizationSystemBusy
+        case .connectedByOtherPhone:
+            await Insta360IdentityStore.shared.clearPhoneAuthorization(
+                serialLast6: serial)
+            throw Insta360Error.phoneAuthorizationConnectedByOtherDevice("phone")
+        case .connectedByOtherWatch:
+            await Insta360IdentityStore.shared.clearPhoneAuthorization(
+                serialLast6: serial)
+            throw Insta360Error.phoneAuthorizationConnectedByOtherDevice("watch")
+        case .connectedByOtherCyclocomputer:
+            await Insta360IdentityStore.shared.clearPhoneAuthorization(
+                serialLast6: serial)
+            throw Insta360Error.phoneAuthorizationConnectedByOtherDevice("cyclocomputer")
+        }
+    }
     #endif
+
+    internal static func shouldRequestExplicitPhoneAuthorization(
+        serialLast6: String?,
+        isCachedAuthorized: Bool
+    ) -> Bool {
+        guard serialLast6 != nil else { return false }
+        return !isCachedAuthorized
+    }
 
     /// UUID of the currently-paired camera. `nil` before pairing or after
     /// disconnect. Bridge reads this to append to its claimed-UUID set.

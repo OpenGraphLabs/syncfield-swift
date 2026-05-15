@@ -66,6 +66,14 @@ public enum Insta360Error: Error, CustomStringConvertible, LocalizedError {
     // Camera-side transcode errors (fast-collect path)
     case transcodeFailed(String)
 
+    // GO 3S phone-level authorization errors
+    case phoneAuthorizationRequired(uuid: String, deviceId: String)
+    case phoneAuthorizationRejected
+    case phoneAuthorizationTimedOut
+    case phoneAuthorizationCanceled
+    case phoneAuthorizationSystemBusy
+    case phoneAuthorizationConnectedByOtherDevice(String)
+
     public var description: String {
         switch self {
         case .frameworkNotLinked:
@@ -114,6 +122,18 @@ public enum Insta360Error: Error, CustomStringConvertible, LocalizedError {
             return "Insta360Error: collect timeout for \(streamId)"
         case .transcodeFailed(let detail):
             return "Insta360Error: camera-side transcode failed (\(detail))"
+        case .phoneAuthorizationRequired(let uuid, let deviceId):
+            return "Insta360Error: phone authorization required for \(uuid) (deviceId: \(deviceId))"
+        case .phoneAuthorizationRejected:
+            return "Insta360Error: phone authorization rejected on camera"
+        case .phoneAuthorizationTimedOut:
+            return "Insta360Error: phone authorization timed out"
+        case .phoneAuthorizationCanceled:
+            return "Insta360Error: phone authorization canceled"
+        case .phoneAuthorizationSystemBusy:
+            return "Insta360Error: camera is busy during phone authorization"
+        case .phoneAuthorizationConnectedByOtherDevice(let detail):
+            return "Insta360Error: camera is connected by another device (\(detail))"
         }
     }
 
