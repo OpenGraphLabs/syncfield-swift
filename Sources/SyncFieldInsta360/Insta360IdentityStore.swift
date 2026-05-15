@@ -15,6 +15,26 @@ internal actor Insta360IdentityStore {
         var lastKnownBLEName: String
         var firstPairedAt: Date
         var lastSeenAt: Date
+        var phoneAuthorizedAt: Date?
+        var phoneAuthorizationFailedAt: Date?
+
+        init(
+            serialLast6: String,
+            lastKnownUUID: String?,
+            lastKnownBLEName: String,
+            firstPairedAt: Date,
+            lastSeenAt: Date,
+            phoneAuthorizedAt: Date? = nil,
+            phoneAuthorizationFailedAt: Date? = nil
+        ) {
+            self.serialLast6 = serialLast6
+            self.lastKnownUUID = lastKnownUUID
+            self.lastKnownBLEName = lastKnownBLEName
+            self.firstPairedAt = firstPairedAt
+            self.lastSeenAt = lastSeenAt
+            self.phoneAuthorizedAt = phoneAuthorizedAt
+            self.phoneAuthorizationFailedAt = phoneAuthorizationFailedAt
+        }
     }
 
     private let recordsURL: URL
@@ -100,6 +120,28 @@ internal actor Insta360IdentityStore {
         saveToDisk()
     }
 
+    internal func markPhoneAuthorized(serialLast6: String, at: Date = Date()) {
+        guard var record = records[serialLast6] else { return }
+        record.phoneAuthorizedAt = at
+        record.phoneAuthorizationFailedAt = nil
+        record.lastSeenAt = at
+        records[serialLast6] = record
+        saveToDisk()
+    }
+
+    internal func clearPhoneAuthorization(serialLast6: String, at: Date = Date()) {
+        guard var record = records[serialLast6] else { return }
+        record.phoneAuthorizedAt = nil
+        record.phoneAuthorizationFailedAt = at
+        record.lastSeenAt = at
+        records[serialLast6] = record
+        saveToDisk()
+    }
+
+    internal func isPhoneAuthorized(serialLast6: String) -> Bool {
+        records[serialLast6]?.phoneAuthorizedAt != nil
+    }
+
     internal func wifiCreds(forSerial serial: String) -> (ssid: String, passphrase: String)? {
         KeychainHelper.read(
             service: keychainService,
@@ -122,6 +164,50 @@ internal actor Insta360IdentityStore {
         KeychainHelper.delete(
             service: keychainService,
             account: "wifi.\(serial)")
+    }
+
+    internal static func cachedPhoneAuthorizationState(
+        uuid: String?,
+        bleName: String?,
+        directory: URL? = nil
+    ) -> PhoneAuthorizationCacheState {
+        let records = loadRecords(from: recordsURL(directory: directory))
+        let serial = bleName.flatMap(Insta360BLEController.extractSerialLast6(fromBLEName:))
+        let record: Record? = {
+            if let serial, let match = records[serial] {
+                return match
+            }
+            if let uuid, let match = records.values.first(where: { $0.lastKnownUUID == uuid }) {
+                return match
+            }
+            if let serial {
+                return records.values.first { $0.serialLast6 == serial }
+            }
+            return nil
+        }()
+
+        guard let record else { return .unknown }
+        if let authorizedAt = record.phoneAuthorizedAt {
+            return .authorized(at: authorizedAt)
+        }
+        if record.phoneAuthorizationFailedAt != nil {
+            return .failed
+        }
+        return .unknown
+    }
+
+    private static func defaultDirectory() -> URL {
+        let appSupport = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first ?? FileManager.default.temporaryDirectory
+        return appSupport.appendingPathComponent(
+            "SyncFieldInsta360",
+            isDirectory: true)
+    }
+
+    private static func recordsURL(directory: URL?) -> URL {
+        (directory ?? defaultDirectory()).appendingPathComponent("identities.json")
     }
 
     private static func loadRecords(from url: URL) -> [String: Record] {

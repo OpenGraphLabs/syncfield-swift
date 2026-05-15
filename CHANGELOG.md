@@ -2,6 +2,24 @@
 
 All notable changes to **syncfield-swift** are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.6] — 2026-05-15
+
+Phone authorization support for Insta360 GO 3S pair/reconnect flows. Source-compatible with 0.9.x.
+
+### Added
+- **`Insta360CameraStream.requestPhoneAuthorization(timeoutSeconds:onCameraPromptStarted:)` and `cancelPhoneAuthorization()`** expose the GO 3S BLE phone-authorization handshake needed when the camera asks the user to approve a new phone/controller device.
+- **`Insta360BLEController.phoneAuthorizationDeviceId()`** returns the SDK-generated authorization device id that host apps should surface with `PHONE_AUTH_REQUIRED` failures.
+- **`PhoneAuthorizationCacheState` and `phoneAuthorizationStatus`** let hosts distinguish unknown, authorized, and failed authorization cache states per remembered GO 3S identity.
+- **Persistent phone-authorization cache metadata** in `Insta360IdentityStore` records successful authorization by the camera's stable serial suffix and survives Bluetooth UUID rotation.
+
+### Changed
+- GO 3S connect, standalone pair, and adopt flows now fail fast with `phoneAuthorizationRequired(uuid:deviceId:)` on phone-authorization cache miss, so the host can present an explicit modal before any camera-side approval UI is triggered.
+- GO 3S phone authorization now treats the initial SDK `.unauthorized` status as "waiting for camera user decision" and waits for `INSCameraAuthorizationResultNotification` before resolving success, reject, timeout, or system-busy outcomes.
+- `SyncFieldVersion.current` bumped to `0.9.6`.
+
+### Fixed
+- Unauthorized GO 3S cameras no longer continue into clock sync / Wi-Fi credential reads where the command channel would fail later with ambiguous SDK errors.
+
 ## [0.9.5] — 2026-05-14
 
 Patch release that stabilizes Go 3S BLE pair/reconnect for dual-wrist setups. Source-compatible with 0.9.x.
