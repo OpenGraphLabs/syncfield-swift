@@ -173,6 +173,23 @@ final class Insta360CollectorTests: XCTestCase {
         XCTAssertEqual(Set(items.map { $0.sidecar.streamId }), ["cam_wrist_left", "cam_wrist_right"])
     }
 
+    func test_itemsForEpisodeDirs_skipsPendingWhenCanonicalMp4Exists() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("collector_existing_\(UUID().uuidString)")
+        let ep = root.appendingPathComponent("ep_A")
+        try FileManager.default.createDirectory(at: ep, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        try writeSidecar(to: ep, streamId: "cam_wrist_right", bleUuid: "U_RIGHT")
+        FileManager.default.createFile(
+            atPath: ep.appendingPathComponent("cam_wrist_right.mp4").path,
+            contents: Data([0x01, 0x02]))
+
+        let items = try Insta360Collector.itemsForEpisodeDirs([ep])
+
+        XCTAssertTrue(items.isEmpty)
+    }
+
     private func writeSidecar(to episodeDir: URL,
                               streamId: String,
                               bleUuid: String) throws {

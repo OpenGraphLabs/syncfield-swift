@@ -26,19 +26,25 @@ import INSCameraServiceSDK
 public actor Insta360Collector {
     public static let shared = Insta360Collector()
     private init() {}
+    private var activeListFilesTasks: [String: Task<[Insta360FileInfo], Error>] = [:]
 
-    /// Per-file progress event. `fraction` is 0.0 – 1.0.
+    /// Per-file progress event. `fraction` is 0.0 - 1.0 when `phase` is
+    /// `downloading`. Non-download phases let clients render the BLE/Wi-Fi
+    /// setup work that happens before bytes start moving.
     public struct Progress: Sendable {
         public let episodeDir: URL
         public let streamId: String
         public let bleUuid: String
+        public let phase: String
         public let fraction: Double
 
         public init(episodeDir: URL, streamId: String,
-                    bleUuid: String, fraction: Double) {
+                    bleUuid: String, phase: String = "downloading",
+                    fraction: Double) {
             self.episodeDir = episodeDir
             self.streamId = streamId
             self.bleUuid = bleUuid
+            self.phase = phase
             self.fraction = fraction
         }
     }
@@ -76,11 +82,8 @@ public actor Insta360Collector {
         _ episodeDir: URL,
         progress: @escaping @Sendable (Progress) -> Void = { _ in }
     ) async throws -> [Result] {
-        let pendings = try Insta360PendingSidecar.scan(episodeDir)
-        guard !pendings.isEmpty else { return [] }
-        let items = pendings.map {
-            Insta360PendingSidecar.WithDir(episodeDir: episodeDir, sidecar: $0)
-        }
+        let items = try Self.itemsForEpisodeDirs([episodeDir])
+        guard !items.isEmpty else { return [] }
         return try await runCollect(items: items, progress: progress)
     }
 
@@ -110,6 +113,141 @@ public actor Insta360Collector {
         guard !items.isEmpty else { return [] }
         return try await runCollect(items: items, progress: progress)
     }
+
+    public func listFiles(
+        uuid: String,
+        preferredName: String? = nil,
+        thumbnailReferenceDate: Date? = nil
+    ) async throws -> [Insta360FileInfo] {
+        let key = uuid.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let active = activeListFilesTasks[key] {
+            NSLog("[Insta360Collector] joining active listFiles uuid=\(key)")
+            return try await active.value
+        }
+
+        let task = Task { [key, preferredName, thumbnailReferenceDate] in
+            try await Self.performListFiles(
+                uuid: key,
+                preferredName: preferredName,
+                thumbnailReferenceDate: thumbnailReferenceDate)
+        }
+        activeListFilesTasks[key] = task
+        defer { activeListFilesTasks[key] = nil }
+        return try await task.value
+    }
+
+    private static func performListFiles(
+        uuid: String,
+        preferredName: String? = nil,
+        thumbnailReferenceDate: Date? = nil
+    ) async throws -> [Insta360FileInfo] {
+        #if canImport(INSCameraServiceSDK)
+        try await Insta360Scanner.shared.pair(
+            uuid: uuid,
+            preferredName: preferredName)
+        defer {
+            Task {
+                try? await Insta360Scanner.shared.unpair(uuid: uuid)
+            }
+        }
+        let ble = try await Insta360Scanner.shared.controller(forUUID: uuid)
+        try? await ble.enableWiFiForDownload()
+        let creds = try await ble.wifiCredentials()
+        let downloader = Insta360WiFiDownloader()
+        return try await downloader.listFiles(
+            ssid: creds.ssid,
+            passphrase: creds.passphrase,
+            thumbnailReferenceDate: thumbnailReferenceDate,
+            includeThumbnails: false,
+            beforeRestore: { files in
+                await enrichMissingThumbnailsWithBLE(
+                    files,
+                    ble: ble,
+                    referenceDate: thumbnailReferenceDate)
+            })
+        #else
+        throw Insta360Error.frameworkNotLinked
+        #endif
+    }
+
+    #if canImport(INSCameraServiceSDK)
+    private static func enrichMissingThumbnailsWithBLE(
+        _ files: [Insta360FileInfo],
+        ble: Insta360BLEController,
+        referenceDate: Date?,
+        limit: Int = 8
+    ) async -> [Insta360FileInfo] {
+        guard !files.isEmpty else { return files }
+
+        var output = files
+        let requestedIndices = thumbnailCandidateIndices(
+            in: files,
+            referenceDate: referenceDate,
+            limit: limit)
+        var successCount = 0
+        var failureCount = 0
+        var consecutiveFailureCount = 0
+
+        for index in requestedIndices {
+            if Task.isCancelled { break }
+            let file = output[index]
+            guard file.thumbnailUri == nil else { continue }
+
+            do {
+                let thumbnailUri = try await ble.miniThumbnailURI(for: file.fileUri)
+                output[index] = Insta360FileInfo(
+                    fileUri: file.fileUri,
+                    createdAtIso: file.createdAtIso,
+                    durationSec: file.durationSec,
+                    sizeBytes: file.sizeBytes,
+                    thumbnailUri: thumbnailUri)
+                successCount += 1
+                consecutiveFailureCount = 0
+            } catch {
+                failureCount += 1
+                consecutiveFailureCount += 1
+                if failureCount <= 3 {
+                    NSLog("[Insta360Collector] BLE mini thumbnail failed uri=\(file.fileUri): \(error.localizedDescription)")
+                }
+                if consecutiveFailureCount >= 3 {
+                    NSLog("[Insta360Collector] BLE mini thumbnails stopped after \(consecutiveFailureCount) consecutive failures")
+                    break
+                }
+            }
+        }
+
+        if successCount > 0 || failureCount > 0 {
+            NSLog("[Insta360Collector] BLE mini thumbnails enriched success=\(successCount) failed=\(failureCount) requested=\(requestedIndices.count)")
+        }
+        return output
+    }
+
+    private static func thumbnailCandidateIndices(
+        in files: [Insta360FileInfo],
+        referenceDate: Date?,
+        limit: Int
+    ) -> [Int] {
+        let capped = min(limit, files.count)
+        guard let referenceDate else {
+            return Array(0..<capped)
+        }
+
+        let iso = ISO8601DateFormatter()
+        return files.enumerated()
+            .sorted { lhs, rhs in
+                let lhsDate = iso.date(from: lhs.element.createdAtIso)
+                let rhsDate = iso.date(from: rhs.element.createdAtIso)
+                let lhsDelta = lhsDate.map { abs($0.timeIntervalSince(referenceDate)) }
+                    ?? Double.greatestFiniteMagnitude
+                let rhsDelta = rhsDate.map { abs($0.timeIntervalSince(referenceDate)) }
+                    ?? Double.greatestFiniteMagnitude
+                if lhsDelta != rhsDelta { return lhsDelta < rhsDelta }
+                return lhs.offset < rhs.offset
+            }
+            .prefix(capped)
+            .map(\.offset)
+    }
+    #endif
 
     // MARK: - Pure helper (unit-tested)
 
@@ -193,6 +331,21 @@ public actor Insta360Collector {
         try Task.checkCancellation()
         let groups = Self.groupByCamera(items)
 
+        func emitGroupPhase(
+            _ group: (uuid: String, items: [Insta360PendingSidecar.WithDir]),
+            phase: String,
+            fraction: Double = 0
+        ) {
+            for item in group.items {
+                progress(Progress(
+                    episodeDir: item.episodeDir,
+                    streamId: item.sidecar.streamId,
+                    bleUuid: group.uuid,
+                    phase: phase,
+                    fraction: fraction))
+            }
+        }
+
         // Cameras are collected sequentially because iOS can join only one
         // camera Wi-Fi AP at a time. Prefetch every target BLE pairing first
         // so the existing per-controller heartbeat keeps waiting cameras
@@ -209,6 +362,9 @@ public actor Insta360Collector {
             }
         }
 
+        for group in groups {
+            emitGroupPhase(group, phase: "scanning")
+        }
         let prefetch = await Self.prefetchPairCameras(groups) { uuid, preferredName in
             try await Insta360Scanner.shared.pair(
                 uuid: uuid,
@@ -226,6 +382,7 @@ public actor Insta360Collector {
         for (uuid, group) in groups {
             try Task.checkCancellation()
             do {
+                emitGroupPhase((uuid, group), phase: "pairing")
                 try await Insta360Scanner.shared.pair(
                     uuid: uuid,
                     preferredName: group.first?.sidecar.bleName)
@@ -246,17 +403,26 @@ public actor Insta360Collector {
                         sidecar: item.sidecar)
                 }
 
+                emitGroupPhase((uuid, group), phase: "joiningWifi")
                 let downloader = Insta360WiFiDownloader()
                 let batchResults = await downloader.downloadBatch(
                     ssid: creds.ssid,
                     passphrase: creds.passphrase,
                     items: batchItems,
-                    onItemStart: { _ in },
+                    onItemStart: { batchItem in
+                        progress(Progress(
+                            episodeDir: batchItem.episodeDir,
+                            streamId: batchItem.streamId,
+                            bleUuid: uuid,
+                            phase: "downloading",
+                            fraction: 0))
+                    },
                     progress: { batchItem, fraction in
                         progress(Progress(
                             episodeDir: batchItem.episodeDir,
                             streamId: batchItem.streamId,
                             bleUuid: uuid,
+                            phase: "downloading",
                             fraction: fraction))
                     })
                 try Task.checkCancellation()
@@ -305,6 +471,9 @@ public actor Insta360Collector {
         // Best-effort final camera-hotspot config cleanup. Do not sweep all
         // app-managed SSIDs here: upload Wi-Fi configs may also have been
         // installed through NEHotspotConfiguration and must survive collect.
+        for group in groups {
+            emitGroupPhase(group, phase: "restoringWiFi", fraction: 1)
+        }
         let finalDownloader = Insta360WiFiDownloader()
         await finalDownloader.finalizeWiFiRestore()
         await finalDownloader.removeCameraHotspotConfigurations()

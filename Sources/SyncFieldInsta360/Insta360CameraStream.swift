@@ -426,6 +426,20 @@ public final class Insta360CameraStream: SyncFieldStream, SyncFieldRecordingPref
         #if canImport(INSCameraServiceSDK)
         self.currentEpisodeDirectory = writerFactory.videoURL(streamId: streamId).deletingLastPathComponent()
         self.bleAckMonotonicNs = try await ble.startRemoteRecording(clock: clock)
+        if let epDir = currentEpisodeDirectory {
+            let identity = resolvedSidecarIdentity()
+            do {
+                try Insta360PendingSidecar.writeTentative(
+                    to: epDir,
+                    streamId: streamId,
+                    role: sidecarRole(),
+                    deviceUuid: identity.uuid,
+                    deviceName: identity.name,
+                    bleAckNs: bleAckMonotonicNs)
+            } catch {
+                NSLog("[Insta360CameraStream] WARNING tentative sidecar write failed for \(streamId): \(error.localizedDescription)")
+            }
+        }
         #else
         throw Insta360Error.frameworkNotLinked
         #endif

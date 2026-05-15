@@ -22,6 +22,7 @@ import NetworkExtension
 public final class Insta360WiFiDownloader: @unchecked Sendable {
     private let cameraHost = "192.168.42.1"
     private let cameraPort: UInt16 = 6666
+    private static let operationGate = AsyncSerialGate()
 
     public init() {}
 
@@ -49,6 +50,23 @@ public final class Insta360WiFiDownloader: @unchecked Sendable {
                          passphrase: String,
                          sidecar: Insta360PendingSidecar? = nil,
                          progress: @escaping @Sendable (Double) -> Void) async throws -> Int64 {
+        try await Self.operationGate.withLock {
+            try await self.downloadUnlocked(
+                remoteFileURI: remoteFileURI,
+                to: destination,
+                ssid: ssid,
+                passphrase: passphrase,
+                sidecar: sidecar,
+                progress: progress)
+        }
+    }
+
+    private func downloadUnlocked(remoteFileURI: String,
+                                  to destination: URL,
+                                  ssid: String,
+                                  passphrase: String,
+                                  sidecar: Insta360PendingSidecar? = nil,
+                                  progress: @escaping @Sendable (Double) -> Void) async throws -> Int64 {
         try await applyHotspot(ssid: ssid, passphrase: passphrase)
 
         var downloadError: Error?
@@ -91,6 +109,100 @@ public final class Insta360WiFiDownloader: @unchecked Sendable {
 
         if let error = downloadError { throw error }
         return bytes
+    }
+
+    public func listFiles(
+        ssid: String,
+        passphrase: String,
+        thumbnailReferenceDate: Date? = nil,
+        includeThumbnails: Bool = true,
+        restoreWiFiAfterList: Bool = true,
+        beforeRestore: (@Sendable ([Insta360FileInfo]) async -> [Insta360FileInfo])? = nil
+    ) async throws -> [Insta360FileInfo] {
+        try await Self.operationGate.withLock {
+            try await self.listFilesUnlocked(
+                ssid: ssid,
+                passphrase: passphrase,
+                thumbnailReferenceDate: thumbnailReferenceDate,
+                includeThumbnails: includeThumbnails,
+                restoreWiFiAfterList: restoreWiFiAfterList,
+                beforeRestore: beforeRestore)
+        }
+    }
+
+    private func listFilesUnlocked(
+        ssid: String,
+        passphrase: String,
+        thumbnailReferenceDate: Date?,
+        includeThumbnails: Bool,
+        restoreWiFiAfterList: Bool,
+        beforeRestore: (@Sendable ([Insta360FileInfo]) async -> [Insta360FileInfo])?
+    ) async throws -> [Insta360FileInfo] {
+        var listError: Error?
+        var files: [Insta360FileInfo]?
+
+        do {
+            try await applyHotspot(
+                ssid: ssid,
+                passphrase: passphrase,
+                applyTimeoutSeconds: 10)
+            try await waitForReachability(attempts: 8)
+
+            for attempt in 1...2 {
+                do {
+                    INSCameraManager.socket().shutdown()
+                    INSCameraManager.socket().setup()
+                    let ready = await waitForSocketCameraReady(timeoutSeconds: attempt == 1 ? 3.0 : 5.0)
+                    if !ready {
+                        try await Task.sleep(nanoseconds: attempt == 1 ? 500_000_000 : 800_000_000)
+                    }
+                    INSCameraManager.socket().commandsImpl.sendHeartbeats(with: nil)
+
+                    let fetched = try await fetchCameraFileInfoList(
+                        timeoutSeconds: attempt == 1 ? 12 : 18,
+                        includeThumbnails: includeThumbnails,
+                        thumbnailReferenceDate: thumbnailReferenceDate)
+                    NSLog("[WiFiDownloader] listFiles succeeded on socket attempt \(attempt) files=\(fetched.count)")
+                    files = fetched
+                    break
+                } catch {
+                    listError = error
+                    NSLog("[WiFiDownloader] listFiles socket attempt \(attempt)/2 failed: \(error.localizedDescription)")
+                    INSCameraManager.socket().shutdown()
+                    if error is CancellationError { break }
+                    if attempt < 2 {
+                        try await Task.sleep(nanoseconds: 500_000_000)
+                        try await waitForReachability(attempts: 5)
+                    }
+                }
+            }
+        } catch {
+            listError = error
+        }
+
+        if let currentFiles = files, let beforeRestore {
+            files = await beforeRestore(currentFiles)
+        }
+
+        INSCameraManager.socket().shutdown()
+        if restoreWiFiAfterList {
+            await restoreSystemWiFiAfterCameraOperation(ssid: ssid, context: "listFiles")
+        } else {
+            NSLog("[WiFiDownloader] SDK socket shut down after listFiles; keeping camera hotspot for caller cleanup (ssid=\(ssid))")
+        }
+
+        if let files { return files }
+        throw listError ?? Insta360Error.downloadFailed("listFiles failed")
+    }
+
+    public func restoreSystemWiFiAfterCameraOperation(
+        ssid: String,
+        context: String
+    ) async {
+        NEHotspotConfigurationManager.shared.removeConfiguration(forSSID: ssid)
+        INSCameraManager.socket().shutdown()
+        NSLog("[WiFiDownloader] Hotspot config removed + SDK socket shut down after \(context) (ssid=\(ssid))")
+        try? await waitForSystemWiFiRestore(away: cameraHost)
     }
 
     /// One pending file to fetch as part of a batch on the same camera AP.
@@ -154,6 +266,23 @@ public final class Insta360WiFiDownloader: @unchecked Sendable {
     ///     shut down. Final home-Wi-Fi restore is the CALLER'S job (via
     ///     `finalizeWiFiRestore`) so per-camera teardown stays fast.
     public func downloadBatch(
+        ssid: String,
+        passphrase: String,
+        items: [BatchItem],
+        onItemStart: @escaping @Sendable (BatchItem) -> Void,
+        progress: @escaping @Sendable (BatchItem, Double) -> Void
+    ) async -> [BatchResult] {
+        await Self.operationGate.withLock {
+            await self.downloadBatchUnlocked(
+                ssid: ssid,
+                passphrase: passphrase,
+                items: items,
+                onItemStart: onItemStart,
+                progress: progress)
+        }
+    }
+
+    private func downloadBatchUnlocked(
         ssid: String,
         passphrase: String,
         items: [BatchItem],
@@ -622,36 +751,366 @@ public final class Insta360WiFiDownloader: @unchecked Sendable {
 
     #endif
 
-    /// Snapshot every video URI currently visible to the camera HTTP API.
+    /// Snapshot every video URI currently visible to the camera listing APIs.
     /// Used both by the fallback path when stopCapture confirms stop without
     /// a URI, and by the optional camera-side transcode discovery flow.
     private func fetchVideoURIList() async throws -> [String] {
-        let http = INSCameraHTTPManager.socket()
-        return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<[String], Error>) in
-            let task = http.fetchVideoList(completion: { error, list in
+        try await fetchCameraFileInfoList(
+            timeoutSeconds: 12,
+            includeThumbnails: false).map(\.fileUri)
+    }
+
+    private func fetchCameraFileInfoList(
+        timeoutSeconds: TimeInterval,
+        includeThumbnails: Bool = false,
+        thumbnailReferenceDate: Date? = nil
+    ) async throws -> [Insta360FileInfo] {
+        var errors: [String] = []
+
+        do {
+            let files = try await fetchGo3SEditFileInfoList(timeoutSeconds: timeoutSeconds)
+            if !files.isEmpty {
+                NSLog("[WiFiDownloader] listFiles api=go3sEditList files=\(files.count)")
+                return includeThumbnails
+                    ? await enrichFileInfoWithThumbnails(
+                        files,
+                        referenceDate: thumbnailReferenceDate)
+                    : files
+            }
+            NSLog("[WiFiDownloader] listFiles api=go3sEditList returned empty; falling back to HTTP video list")
+        } catch {
+            errors.append("go3sEditList: \(error.localizedDescription)")
+            NSLog("[WiFiDownloader] listFiles api=go3sEditList failed: \(error.localizedDescription)")
+        }
+
+        do {
+            let files = try await fetchHTTPVideoFileInfoList(timeoutSeconds: timeoutSeconds)
+            NSLog("[WiFiDownloader] listFiles api=httpVideoList files=\(files.count)")
+            return includeThumbnails
+                ? await enrichFileInfoWithThumbnails(
+                    files,
+                    referenceDate: thumbnailReferenceDate)
+                : files
+        } catch {
+            errors.append("httpVideoList: \(error.localizedDescription)")
+            NSLog("[WiFiDownloader] listFiles api=httpVideoList failed: \(error.localizedDescription)")
+        }
+
+        throw Insta360Error.downloadFailed(
+            "camera album listing failed (\(errors.joined(separator: "; ")))")
+    }
+
+    private func fetchGo3SEditFileInfoList(timeoutSeconds: TimeInterval) async throws -> [Insta360FileInfo] {
+        let cmd = INSCameraManager.socket().commandsImpl
+        return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<[Insta360FileInfo], Error>) in
+            let gate = ContinuationGate<[Insta360FileInfo]>()
+            let timeout = DispatchWorkItem {
+                gate.resume(cont, throwing: Insta360Error.downloadFailed(
+                    "fetchFileEditList timed out after \(timeoutSeconds)s"))
+            }
+            DispatchQueue.global(qos: .utility).asyncAfter(
+                deadline: .now() + timeoutSeconds,
+                execute: timeout)
+
+            let storageType = INSStorageType(rawValue: 0b0011)
+            cmd.fetchFileEditList(with: storageType) { error, editInfoList in
+                timeout.cancel()
                 if let error = error {
-                    cont.resume(throwing: Insta360Error.downloadFailed(
+                    gate.resume(cont, throwing: Insta360Error.downloadFailed(
+                        "fetchFileEditList failed: \(error.localizedDescription)"))
+                    return
+                }
+
+                let files = self.fileInfoList(from: editInfoList)
+                gate.resume(cont, returning: files)
+            }
+        }
+    }
+
+    private func fetchHTTPVideoFileInfoList(timeoutSeconds: TimeInterval) async throws -> [Insta360FileInfo] {
+        let http = INSCameraHTTPManager.socket()
+        return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<[Insta360FileInfo], Error>) in
+            let gate = ContinuationGate<[Insta360FileInfo]>()
+            let timeout = DispatchWorkItem {
+                gate.resume(cont, throwing: Insta360Error.downloadFailed(
+                    "fetchVideoList timed out after \(timeoutSeconds)s"))
+            }
+            DispatchQueue.global(qos: .utility).asyncAfter(
+                deadline: .now() + timeoutSeconds,
+                execute: timeout)
+
+            let task = http.fetchVideoList(completion: { error, list in
+                timeout.cancel()
+                if let error = error {
+                    gate.resume(cont, throwing: Insta360Error.downloadFailed(
                         "fetchVideoList failed: \(error.localizedDescription)"))
                     return
                 }
-                var uris: [String] = []
+                var files: [Insta360FileInfo] = []
                 if let list = list as? [Any] {
                     for item in list {
                         let obj = item as AnyObject
-                        if obj.responds(to: NSSelectorFromString("uri")),
-                           let uri = obj.value(forKey: "uri") as? String,
-                           !uri.isEmpty {
-                            uris.append(uri)
+                        guard obj.responds(to: NSSelectorFromString("uri")),
+                              let uri = obj.value(forKey: "uri") as? String,
+                              !uri.isEmpty
+                        else {
+                            continue
                         }
+                        guard self.isDownloadableCameraVideoURI(uri) else { continue }
+                        files.append(self.fileInfo(
+                            uri: uri,
+                            durationSec: (obj.value(forKey: "totalTime") as? NSNumber)?.doubleValue ?? 0,
+                            sizeBytes: (obj.value(forKey: "fileSize") as? NSNumber)?.uint64Value ?? 0,
+                            fallbackTimestampSec: nil))
                     }
                 }
-                cont.resume(returning: uris)
+                gate.resume(cont, returning: self.sortedUniqueFileInfo(files))
             })
             if task == nil {
-                cont.resume(throwing: Insta360Error.downloadFailed(
+                timeout.cancel()
+                gate.resume(cont, throwing: Insta360Error.downloadFailed(
                     "fetchVideoList returned nil task"))
             }
         }
+    }
+
+    private func enrichFileInfoWithThumbnails(
+        _ files: [Insta360FileInfo],
+        referenceDate: Date?,
+        limit: Int = 6
+    ) async -> [Insta360FileInfo] {
+        guard !files.isEmpty else { return files }
+
+        var output = files
+        let requestedIndices = thumbnailCandidateIndices(
+            in: files,
+            referenceDate: referenceDate,
+            limit: limit)
+        let capped = requestedIndices.count
+        var successCount = 0
+        var failureCount = 0
+        var consecutiveFailureCount = 0
+
+        for index in requestedIndices {
+            if Task.isCancelled { break }
+            let file = files[index]
+            do {
+                let thumbnailUri = try await fetchVideoThumbnailURI(
+                    for: file.fileUri,
+                    timeoutSeconds: 2.0)
+                output[index] = Insta360FileInfo(
+                    fileUri: file.fileUri,
+                    createdAtIso: file.createdAtIso,
+                    durationSec: file.durationSec,
+                    sizeBytes: file.sizeBytes,
+                    thumbnailUri: thumbnailUri)
+                successCount += 1
+                consecutiveFailureCount = 0
+            } catch {
+                failureCount += 1
+                consecutiveFailureCount += 1
+                if failureCount <= 3 {
+                    NSLog("[WiFiDownloader] thumbnail fetch failed uri=\(file.fileUri): \(error.localizedDescription)")
+                }
+                if consecutiveFailureCount >= 3 {
+                    NSLog("[WiFiDownloader] thumbnail fetch stopped after \(consecutiveFailureCount) consecutive failures")
+                    break
+                }
+            }
+        }
+
+        NSLog("[WiFiDownloader] thumbnails enriched success=\(successCount) failed=\(failureCount) requested=\(capped)")
+        return output
+    }
+
+    private func thumbnailCandidateIndices(
+        in files: [Insta360FileInfo],
+        referenceDate: Date?,
+        limit: Int
+    ) -> [Int] {
+        let capped = min(limit, files.count)
+        guard let referenceDate else {
+            return Array(0..<capped)
+        }
+
+        let iso = ISO8601DateFormatter()
+        return files.enumerated()
+            .sorted { lhs, rhs in
+                let lhsDate = iso.date(from: lhs.element.createdAtIso)
+                let rhsDate = iso.date(from: rhs.element.createdAtIso)
+                let lhsDelta = lhsDate.map { abs($0.timeIntervalSince(referenceDate)) }
+                    ?? Double.greatestFiniteMagnitude
+                let rhsDelta = rhsDate.map { abs($0.timeIntervalSince(referenceDate)) }
+                    ?? Double.greatestFiniteMagnitude
+                if lhsDelta != rhsDelta { return lhsDelta < rhsDelta }
+                return lhs.offset < rhs.offset
+            }
+            .prefix(capped)
+            .map(\.offset)
+    }
+
+    private func fetchVideoThumbnailURI(
+        for uri: String,
+        timeoutSeconds: TimeInterval
+    ) async throws -> String {
+        let http = INSCameraHTTPManager.socket()
+        return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<String, Error>) in
+            let gate = ContinuationGate<String>()
+            var task: URLSessionTask?
+            let timeout = DispatchWorkItem {
+                task?.cancel()
+                gate.resume(cont, throwing: Insta360Error.downloadFailed(
+                    "fetchVideoThumbnail timed out after \(timeoutSeconds)s"))
+            }
+            DispatchQueue.global(qos: .utility).asyncAfter(
+                deadline: .now() + timeoutSeconds,
+                execute: timeout)
+
+            task = http.fetchVideoThumbnail(withURI: uri) { error, data in
+                timeout.cancel()
+                if let error = error {
+                    gate.resume(cont, throwing: Insta360Error.downloadFailed(
+                        "fetchVideoThumbnail failed: \(error.localizedDescription)"))
+                    return
+                }
+                guard let data, !data.isEmpty else {
+                    gate.resume(cont, throwing: Insta360Error.downloadFailed(
+                        "fetchVideoThumbnail returned empty data"))
+                    return
+                }
+
+                do {
+                    let fileURL = try self.thumbnailCacheURL(for: uri)
+                    try FileManager.default.createDirectory(
+                        at: fileURL.deletingLastPathComponent(),
+                        withIntermediateDirectories: true)
+                    try data.write(to: fileURL, options: [.atomic])
+                    gate.resume(cont, returning: fileURL.absoluteString)
+                } catch {
+                    gate.resume(cont, throwing: error)
+                }
+            }
+            if task == nil {
+                timeout.cancel()
+                gate.resume(cont, throwing: Insta360Error.downloadFailed(
+                    "fetchVideoThumbnail returned nil task"))
+            }
+        }
+    }
+
+    private func thumbnailCacheURL(for uri: String) throws -> URL {
+        let base = FileManager.default.urls(
+            for: .cachesDirectory,
+            in: .userDomainMask).first ?? FileManager.default.temporaryDirectory
+        let encoded = Data(uri.utf8)
+            .base64EncodedString()
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "=", with: "")
+        return base
+            .appendingPathComponent("syncfield-insta360-thumbnails", isDirectory: true)
+            .appendingPathComponent("\(encoded).jpg")
+    }
+
+    private func fileInfoList(from editInfoList: INSCameraEditInfoList?) -> [Insta360FileInfo] {
+        guard let editInfoList else { return [] }
+
+        var files: [Insta360FileInfo] = []
+        appendEditInfos(editInfoList.sdEditInfolist, to: &files)
+        appendEditInfos(editInfoList.cameraEditInfolist, to: &files)
+        return sortedUniqueFileInfo(files)
+    }
+
+    private func appendEditInfos(_ rawList: Any?, to files: inout [Insta360FileInfo]) {
+        guard let rawList else { return }
+
+        let items: [INSCameraEditInfo]
+        if let typed = rawList as? [INSCameraEditInfo] {
+            items = typed
+        } else if let array = rawList as? NSArray {
+            items = array.compactMap { $0 as? INSCameraEditInfo }
+        } else {
+            items = []
+        }
+
+        for item in items {
+            guard let uri = normalizedCameraFileURI(item.filePath),
+                  isDownloadableCameraVideoURI(uri)
+            else {
+                continue
+            }
+            let modifyTimestamp = item.favoriteInfo?.modifyTimestamp
+            files.append(fileInfo(
+                uri: uri,
+                durationSec: 0,
+                sizeBytes: 0,
+                fallbackTimestampSec: modifyTimestamp.flatMap { $0 > 0 ? $0 : nil }))
+        }
+    }
+
+    private func normalizedCameraFileURI(_ raw: String?) -> String? {
+        guard var value = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !value.isEmpty
+        else {
+            return nil
+        }
+
+        if let url = URL(string: value),
+           let host = url.host,
+           host == cameraHost,
+           !url.path.isEmpty {
+            value = url.path
+        }
+
+        return value
+    }
+
+    private func fileInfo(
+        uri: String,
+        durationSec: Double,
+        sizeBytes: UInt64,
+        fallbackTimestampSec: Int64?
+    ) -> Insta360FileInfo {
+        let createdAtIso: String = {
+            if let ts = Insta360PendingResolver.parseFilenameTimestampMs(uri) {
+                return ISO8601DateFormatter().string(
+                    from: Date(timeIntervalSince1970: Double(ts) / 1000.0))
+            }
+            if let fallbackTimestampSec, fallbackTimestampSec > 0 {
+                return ISO8601DateFormatter().string(
+                    from: Date(timeIntervalSince1970: Double(fallbackTimestampSec)))
+            }
+            return ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: 0))
+        }()
+        return Insta360FileInfo(
+            fileUri: uri,
+            createdAtIso: createdAtIso,
+            durationSec: durationSec,
+            sizeBytes: sizeBytes)
+    }
+
+    private func sortedUniqueFileInfo(_ files: [Insta360FileInfo]) -> [Insta360FileInfo] {
+        var seen = Set<String>()
+        return files
+            .filter { file in
+                guard !seen.contains(file.fileUri) else { return false }
+                seen.insert(file.fileUri)
+                return true
+            }
+            .sorted {
+                if $0.createdAtIso != $1.createdAtIso {
+                    return $0.createdAtIso > $1.createdAtIso
+                }
+                return $0.fileUri < $1.fileUri
+            }
+    }
+
+    private func isDownloadableCameraVideoURI(_ uri: String) -> Bool {
+        let lower = uri.lowercased()
+        guard lower.hasSuffix(".mp4") || lower.hasSuffix(".insv") else {
+            return false
+        }
+        return !lower.contains("lrv")
     }
 
     private func fetchVideoURIs() async throws -> Set<String> {
@@ -751,6 +1210,27 @@ public final class Insta360WiFiDownloader: @unchecked Sendable {
             if now - lastEmitNs < minIntervalNs { return false }
             lastEmitNs = now
             return true
+        }
+    }
+
+    private final class ContinuationGate<Value>: @unchecked Sendable {
+        private let lock = NSLock()
+        private var isOpen = true
+
+        func resume(_ continuation: CheckedContinuation<Value, Error>, returning value: Value) {
+            lock.lock()
+            defer { lock.unlock() }
+            guard isOpen else { return }
+            isOpen = false
+            continuation.resume(returning: value)
+        }
+
+        func resume(_ continuation: CheckedContinuation<Value, Error>, throwing error: Error) {
+            lock.lock()
+            defer { lock.unlock() }
+            guard isOpen else { return }
+            isOpen = false
+            continuation.resume(throwing: error)
         }
     }
 
@@ -874,7 +1354,11 @@ public final class Insta360WiFiDownloader: @unchecked Sendable {
 
     // MARK: - Hotspot
 
-    private func applyHotspot(ssid: String, passphrase: String) async throws {
+    private func applyHotspot(
+        ssid: String,
+        passphrase: String,
+        applyTimeoutSeconds: TimeInterval = 8
+    ) async throws {
         // Two attempts. `NEHotspotConfiguration.apply` occasionally fails
         // with `internal` / `system` error codes when iOS is still in the
         // middle of releasing the previous camera's config; a single
@@ -882,7 +1366,10 @@ public final class Insta360WiFiDownloader: @unchecked Sendable {
         var lastError: Error?
         for attempt in 1...2 {
             do {
-                try await applyHotspotOnce(ssid: ssid, passphrase: passphrase)
+                try await applyHotspotOnce(
+                    ssid: ssid,
+                    passphrase: passphrase,
+                    applyTimeoutSeconds: applyTimeoutSeconds)
                 if attempt > 1 {
                     NSLog("[WiFiDownloader] applyHotspot succeeded on attempt \(attempt)")
                 }
@@ -970,6 +1457,29 @@ public final class Insta360WiFiDownloader: @unchecked Sendable {
             try await Task.sleep(nanoseconds: 1_000_000_000)
         }
         throw Insta360Error.cameraNotReachable
+    }
+
+    private func waitForSocketCameraReady(timeoutSeconds: TimeInterval) async -> Bool {
+        let deadline = DispatchTime.now().uptimeNanoseconds
+            + UInt64(max(0, timeoutSeconds) * 1_000_000_000)
+        var polls = 0
+        while DispatchTime.now().uptimeNanoseconds < deadline {
+            polls += 1
+            let manager = INSCameraManager.socket()
+            if manager.cameraState.rawValue == 2, manager.currentCamera != nil {
+                NSLog("[WiFiDownloader] SDK socket camera ready after \(polls) poll(s): \(socketCameraStateDescription())")
+                return true
+            }
+            try? await Task.sleep(nanoseconds: 200_000_000)
+        }
+        NSLog("[WiFiDownloader] SDK socket camera not ready after \(String(format: "%.1f", timeoutSeconds))s: \(socketCameraStateDescription())")
+        return false
+    }
+
+    private func socketCameraStateDescription() -> String {
+        let manager = INSCameraManager.socket()
+        let camera = manager.currentCamera
+        return "state=\(manager.cameraState.rawValue) camera=\(camera?.name ?? "nil") serial=\(camera?.serialNumber ?? "nil")"
     }
 
     private func isHostReachable(host: String, port: UInt16) async -> Bool {

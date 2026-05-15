@@ -69,28 +69,44 @@ final class SessionOrchestratorManualStopRecoveryTests: XCTestCase {
         try await session.connect()
         _ = try await session.startRecording()
 
-        do {
-            _ = try await session.stopRecording()
-            XCTFail("expected stop to fail before manual recovery")
-        } catch {
-            let state = await session.state
-            XCTAssertEqual(state, .stopping)
-        }
-
-        let manualStopWallClockMs: UInt64 = 1_778_688_360_000
-        let report = try await session.recoverUnconfirmedStops(
-            manualStopWallClockMs: manualStopWallClockMs,
-            reason: "user_confirmed_manual_stop")
+        let report = try await session.stopRecording()
 
         XCTAssertEqual(report.streamReports.map(\.streamId), ["cam_ego", "cam_wrist_left"])
+        let wristReport = try XCTUnwrap(
+            report.streamReports.first { $0.streamId == "cam_wrist_left" })
+        XCTAssertEqual(wristReport.status, "incomplete")
+        XCTAssertEqual(wristReport.incompleteReason, "stop_failed")
         let stopCallCount = await wrist.stopCallCount
         let recoveryCallCount = await wrist.recoveryCallCount
-        let recoveredStopWallClockMs = await wrist.recoveredStopWallClockMs
         let recoveredReason = await wrist.recoveredReason
         XCTAssertEqual(stopCallCount, 1)
         XCTAssertEqual(recoveryCallCount, 1)
-        XCTAssertEqual(recoveredStopWallClockMs, manualStopWallClockMs)
-        XCTAssertEqual(recoveredReason, "user_confirmed_manual_stop")
+        XCTAssertEqual(recoveredReason, "stop_failed")
+
+        try await session.finishRecording()
+        let state = await session.state
+        XCTAssertEqual(state, .connected)
+    }
+
+    func test_stopRecording_marksRecoverableExternalFailureIncompleteWithoutDroppingEpisode() async throws {
+        let (session, _) = makeSession()
+        let native = MockStream(streamId: "cam_ego", kind: "video")
+        let wrist = ManualStopRecoveryProbeStream(streamId: "cam_wrist_left")
+        try await session.add(native)
+        try await session.add(wrist)
+
+        try await session.connect()
+        _ = try await session.startRecording()
+
+        let report = try await session.stopRecording()
+
+        XCTAssertEqual(report.streamReports.map(\.streamId), ["cam_ego", "cam_wrist_left"])
+        let wristReport = try XCTUnwrap(
+            report.streamReports.first { $0.streamId == "cam_wrist_left" })
+        XCTAssertEqual(wristReport.status, "incomplete")
+        XCTAssertEqual(wristReport.incompleteReason, "stop_failed")
+        let recoveryCallCount = await wrist.recoveryCallCount
+        XCTAssertEqual(recoveryCallCount, 1)
 
         try await session.finishRecording()
         let state = await session.state

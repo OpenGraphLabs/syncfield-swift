@@ -357,6 +357,7 @@ public actor SessionOrchestrator {
         // failing BLE camera doesn't cancel a healthy stream's finalise
         // (AVAssetWriter commit etc).
         var firstError: Error?
+        let stopWallClockMs = UInt64(Date().timeIntervalSince1970 * 1000)
         let tBeforeStreamStop = DispatchTime.now().uptimeNanoseconds
         await withTaskGroup(of: (StreamStopReport?, Error?).self) { group in
             for s in streams {
@@ -365,9 +366,28 @@ public actor SessionOrchestrator {
                 group.addTask { [s] in
                     let t0 = DispatchTime.now().uptimeNanoseconds
                     let result: (StreamStopReport?, Error?)
-                    do { result = (try await s.stopRecording(), nil) }
-                    catch {
-                        result = (nil, StreamError(streamId: s.streamId, underlying: error))
+                    do {
+                        result = (try await s.stopRecording(), nil)
+                    } catch {
+                        if let recoverable = s as? any SyncFieldManualStopRecoveryStream {
+                            do {
+                                _ = try await recoverable.recoverUnconfirmedManualStop(
+                                    stopWallClockMs: stopWallClockMs,
+                                    reason: "stop_failed")
+                                result = (StreamStopReport(
+                                    streamId: s.streamId,
+                                    frameCount: 0,
+                                    kind: s.capabilities.producesFile ? "video" : "sensor",
+                                    status: "incomplete",
+                                    incompleteReason: "stop_failed"), nil)
+                            } catch {
+                                result = (nil, StreamError(
+                                    streamId: s.streamId,
+                                    underlying: error))
+                            }
+                        } else {
+                            result = (nil, StreamError(streamId: s.streamId, underlying: error))
+                        }
                     }
                     let elapsedMs = (DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000
                     NSLog("[SDK.stopRecording] stream=\(id) stop elapsedMs=\(elapsedMs)")
@@ -458,12 +478,17 @@ public actor SessionOrchestrator {
                 group.addTask { [stream, recoverable] in
                     let t0 = DispatchTime.now().uptimeNanoseconds
                     do {
-                        let report = try await recoverable.recoverUnconfirmedManualStop(
+                        let recovered = try await recoverable.recoverUnconfirmedManualStop(
                             stopWallClockMs: manualStopWallClockMs,
                             reason: reason)
                         let elapsedMs = (DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000
                         NSLog("[SDK.manualStopRecovery] stream=\(stream.streamId) recovered elapsedMs=\(elapsedMs)")
-                        return (report, nil)
+                        return (StreamStopReport(
+                            streamId: recovered.streamId,
+                            frameCount: recovered.frameCount,
+                            kind: recovered.kind,
+                            status: "incomplete",
+                            incompleteReason: reason), nil)
                     } catch {
                         let elapsedMs = (DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000
                         NSLog("[SDK.manualStopRecovery] stream=\(stream.streamId) failed elapsedMs=\(elapsedMs)")

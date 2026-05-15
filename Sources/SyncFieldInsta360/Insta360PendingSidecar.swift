@@ -66,6 +66,38 @@ public struct Insta360PendingSidecar: Codable, Sendable {
         "\(streamId).pending.json"
     }
 
+    public static func tentativeFilename(forStreamId streamId: String) -> String {
+        "\(streamId).pending.tentative.json"
+    }
+
+    public struct Tentative: Codable, Sendable {
+        public let streamId: String
+        public let role: String
+        public let sessionStartIso: String
+        public let deviceUuid: String
+        public let deviceName: String
+        public let expectedSetupType: String
+        public let bleAckMonotonicNs: UInt64
+
+        public init(
+            streamId: String,
+            role: String,
+            sessionStartIso: String,
+            deviceUuid: String,
+            deviceName: String,
+            expectedSetupType: String = "ego_wrist",
+            bleAckMonotonicNs: UInt64
+        ) {
+            self.streamId = streamId
+            self.role = role
+            self.sessionStartIso = sessionStartIso
+            self.deviceUuid = deviceUuid
+            self.deviceName = deviceName
+            self.expectedSetupType = expectedSetupType
+            self.bleAckMonotonicNs = bleAckMonotonicNs
+        }
+    }
+
     // MARK: - Write
 
     public static func write(
@@ -102,6 +134,34 @@ public struct Insta360PendingSidecar: Codable, Sendable {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         let data = try encoder.encode(sidecar)
         let url = episodeDirectory.appendingPathComponent(filename(forStreamId: streamId))
+        try FileManager.default.createDirectory(
+            at: episodeDirectory, withIntermediateDirectories: true)
+        try data.write(to: url, options: [.atomic])
+        try deleteTentative(at: episodeDirectory, streamId: streamId)
+    }
+
+    public static func writeTentative(
+        to episodeDirectory: URL,
+        streamId: String,
+        role: String,
+        deviceUuid: String,
+        deviceName: String,
+        expectedSetupType: String = "ego_wrist",
+        bleAckNs: UInt64
+    ) throws {
+        let sidecar = Tentative(
+            streamId: streamId,
+            role: role,
+            sessionStartIso: ISO8601DateFormatter().string(from: Date()),
+            deviceUuid: deviceUuid,
+            deviceName: deviceName,
+            expectedSetupType: expectedSetupType,
+            bleAckMonotonicNs: bleAckNs)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let data = try encoder.encode(sidecar)
+        let url = episodeDirectory.appendingPathComponent(
+            tentativeFilename(forStreamId: streamId))
         try FileManager.default.createDirectory(
             at: episodeDirectory, withIntermediateDirectories: true)
         try data.write(to: url, options: [.atomic])
@@ -193,6 +253,17 @@ public struct Insta360PendingSidecar: Codable, Sendable {
         at episodeDirectory: URL, streamId: String
     ) throws {
         let url = episodeDirectory.appendingPathComponent(filename(forStreamId: streamId))
+        if FileManager.default.fileExists(atPath: url.path) {
+            try FileManager.default.removeItem(at: url)
+        }
+        try deleteTentative(at: episodeDirectory, streamId: streamId)
+    }
+
+    public static func deleteTentative(
+        at episodeDirectory: URL, streamId: String
+    ) throws {
+        let url = episodeDirectory.appendingPathComponent(
+            tentativeFilename(forStreamId: streamId))
         if FileManager.default.fileExists(atPath: url.path) {
             try FileManager.default.removeItem(at: url)
         }

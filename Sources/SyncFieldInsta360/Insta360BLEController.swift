@@ -575,6 +575,20 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
         await Self.wake(serialLast6: serial, window: window)
     }
 
+    private static func miniThumbnailCacheURL(for uri: String) throws -> URL {
+        let base = FileManager.default.urls(
+            for: .cachesDirectory,
+            in: .userDomainMask).first ?? FileManager.default.temporaryDirectory
+        let encoded = Data(uri.utf8)
+            .base64EncodedString()
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "=", with: "")
+        return base
+            .appendingPathComponent("syncfield-insta360-thumbnails", isDirectory: true)
+            .appendingPathComponent("ble-\(encoded).jpg")
+    }
+
     public static func phoneAuthorizationDeviceId() -> String {
         INSConnectionUtils.authorizationId()
     }
@@ -1367,6 +1381,41 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
             try await self.ensureCommandReady(
                 reason: "refreshConnection",
                 maxCachedAgeSeconds: 0)
+        }
+    }
+
+    public func miniThumbnailURI(for uri: String) async throws -> String {
+        try await withControllerCommandGate(label: "miniThumbnail") {
+            try await self.ensureCommandReady(
+                reason: "miniThumbnail",
+                maxCachedAgeSeconds: 5)
+            let cmd = try self.commandManager()
+            guard let bluetoothCommands = cmd as? INSBluetoothCommands else {
+                throw Insta360Error.commandFailed("BLE mini thumbnail command unavailable")
+            }
+
+            let data: Data = try await self.withTimeout(seconds: 3) {
+                try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Data, Error>) in
+                    bluetoothCommands.getMiniThumbnail(ofURI: uri) { error, imageData in
+                        if let error {
+                            cont.resume(throwing: Insta360Error.commandFailed(error.localizedDescription))
+                            return
+                        }
+                        guard let imageData, !imageData.isEmpty else {
+                            cont.resume(throwing: Insta360Error.commandFailed("BLE mini thumbnail returned empty data"))
+                            return
+                        }
+                        cont.resume(returning: imageData as Data)
+                    }
+                }
+            }
+
+            let fileURL = try Self.miniThumbnailCacheURL(for: uri)
+            try FileManager.default.createDirectory(
+                at: fileURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true)
+            try data.write(to: fileURL, options: [.atomic])
+            return fileURL.absoluteString
         }
     }
 
@@ -2296,6 +2345,10 @@ public final class Insta360BLEController: @unchecked Sendable {
     }
 
     public func refreshConnection() async throws {
+        throw Insta360Error.frameworkNotLinked
+    }
+
+    public func miniThumbnailURI(for _: String) async throws -> String {
         throw Insta360Error.frameworkNotLinked
     }
 

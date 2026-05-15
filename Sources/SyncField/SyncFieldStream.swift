@@ -15,9 +15,21 @@ public struct StreamStopReport: Sendable {
     public let streamId: String
     public let frameCount: Int
     public let kind: String
+    public let status: String
+    public let incompleteReason: String?
 
-    public init(streamId: String, frameCount: Int, kind: String) {
-        self.streamId = streamId; self.frameCount = frameCount; self.kind = kind
+    public init(
+        streamId: String,
+        frameCount: Int,
+        kind: String,
+        status: String = "ok",
+        incompleteReason: String? = nil
+    ) {
+        self.streamId = streamId
+        self.frameCount = frameCount
+        self.kind = kind
+        self.status = status
+        self.incompleteReason = incompleteReason
     }
 }
 
