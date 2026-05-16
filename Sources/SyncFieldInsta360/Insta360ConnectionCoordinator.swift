@@ -89,6 +89,20 @@ public actor Insta360ConnectionCoordinator {
                     reason: reason,
                     health: health)
                 await self.emitStateTransition(event)
+                // Heartbeat lifecycle for S5 background suspension.
+                // Pausing while iOS has the process backgrounded saves
+                // battery and prevents the RSSI poll from accruing
+                // misleading misses during the suspension window.
+                // Restoring on exit re-engages the loop so the next
+                // tick observes the real link state.
+                if to == .bleSuspended {
+                    await self.applyHeartbeatInterval(bindingKey: bindingKey,
+                                                     ms: nil)
+                } else if from == .bleSuspended {
+                    await self.applyHeartbeatInterval(
+                        bindingKey: bindingKey,
+                        ms: Insta360CoordinatorConfig.shared.heartbeatIntervalMs)
+                }
             },
             didEmitWakeStallRequiringUser: { [weak self] suggested, health in
                 guard let self = self else { return }

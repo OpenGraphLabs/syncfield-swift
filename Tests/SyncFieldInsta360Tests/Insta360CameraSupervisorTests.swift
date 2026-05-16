@@ -313,6 +313,28 @@ final class Insta360CameraSupervisorTests: XCTestCase {
                        "recording should not suspend BLE")
     }
 
+    /// S5: foregroundEntered must not just transition state — it must also
+    /// schedule a reconnect so the bridge's `reconnectDriver` runs
+    /// `refreshConnection`. Without this the supervisor sits in `.searching`
+    /// indefinitely after every backgrounding because nothing in the state
+    /// machine itself drives a probe.
+    func testForegroundFromSuspendedSchedulesReconnect() async {
+        let driverCalled = expectation(description: "reconnect driver invoked on foreground")
+        let (sup, _) = await makeSupervisor(reconnectDriver: {
+            driverCalled.fulfill()
+        })
+        await sup.handle(.attached)
+        await sup.handle(.scanHit(rssi: -65))
+        await sup.handle(.readinessProbeAck(elapsedMs: 100))
+        await sup.handle(.backgroundEntered(recordingActive: false))
+        await assertStateEquals(sup, .bleSuspended)
+        await sup.handle(.foregroundEntered)
+        await assertStateEquals(sup, .searching)
+
+        // Driver must fire within the first backoff window (500 ms).
+        await fulfillment(of: [driverCalled], timeout: 2)
+    }
+
     // MARK: - Wake stall prompt (S2)
 
     func testWakeStallEmitsPromptWithPowerButtonByDefault() async {

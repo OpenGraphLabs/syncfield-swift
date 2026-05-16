@@ -331,6 +331,16 @@ public actor Insta360CameraSupervisor {
             InstaLog.log(.bg, role: role, "will_enter_foreground")
             if health.state == .bleSuspended {
                 await transition(to: .searching, reason: "foreground_resume")
+                // Kick the reconnect driver so the bridge runs
+                // `refreshConnection`. If iOS kept the GATT link alive
+                // (bluetooth-central background mode), this is a fast
+                // command-channel probe → synthetic scanHit + readiness
+                // → bleReady. If iOS dropped the peripheral while we were
+                // suspended, the driver falls back to its wake+repair
+                // path and the backoff schedule takes over. Without
+                // this call the supervisor would sit in `.searching`
+                // indefinitely with nothing scheduling work.
+                scheduleReconnect()
             }
 
         case .forceReconnectRequested:
