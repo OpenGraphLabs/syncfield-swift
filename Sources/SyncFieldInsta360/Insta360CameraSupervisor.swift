@@ -486,6 +486,16 @@ public actor Insta360CameraSupervisor {
                 }
                 return
             }
+            // Check the persistent classifier here too — the only other
+            // call site was `scanWindowClosedNoHit`, which nothing emits
+            // in the current pipeline, so the classifier never had a
+            // chance to fire after the camera stayed dark for > 90 s
+            // (S9 "두 카메라 동시 OFF" runbook requirement). Calling it
+            // from every reconnect failure means the supervisor lands
+            // in `.lost` after either a hard CB error or
+            // `msSinceLastAdvertisement` crossing the threshold,
+            // matching the plan's spec.
+            await checkPersistentClassifier()
             // Otherwise, keep trying within the policy ceiling.
             if attempt < policy.maxAttempts && !health.state.isTerminal {
                 scheduleReconnect()

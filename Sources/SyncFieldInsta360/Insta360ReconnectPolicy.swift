@@ -53,11 +53,22 @@ public struct Insta360ReconnectPolicy: Sendable, Equatable {
             return true
         }
         if let err = lastErrorDescription?.lowercased() {
+            // String matches cover both Swift enum stringification
+            // (`peripheraldisconnected`) and the human-readable
+            // `String(describing:)` of an `NSError` from
+            // `CBErrorDomain` (codes 6 + 7 typically surface as the
+            // descriptions below). Either form means the peripheral
+            // is gone — no point burning more backoff cycles.
             let persistentMarkers = [
                 "powered off",
                 "out of range",
                 "user disconnect",
                 "peripheraldisconnected",
+                // CBErrorDomain Code=7 — peripheral disconnected from us
+                "the specified device has disconnected",
+                // CBErrorDomain Code=6 — connection timed out (when the
+                // remote side is no longer responding, repeated drops)
+                "the connection has timed out unexpectedly",
             ]
             if persistentMarkers.contains(where: err.contains) { return true }
         }

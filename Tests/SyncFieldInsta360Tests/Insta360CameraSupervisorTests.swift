@@ -313,6 +313,38 @@ final class Insta360CameraSupervisorTests: XCTestCase {
                        "recording should not suspend BLE")
     }
 
+    /// S9 regression: when both cameras are powered off and the reconnect
+    /// driver keeps failing with a peripheral-disconnected CB error, the
+    /// supervisor must classify as `.lost` rather than retrying forever
+    /// at the steady-state 60 s cadence. The classifier was previously
+    /// unreachable from the reconnect path (only emitted from
+    /// `.scanWindowClosedNoHit`, which no callsite produces) and only
+    /// matched Swift-enum error strings, not the human-readable
+    /// `CBErrorDomain` format the broker actually surfaces.
+    func testReconnectFailureWithCBDisconnectErrorClassifiesAsLost() async {
+        // Driver that always fails with the exact CB error format the
+        // broker surfaces when a camera goes out of range / off.
+        let cbDisconnect =
+            #"Error Domain=CBErrorDomain Code=7 "The specified device has disconnected from us.""#
+        struct DummyError: Error, CustomStringConvertible {
+            let description: String
+        }
+        let (sup, obs) = await makeSupervisor(reconnectDriver: {
+            throw DummyError(description: cbDisconnect)
+        })
+        await sup.handle(.attached)
+        await sup.handle(.scanHit(rssi: -65))
+        await sup.handle(.readinessProbeAck(elapsedMs: 100))
+        await sup.handle(.unsolicitedDisconnect(error: cbDisconnect))
+
+        // Give the first reconnect attempt time to fire + catch.
+        try? await Task.sleep(nanoseconds: 700_000_000)
+
+        let states = (await obs.snapshotTransitions()).map(\.to)
+        XCTAssertTrue(states.contains(.lost),
+                      "expected classifier-driven lost transition, got \(states)")
+    }
+
     /// S5: foregroundEntered must not just transition state — it must also
     /// schedule a reconnect so the bridge's `reconnectDriver` runs
     /// `refreshConnection`. Without this the supervisor sits in `.searching`
