@@ -170,6 +170,39 @@ final class Insta360CameraSupervisorTests: XCTestCase {
         await assertStateEquals(sup, .lost)
     }
 
+    /// S3 third-run regression: even with the schedule-time debounce,
+    /// a duplicate event queued *behind* the first slipped through during
+    /// the first event's `await transition(...)` observer yield, because
+    /// the schedule timestamp was still nil. The debounce must instead
+    /// be set at the very top of the handler — before any await — so the
+    /// queued duplicate observes it.
+    func testDuplicateDisconnectsRacingTransitionAwaitAreStillDebounced() async {
+        // A driver that takes a moment so the supervisor stays in
+        // .reconnecting between events.
+        let driverCalled = expectation(description: "driver called once")
+        driverCalled.assertForOverFulfill = true
+        let (sup, obs) = await makeSupervisor(reconnectDriver: {
+            driverCalled.fulfill()
+        })
+        // Fire enough setup events to reach bleReady.
+        await sup.handle(.attached)
+        await sup.handle(.scanHit(rssi: -65))
+        await sup.handle(.readinessProbeAck(elapsedMs: 100))
+
+        // Spawn two disconnect tasks concurrently — they race on actor
+        // re-entrancy across the transition's observer await. With the
+        // pre-await marker, only the first should pass.
+        async let a: Void = sup.handle(.unsolicitedDisconnect(error: "primary"))
+        async let b: Void = sup.handle(.unsolicitedDisconnect(error: "duplicate"))
+        _ = await (a, b)
+
+        await fulfillment(of: [driverCalled], timeout: 2)
+        let scheduleEvents = (await obs.snapshotTransitions())
+            .filter { $0.to == .reconnecting }
+        XCTAssertEqual(scheduleEvents.count, 1,
+                       "expected one reconnecting transition under race, got \(scheduleEvents.count)")
+    }
+
     /// S3 regression: SDK fires `didDisconnectWithError` multiple times for
     /// the same drop (CoreBluetooth peripheral disconnect + INSCameraManager
     /// cleanup + `markConnectionStale` cascade). Without debounce, each fire

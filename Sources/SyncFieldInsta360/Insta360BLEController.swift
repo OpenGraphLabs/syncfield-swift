@@ -363,36 +363,56 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
     /// next heartbeat tick — no race because the loop reads it each cycle.
     private var heartbeatIntervalNs: UInt64? = 2_000_000_000
 
-    /// Process-wide UUIDs we've just intentionally disconnected (via
-    /// `unpair()` or other deliberate `bluetoothManager.disconnectDevice`
-    /// paths). When CoreBluetooth surfaces the resulting
-    /// `didDisconnectWithError` we want to SKIP firing the supervisor's
-    /// `.unsolicitedDisconnect` handler — the camera isn't really gone,
-    /// we just told the radio to drop it (e.g. after stopRecording, before
-    /// Wi-Fi switch). One-shot semantics: the UUID is removed on first
-    /// matching callback. Static so every controller's delegate fan-out
-    /// sees the suppression list regardless of which controller initiated
-    /// the unpair.
+    /// Process-wide map of UUIDs we've recently intentionally disconnected
+    /// (via `unpair()` or other deliberate `bluetoothManager.disconnectDevice`
+    /// paths), stamped with the mark time. When CoreBluetooth surfaces the
+    /// resulting `didDisconnectWithError` we want to SKIP firing the
+    /// supervisor's `.unsolicitedDisconnect` handler — the camera isn't
+    /// really gone, we just told the radio to drop it (e.g. after
+    /// stopRecording, before Wi-Fi switch).
+    ///
+    /// Time-windowed instead of one-shot because the SDK fans the same
+    /// disconnect through multiple paths (CB direct + INSCameraManager
+    /// cleanup) within ms — a one-shot flag would catch the first fire
+    /// but let the second through, false-flagging it as a real drop and
+    /// kicking the supervisor into reconnect → user_action_required → lost.
+    /// Static so every controller's delegate fan-out sees the suppression
+    /// list regardless of which controller initiated the unpair.
     private static let intentionalDisconnectLock = NSLock()
-    nonisolated(unsafe) private static var intentionalDisconnectUUIDs: Set<String> = []
+    nonisolated(unsafe) private static var intentionalDisconnectAtMs: [String: UInt64] = [:]
+    /// Window during which any disconnect for the marked UUID counts as
+    /// intentional. 3 s covers both the SDK's duplicate fire (~ms apart)
+    /// and the somewhat-deferred CoreBluetooth completion that can lag
+    /// the actual `disconnectDevice` call.
+    private static let intentionalDisconnectWindowMs: UInt64 = 3_000
 
     /// Mark a UUID as "about to be intentionally disconnected" so the next
-    /// `didDisconnectWithError` for that device suppresses the supervisor
-    /// notification. Call BEFORE invoking `bluetoothManager.disconnectDevice`.
+    /// `didDisconnectWithError` for that device (within the window) is
+    /// recognized as expected. Call BEFORE invoking
+    /// `bluetoothManager.disconnectDevice`.
     static func markIntentionalDisconnect(_ uuid: String) {
+        let nowMs = UInt64(Date().timeIntervalSince1970 * 1_000)
         intentionalDisconnectLock.lock()
-        intentionalDisconnectUUIDs.insert(uuid)
+        intentionalDisconnectAtMs[uuid] = nowMs
+        // Opportunistic cleanup of stale entries to keep the map bounded.
+        intentionalDisconnectAtMs = intentionalDisconnectAtMs.filter {
+            nowMs - $0.value < intentionalDisconnectWindowMs
+        }
         intentionalDisconnectLock.unlock()
     }
 
-    /// Check + clear the intentional-disconnect flag for a UUID. Returns
-    /// true if the disconnect was expected (and clears the flag so the next
-    /// disconnect for the same UUID is treated as unsolicited).
+    /// Returns true if the disconnect for this UUID was marked intentional
+    /// within the current window. Does NOT clear the entry — the SDK fires
+    /// duplicate `didDisconnectWithError` callbacks for the same drop and
+    /// we want ALL of them suppressed, not just the first.
     static func consumeIntentionalDisconnect(_ uuid: String) -> Bool {
+        let nowMs = UInt64(Date().timeIntervalSince1970 * 1_000)
         intentionalDisconnectLock.lock()
-        let was = intentionalDisconnectUUIDs.remove(uuid) != nil
-        intentionalDisconnectLock.unlock()
-        return was
+        defer { intentionalDisconnectLock.unlock() }
+        guard let markedAt = intentionalDisconnectAtMs[uuid] else { return false }
+        if nowMs - markedAt < intentionalDisconnectWindowMs { return true }
+        intentionalDisconnectAtMs.removeValue(forKey: uuid)
+        return false
     }
 
     /// Hook invoked when CoreBluetooth surfaces an unsolicited disconnect.

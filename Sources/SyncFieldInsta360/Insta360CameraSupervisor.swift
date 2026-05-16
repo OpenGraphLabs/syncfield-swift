@@ -97,15 +97,15 @@ public actor Insta360CameraSupervisor {
     private var wakeAttemptStartedAtMs: UInt64?
     private var wakeStallPromptEmitted: Bool = false
     private var reconnectTask: Task<Void, Never>?
-    /// Set when `scheduleReconnect()` runs; cleared when a reconnect attempt
-    /// actually fires OR after a debounce window. Used to drop duplicate
-    /// `.unsolicitedDisconnect` events that the SDK fires within
-    /// milliseconds of each other (CoreBluetooth direct callback + SDK
-    /// internal cleanup + `markConnectionStale` cascade). Without this,
-    /// the supervisor reschedules N times, each cancelling the prior, and
-    /// the attempt counter jumps from 1 → 6 in a few ms — pushing the first
-    /// backoff from 500 ms to 15 s.
-    private var lastReconnectScheduleAtMs: UInt64?
+    /// Timestamp of the most recently processed `.unsolicitedDisconnect`
+    /// event. Set at the FIRST statement of the handler (before any
+    /// `await`) so duplicate events queued behind the first one — which
+    /// only see the actor again after `transition`'s observer await
+    /// yields — observe the marker and short-circuit. Earlier attempt
+    /// to gate on `lastReconnectScheduleAtMs` failed because that field
+    /// is only set inside `scheduleReconnect()`, which runs AFTER the
+    /// observer await, so the duplicate slipped past with a nil marker.
+    private var lastUnsolicitedDisconnectAtMs: UInt64?
 
     /// Provider for the supervisor's own reconnect Task. Real coordinator
     /// passes a closure that invokes BLE scan + connect; tests pass a stub.
@@ -282,25 +282,26 @@ public actor Insta360CameraSupervisor {
             }
 
         case .unsolicitedDisconnect(let error):
+            let now = nowMs()
             // Debounce SDK-side duplicate disconnect fires. The SDK
-            // surfaces the same drop through multiple paths (CoreBluetooth
-            // peripheral disconnect + INSCameraManager cleanup +
-            // `markConnectionStale` after probe failures), often within
-            // the same millisecond. Without this gate the attempt counter
-            // explodes and backoff escalates instantly to its ceiling.
-            // Window matches the smallest backoff (500 ms) so a real
-            // second drop arriving after the first reconnect attempt
-            // started can still re-schedule.
-            if health.state == .reconnecting,
-               let scheduledAt = lastReconnectScheduleAtMs,
-               nowMs() - scheduledAt < 500 {
+            // surfaces the same drop through multiple paths within
+            // milliseconds (CoreBluetooth peripheral disconnect +
+            // INSCameraManager internal cleanup + `markConnectionStale`
+            // cascade). Each fire enqueues a Task → handle(.unsolicited
+            // Disconnect), and `transition`'s observer `await` yields the
+            // actor between the first event setting state=.reconnecting
+            // and calling `scheduleReconnect()`, so the second event
+            // slips through any state-only gate. Set this marker BEFORE
+            // any `await` so duplicates queued behind the first see it.
+            if let last = lastUnsolicitedDisconnectAtMs, now - last < 500 {
                 InstaLog.log(.sup, role: role, level: .debug,
                              "unsolicited_disconnect_debounced",
-                             ["since_last_schedule_ms": nowMs() - scheduledAt])
+                             ["since_last_ms": now - last])
                 return
             }
+            lastUnsolicitedDisconnectAtMs = now
             health.lastError = error
-            health.lastErrorAtMs = nowMs()
+            health.lastErrorAtMs = now
             health.consecutiveHeartbeatMisses = 0
             InstaLog.log(.ble, role: role, level: .warn, "didDisconnectWithError",
                          ["error": error as Any])
@@ -377,7 +378,7 @@ public actor Insta360CameraSupervisor {
         // Reset reconnect bookkeeping on any healthy state.
         if next == .bleReady || next == .wifiBound {
             reconnectAttempt = 0
-            lastReconnectScheduleAtMs = nil
+            lastUnsolicitedDisconnectAtMs = nil
         }
         if let observer = observer {
             await observer.didTransition(previous, next, reason, health)
@@ -428,7 +429,6 @@ public actor Insta360CameraSupervisor {
         reconnectAttempt += 1
         let attempt = reconnectAttempt
         let delaySeconds = policy.backoffSeconds(forAttempt: attempt)
-        lastReconnectScheduleAtMs = nowMs()
         InstaLog.log(.sup, role: role, "reconnect_scheduled",
                      ["attempt": attempt,
                       "backoff_ms": Int(delaySeconds * 1_000)])
