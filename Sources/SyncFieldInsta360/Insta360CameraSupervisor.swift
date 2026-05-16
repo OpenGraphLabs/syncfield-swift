@@ -97,6 +97,15 @@ public actor Insta360CameraSupervisor {
     private var wakeAttemptStartedAtMs: UInt64?
     private var wakeStallPromptEmitted: Bool = false
     private var reconnectTask: Task<Void, Never>?
+    /// Set when `scheduleReconnect()` runs; cleared when a reconnect attempt
+    /// actually fires OR after a debounce window. Used to drop duplicate
+    /// `.unsolicitedDisconnect` events that the SDK fires within
+    /// milliseconds of each other (CoreBluetooth direct callback + SDK
+    /// internal cleanup + `markConnectionStale` cascade). Without this,
+    /// the supervisor reschedules N times, each cancelling the prior, and
+    /// the attempt counter jumps from 1 → 6 in a few ms — pushing the first
+    /// backoff from 500 ms to 15 s.
+    private var lastReconnectScheduleAtMs: UInt64?
 
     /// Provider for the supervisor's own reconnect Task. Real coordinator
     /// passes a closure that invokes BLE scan + connect; tests pass a stub.
@@ -273,6 +282,23 @@ public actor Insta360CameraSupervisor {
             }
 
         case .unsolicitedDisconnect(let error):
+            // Debounce SDK-side duplicate disconnect fires. The SDK
+            // surfaces the same drop through multiple paths (CoreBluetooth
+            // peripheral disconnect + INSCameraManager cleanup +
+            // `markConnectionStale` after probe failures), often within
+            // the same millisecond. Without this gate the attempt counter
+            // explodes and backoff escalates instantly to its ceiling.
+            // Window matches the smallest backoff (500 ms) so a real
+            // second drop arriving after the first reconnect attempt
+            // started can still re-schedule.
+            if health.state == .reconnecting,
+               let scheduledAt = lastReconnectScheduleAtMs,
+               nowMs() - scheduledAt < 500 {
+                InstaLog.log(.sup, role: role, level: .debug,
+                             "unsolicited_disconnect_debounced",
+                             ["since_last_schedule_ms": nowMs() - scheduledAt])
+                return
+            }
             health.lastError = error
             health.lastErrorAtMs = nowMs()
             health.consecutiveHeartbeatMisses = 0
@@ -351,6 +377,7 @@ public actor Insta360CameraSupervisor {
         // Reset reconnect bookkeeping on any healthy state.
         if next == .bleReady || next == .wifiBound {
             reconnectAttempt = 0
+            lastReconnectScheduleAtMs = nil
         }
         if let observer = observer {
             await observer.didTransition(previous, next, reason, health)
@@ -401,6 +428,7 @@ public actor Insta360CameraSupervisor {
         reconnectAttempt += 1
         let attempt = reconnectAttempt
         let delaySeconds = policy.backoffSeconds(forAttempt: attempt)
+        lastReconnectScheduleAtMs = nowMs()
         InstaLog.log(.sup, role: role, "reconnect_scheduled",
                      ["attempt": attempt,
                       "backoff_ms": Int(delaySeconds * 1_000)])
@@ -420,6 +448,16 @@ public actor Insta360CameraSupervisor {
                          ["attempt": attempt])
             // Successful reconnect signals will arrive via subsequent events
             // (scanHit → readinessProbeAck → bleReady). No state change here.
+        } catch is CancellationError {
+            // We were superseded by a fresh scheduleReconnect (typically
+            // because a stale-link cascade fired another disconnect). The
+            // newer task already owns the ramp — don't compound by
+            // re-scheduling again from this catch path, which would
+            // double the attempt counter and inflate the next backoff.
+            InstaLog.log(.sup, role: role, level: .debug,
+                         "reconnect_superseded",
+                         ["attempt": attempt])
+            return
         } catch {
             let description = String(describing: error)
             health.lastError = description

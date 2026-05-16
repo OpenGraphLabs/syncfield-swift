@@ -363,6 +363,38 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
     /// next heartbeat tick — no race because the loop reads it each cycle.
     private var heartbeatIntervalNs: UInt64? = 2_000_000_000
 
+    /// Process-wide UUIDs we've just intentionally disconnected (via
+    /// `unpair()` or other deliberate `bluetoothManager.disconnectDevice`
+    /// paths). When CoreBluetooth surfaces the resulting
+    /// `didDisconnectWithError` we want to SKIP firing the supervisor's
+    /// `.unsolicitedDisconnect` handler — the camera isn't really gone,
+    /// we just told the radio to drop it (e.g. after stopRecording, before
+    /// Wi-Fi switch). One-shot semantics: the UUID is removed on first
+    /// matching callback. Static so every controller's delegate fan-out
+    /// sees the suppression list regardless of which controller initiated
+    /// the unpair.
+    private static let intentionalDisconnectLock = NSLock()
+    nonisolated(unsafe) private static var intentionalDisconnectUUIDs: Set<String> = []
+
+    /// Mark a UUID as "about to be intentionally disconnected" so the next
+    /// `didDisconnectWithError` for that device suppresses the supervisor
+    /// notification. Call BEFORE invoking `bluetoothManager.disconnectDevice`.
+    static func markIntentionalDisconnect(_ uuid: String) {
+        intentionalDisconnectLock.lock()
+        intentionalDisconnectUUIDs.insert(uuid)
+        intentionalDisconnectLock.unlock()
+    }
+
+    /// Check + clear the intentional-disconnect flag for a UUID. Returns
+    /// true if the disconnect was expected (and clears the flag so the next
+    /// disconnect for the same UUID is treated as unsolicited).
+    static func consumeIntentionalDisconnect(_ uuid: String) -> Bool {
+        intentionalDisconnectLock.lock()
+        let was = intentionalDisconnectUUIDs.remove(uuid) != nil
+        intentionalDisconnectLock.unlock()
+        return was
+    }
+
     /// Hook invoked when CoreBluetooth surfaces an unsolicited disconnect.
     /// Set by `Insta360CameraSupervisor` so it can enter `.reconnecting`
     /// and drive the backoff schedule. Optional + async + Sendable so the
@@ -904,6 +936,12 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
         guard let device = connectedDevice else { return }
         let uuid = device.identifierUUIDStringSafe
         stopHeartbeat()
+        // Mark BEFORE disconnect so the inevitable
+        // `didDisconnectWithError` callback is recognized as intentional.
+        // Without this, the supervisor would see the unpair as a real drop
+        // and transition through reconnecting → lost, then prompt the user
+        // (recording_readiness_failed cascade).
+        Self.markIntentionalDisconnect(uuid)
         bluetoothManager.disconnectDevice(device)
         connectedDevice = nil
         Self.unregisterPaired(uuid)
@@ -2274,20 +2312,31 @@ extension Insta360BLEController {
     /// drop.
     func bluetoothDelegate_device(_ device: INSBluetoothDevice,
                                   didDisconnectWithError error: Error?) {
+        let uuid = device.identifierUUIDStringSafe
         let isOurDevice =
-            connectedDevice?.identifierUUIDStringSafe == device.identifierUUIDStringSafe
-            || lastKnownUUID == device.identifierUUIDStringSafe
+            connectedDevice?.identifierUUIDStringSafe == uuid
+            || lastKnownUUID == uuid
         // Log only on our own controller to avoid N×duplicate lines when
         // multiple controllers receive the same broker fan-out — the
         // role-suffixed supervisor log downstream provides the audit
         // trail for non-bound listeners.
         guard isOurDevice else { return }
+        // Was this disconnect requested by us (unpair, deliberate teardown)?
+        // If so, do the same cleanup but DON'T notify the supervisor —
+        // otherwise the state machine would falsely interpret the
+        // post-stop teardown as a real drop and walk through reconnecting
+        // → lost. Per the connection-coordinator plan, BLE is meant to
+        // stay paired for the app's lifetime; intentional unpairs only
+        // happen at explicit user actions or controlled radio handoffs.
+        let intentional = Self.consumeIntentionalDisconnect(uuid)
         InstaLog.log(.ble, level: .warn, "didDisconnectWithError",
                      ["device": Self.displayName(for: device),
-                      "error": error?.localizedDescription ?? "none"])
-        Self.unregisterPaired(device.identifierUUIDStringSafe)
+                      "error": error?.localizedDescription ?? "none",
+                      "intentional": intentional])
+        Self.unregisterPaired(uuid)
         stopHeartbeat()
         connectedDevice = nil
+        if intentional { return }
         if let handler = unsolicitedDisconnectHandler {
             Task { await handler(error) }
         }

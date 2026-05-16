@@ -170,6 +170,33 @@ final class Insta360CameraSupervisorTests: XCTestCase {
         await assertStateEquals(sup, .lost)
     }
 
+    /// S3 regression: SDK fires `didDisconnectWithError` multiple times for
+    /// the same drop (CoreBluetooth peripheral disconnect + INSCameraManager
+    /// cleanup + `markConnectionStale` cascade). Without debounce, each fire
+    /// reschedules reconnect and the attempt counter jumps 1 → 6 in ms,
+    /// pushing first backoff from 500 ms to 15 s. Subsequent disconnects
+    /// arriving inside the debounce window should be ignored.
+    func testDuplicateUnsolicitedDisconnectsDoNotInflateAttemptCounter() async {
+        let driverCalled = expectation(description: "reconnect driver invoked once")
+        driverCalled.assertForOverFulfill = true
+        let (sup, obs) = await makeSupervisor(reconnectDriver: {
+            driverCalled.fulfill()
+        })
+        await sup.handle(.attached)
+        await sup.handle(.scanHit(rssi: -65))
+        await sup.handle(.readinessProbeAck(elapsedMs: 100))
+        // Three back-to-back disconnects within the debounce window.
+        await sup.handle(.unsolicitedDisconnect(error: "primary"))
+        await sup.handle(.unsolicitedDisconnect(error: "duplicate_a"))
+        await sup.handle(.unsolicitedDisconnect(error: "duplicate_b"))
+
+        await fulfillment(of: [driverCalled], timeout: 2)
+        let scheduleEvents = (await obs.snapshotTransitions())
+            .filter { $0.to == .reconnecting }
+        XCTAssertEqual(scheduleEvents.count, 1,
+                       "expected one reconnecting transition, got \(scheduleEvents.count)")
+    }
+
     /// S3 regression: when a camera physically goes out of range, the heartbeat
     /// poll fails first (driving bleReady → bleDegraded), and CoreBluetooth
     /// surfaces the disconnect somewhat later. The supervisor must accept the
