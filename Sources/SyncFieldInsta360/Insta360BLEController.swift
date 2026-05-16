@@ -357,7 +357,23 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
     private var lastKnownName: String?
 
     private var heartbeatTask: Task<Void, Never>?
-    private let heartbeatIntervalNs: UInt64 = 2_000_000_000
+    /// 2 s default. Mutable so `Insta360RadioGate` can switch this camera to
+    /// slow-mode (8 s) while another camera holds the Wi-Fi lease, or pause
+    /// it entirely (set to nil) for the AP-bound camera itself. Read on the
+    /// next heartbeat tick — no race because the loop reads it each cycle.
+    private var heartbeatIntervalNs: UInt64? = 2_000_000_000
+
+    /// Hook invoked when CoreBluetooth surfaces an unsolicited disconnect.
+    /// Set by `Insta360CameraSupervisor` so it can enter `.reconnecting`
+    /// and drive the backoff schedule. Optional + async + Sendable so the
+    /// controller stays decoupled from the supervisor's actor isolation.
+    public var unsolicitedDisconnectHandler: (@Sendable (Error?) async -> Void)?
+
+    // Note: `INSCameraSimpleCommands.sendHeartbeatsWithOptions` is
+    // fire-and-forget — the Insta360 SDK doesn't expose an ACK callback.
+    // Liveness probing is therefore the bridge's responsibility via a
+    // periodic `readCurrentRSSI()` poll: a successful read = ACK, a nil
+    // return = miss. See `SyncFieldBridgeModule.startInsta360RssiPoll`.
     private var lastCommandReadyUptimeNs: UInt64 = 0
     private var lastCommandReadyProbe: Insta360CommandReadinessProbe?
     private let commandGate = Insta360SDKCommandGate()
@@ -528,6 +544,10 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
         }
         let started = DispatchTime.now().uptimeNanoseconds
         NSLog("[Insta360BLE.wake] broadcast SEND")
+        // Notify supervisors so the wake-stall threshold (12 s by default)
+        // accumulates against real SDK wake activity rather than synthetic
+        // bridge-side ticks that get cancelled when pair attempts retry.
+        Insta360WakeObserver.notify(.broadcast, serialLast6: nil)
         manager.wakeUp { error in
             if let error {
                 NSLog("[Insta360BLE.wake] broadcast completion error: \(error.localizedDescription)")
@@ -555,6 +575,7 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
         }
         let started = DispatchTime.now().uptimeNanoseconds
         NSLog("[Insta360BLE.wake] serial=\(serial) wakeId=\(wakeId) SEND")
+        Insta360WakeObserver.notify(.targeted, serialLast6: serial)
         manager.wakeUpSpecificCamera(wakeId) { error in
             if let error {
                 NSLog("[Insta360BLE.wake] serial=\(serial) completion error: \(error.localizedDescription)")
@@ -2110,9 +2131,14 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
 
     private func startHeartbeat() {
         heartbeatTask?.cancel()
-        let interval = heartbeatIntervalNs
         heartbeatTask = Task { [weak self] in
             while !Task.isCancelled {
+                guard let interval = self?.heartbeatIntervalNs else {
+                    // Heartbeat suspended (e.g. AP-bound during WiFi gate);
+                    // poll the interval cheaply until it's re-enabled.
+                    try? await Task.sleep(nanoseconds: 500_000_000)
+                    continue
+                }
                 try? await Task.sleep(nanoseconds: interval)
                 if Task.isCancelled { break }
                 _ = self?.sendHeartbeat()
@@ -2120,8 +2146,25 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
         }
     }
 
+    /// Mutator wired through the coordinator/RadioGate. `intervalMs == nil`
+    /// suspends heartbeats (used while the camera is the AP host during a
+    /// Wi-Fi download); any value re-engages the loop on the next cycle.
+    public func setHeartbeatIntervalMs(_ intervalMs: UInt64?) {
+        if let ms = intervalMs {
+            heartbeatIntervalNs = ms * 1_000_000
+            InstaLog.log(.ble, level: .info, "heartbeat_interval_set",
+                         ["interval_ms": ms])
+        } else {
+            heartbeatIntervalNs = nil
+            InstaLog.log(.ble, level: .info, "heartbeat_paused")
+        }
+    }
+
     @discardableResult
     private func sendHeartbeat() -> Bool {
+        // SDK heartbeat is fire-and-forget; we cannot observe ACK directly.
+        // The bridge's RSSI poll provides the liveness signal that drives
+        // supervisor `.heartbeatAck` / `.heartbeatMiss` transitions.
         guard let cmd = try? commandManager() else { return false }
         cmd.sendHeartbeats(with: nil)
         return true
@@ -2130,6 +2173,27 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
     private func stopHeartbeat() {
         heartbeatTask?.cancel()
         heartbeatTask = nil
+    }
+
+    /// Read the current BLE link RSSI for the connected camera. Returns
+    /// `nil` if no device is connected or the SDK callback errored. Used
+    /// by the bridge's per-camera RSSI poll to feed `.rssiSample` events.
+    public func readCurrentRSSI() async -> Int? {
+        guard let device = connectedDevice else { return nil }
+        return await withCheckedContinuation { (cont: CheckedContinuation<Int?, Never>) in
+            self.bluetoothManager.readRSSI(device) { error, rssi in
+                if error != nil {
+                    cont.resume(returning: nil)
+                    return
+                }
+                // SDK returns NSNumber; bridge to Int? (or nil on weird types).
+                if let rssi = rssi as? NSNumber {
+                    cont.resume(returning: rssi.intValue)
+                } else {
+                    cont.resume(returning: nil)
+                }
+            }
+        }
     }
 
     /// Runs `operation` with a deadline.
@@ -2191,11 +2255,25 @@ extension Insta360BLEController: INSBluetoothManagerDelegate {
     }
 
     public func device(_ device: INSBluetoothDevice, didDisconnectWithError error: Error?) {
-        NSLog("[Insta360BLE] Device disconnected: \(Self.displayName(for: device)), error: \(error?.localizedDescription ?? "none")")
-        if connectedDevice?.identifierUUIDStringSafe == device.identifierUUIDStringSafe {
+        InstaLog.log(.ble, level: .warn, "didDisconnectWithError",
+                     ["device": Self.displayName(for: device),
+                      "error": error?.localizedDescription ?? "none"])
+        // Match the incoming device against BOTH the live `connectedDevice`
+        // (typical drop) AND `lastKnownUUID` (rare cases where teardown
+        // ordering clears `connectedDevice` before CoreBluetooth surfaces
+        // the disconnect — observed during stop-recording flows). Without
+        // the second check the supervisor wouldn't be notified and would
+        // stay in `bleReady` while the link is gone.
+        let isOurDevice =
+            connectedDevice?.identifierUUIDStringSafe == device.identifierUUIDStringSafe
+            || lastKnownUUID == device.identifierUUIDStringSafe
+        if isOurDevice {
             Self.unregisterPaired(device.identifierUUIDStringSafe)
             stopHeartbeat()
             connectedDevice = nil
+            if let handler = unsolicitedDisconnectHandler {
+                Task { await handler(error) }
+            }
         }
     }
 
@@ -2207,12 +2285,19 @@ extension Insta360BLEController: INSBluetoothManagerDelegate {
 #else
 public final class Insta360BLEController: @unchecked Sendable {
     public var onWarning: (@Sendable (Insta360CameraWarning) -> Void)?
+    public var unsolicitedDisconnectHandler: (@Sendable (Error?) async -> Void)?
     public var connectedDeviceUUID: String? { nil }
     public var connectedDeviceName: String? { nil }
     public var lastKnownDeviceUUID: String? { nil }
     public var lastKnownDeviceName: String? { nil }
 
     public init() {}
+
+    /// No-op on platforms without the Insta360 SDK linked — kept for API
+    /// parity so callers can compile without `#if canImport`.
+    public func setHeartbeatIntervalMs(_ intervalMs: UInt64?) {}
+
+    public func readCurrentRSSI() async -> Int? { nil }
 
     public static func shouldAcceptDevice(name: String?,
                                           uuid: String,

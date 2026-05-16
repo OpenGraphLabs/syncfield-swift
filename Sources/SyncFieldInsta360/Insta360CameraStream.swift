@@ -56,6 +56,12 @@ public final class Insta360CameraStream: SyncFieldStream, SyncFieldRecordingPref
     #if canImport(INSCameraServiceSDK)
     private var ble  = Insta360BLEController()
     private let wifi = Insta360WiFiDownloader()
+
+    /// Exposed for `Insta360ConnectionCoordinator` / `Insta360CameraSupervisor`
+    /// so they can wire `unsolicitedDisconnectHandler` and
+    /// `setHeartbeatIntervalMs` without owning the controller. Read-only
+    /// reference; the stream still owns the lifecycle.
+    public var bleController: Insta360BLEController { ble }
     #endif
 
     public init(streamId: String) {
