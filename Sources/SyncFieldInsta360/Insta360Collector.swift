@@ -165,7 +165,7 @@ public actor Insta360Collector {
                 ssid: creds.ssid,
                 passphrase: creds.passphrase,
                 thumbnailReferenceDate: thumbnailReferenceDate,
-                includeThumbnails: true,
+                includeThumbnails: false,
                 beforeRestore: { files in
                     await enrichMissingThumbnailsWithBLE(
                         files,
