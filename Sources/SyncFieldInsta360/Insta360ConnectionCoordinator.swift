@@ -173,6 +173,31 @@ public actor Insta360ConnectionCoordinator {
         await wakeStallObserver?(event)
     }
 
+    // MARK: - RadioGate proxies
+
+    /// Acquire exclusive Wi-Fi access for `bindingKey`. Routes through the
+    /// coordinator's `Insta360RadioGate`, which serializes acquisition
+    /// across cameras and demotes other supervised cameras to slow-mode
+    /// heartbeat (8 s) while suspending the holder's own heartbeat. Use
+    /// `withWiFi(bindingKey:_:)` for the safe scoped variant.
+    public func acquireWiFi(bindingKey: String) async -> Insta360RadioLease {
+        await radioGate.acquireWiFi(bindingKey: bindingKey)
+    }
+
+    public func releaseWiFi(_ lease: Insta360RadioLease) async {
+        await radioGate.releaseWiFi(lease)
+    }
+
+    /// Run `body` under an exclusive Wi-Fi lease. The lease is released
+    /// even if `body` throws. Use for the Wi-Fi download / `applyHotspot`
+    /// sections of `Insta360Collector` / `Insta360WiFiDownloader` so
+    /// concurrent cameras can't race the same `NEHotspotConfiguration`
+    /// state machine.
+    public func withWiFi<T>(bindingKey: String,
+                            _ body: (Insta360RadioLease) async throws -> T) async rethrows -> T {
+        try await radioGate.withWiFi(bindingKey: bindingKey, body)
+    }
+
     // MARK: - Heartbeat interval routing (bridge plugs in real implementation)
 
     public typealias HeartbeatIntervalSetter =

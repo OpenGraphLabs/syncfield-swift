@@ -148,29 +148,31 @@ public actor Insta360Collector {
         thumbnailReferenceDate: Date? = nil
     ) async throws -> [Insta360FileInfo] {
         #if canImport(INSCameraServiceSDK)
+        // Idempotent — no-op if supervisor's persistent pair is still
+        // live. No defer-unpair: BLE stays paired for the app's lifetime
+        // per the connection-coordinator plan.
         try await Insta360Scanner.shared.pair(
             uuid: uuid,
             preferredName: preferredName)
-        defer {
-            Task {
-                try? await Insta360Scanner.shared.unpair(uuid: uuid)
-            }
-        }
         let ble = try await Insta360Scanner.shared.controller(forUUID: uuid)
         try? await ble.enableWiFiForDownload()
         let creds = try await ble.wifiCredentials()
         let downloader = Insta360WiFiDownloader()
-        return try await downloader.listFiles(
-            ssid: creds.ssid,
-            passphrase: creds.passphrase,
-            thumbnailReferenceDate: thumbnailReferenceDate,
-            includeThumbnails: false,
-            beforeRestore: { files in
-                await enrichMissingThumbnailsWithBLE(
-                    files,
-                    ble: ble,
-                    referenceDate: thumbnailReferenceDate)
-            })
+        return try await Insta360ConnectionCoordinator.shared.withWiFi(
+            bindingKey: uuid
+        ) { _ in
+            try await downloader.listFiles(
+                ssid: creds.ssid,
+                passphrase: creds.passphrase,
+                thumbnailReferenceDate: thumbnailReferenceDate,
+                includeThumbnails: false,
+                beforeRestore: { files in
+                    await enrichMissingThumbnailsWithBLE(
+                        files,
+                        ble: ble,
+                        referenceDate: thumbnailReferenceDate)
+                })
+        }
         #else
         throw Insta360Error.frameworkNotLinked
         #endif
@@ -419,32 +421,19 @@ public actor Insta360Collector {
         }
 
         // Cameras are collected sequentially because iOS can join only one
-        // camera Wi-Fi AP at a time. Prefetch every target BLE pairing first
-        // so the existing per-controller heartbeat keeps waiting cameras
-        // awake while an earlier camera is downloading.
-        var prefetchedUUIDs: [String] = []
-        defer {
-            let toCleanup = prefetchedUUIDs
-            if !toCleanup.isEmpty {
-                Task { [toCleanup] in
-                    for uuid in toCleanup {
-                        try? await Insta360Scanner.shared.unpair(uuid: uuid)
-                    }
-                }
-            }
-        }
-
+        // camera Wi-Fi AP at a time. The coordinator's `Insta360RadioGate`
+        // serializes Wi-Fi acquisition across cameras for us and demotes
+        // other cameras to slow-mode heartbeat (8 s) while one camera
+        // holds the lease — no prefetch+unpair dance needed.
+        //
+        // Per `cheeky-baking-allen.md`, BLE stays paired for the whole
+        // app lifecycle; the previous `prefetchPairCameras` + defer-unpair
+        // pattern was a workaround that pre-coordinator code needed to
+        // keep cameras "warm" between sessions, and tearing it down now
+        // because intentional unpairs there were what kicked the
+        // supervisor into `reconnecting → lost` after every collect.
         for group in groups {
             emitGroupPhase(group, phase: "scanning")
-        }
-        let prefetch = await Self.prefetchPairCameras(groups) { uuid, preferredName in
-            try await Insta360Scanner.shared.pair(
-                uuid: uuid,
-                preferredName: preferredName)
-        }
-        prefetchedUUIDs = prefetch.prefetchedUUIDs
-        if prefetch.wasCancelled {
-            throw CancellationError()
         }
         try Task.checkCancellation()
 
@@ -455,6 +444,11 @@ public actor Insta360Collector {
             try Task.checkCancellation()
             do {
                 emitGroupPhase((uuid, group), phase: "pairing")
+                // `Insta360Scanner.shared.pair` is idempotent — if the
+                // supervisor's persistent pair is still live, this
+                // returns immediately. Kept so a previously-disconnected
+                // camera (e.g. coordinator gave up to `.lost`) can still
+                // recover at collect time.
                 try await Insta360Scanner.shared.pair(
                     uuid: uuid,
                     preferredName: group.first?.sidecar.bleName)
@@ -481,7 +475,18 @@ public actor Insta360Collector {
                     ssid: creds.ssid,
                     cameraLabel: group.first?.sidecar.bleName)
                 let downloader = Insta360WiFiDownloader()
-                let batchResults = await downloader.downloadBatch(
+                // Hold a Wi-Fi lease across the entire NEHotspotConfiguration
+                // dance for THIS camera. The RadioGate ensures any second
+                // camera's `acquireWiFi` blocks until our `releaseWiFi`,
+                // and demotes other supervised cameras to slow-mode
+                // heartbeat (config.radioGateSlowHeartbeatIntervalMs)
+                // while we hold the lease so the BLE radio doesn't
+                // starve them during the AP switch. Holder's own
+                // heartbeat is suspended for the lease duration.
+                let batchResults = await Insta360ConnectionCoordinator.shared.withWiFi(
+                    bindingKey: uuid
+                ) { _ in
+                    await downloader.downloadBatch(
                     ssid: creds.ssid,
                     passphrase: creds.passphrase,
                     items: batchItems,
@@ -508,6 +513,7 @@ public actor Insta360Collector {
                             phase: "downloading",
                             fraction: fraction))
                     })
+                }
                 try Task.checkCancellation()
 
                 for br in batchResults {
