@@ -644,10 +644,16 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
         self.bluetoothManager = bluetoothManager
         super.init()
         INSCameraManager.shared().setup()
-        // Delegate is set on every init — last controller wins the slot.
-        // The delegate methods gate on UUID match, so stale controllers
-        // correctly no-op on events not belonging to their device.
-        bluetoothManager.delegate = self
+        // Register with the process-wide delegate broker. The SDK's
+        // `INSBluetoothManager.delegate` is a single weak slot — directly
+        // assigning `self` here would steal the slot from any previously-
+        // initialized controller, so a two-camera setup loses disconnect
+        // routing for the older controller (root cause of S3's stuck
+        // `bleDegraded`). The broker claims the slot once and fans every
+        // delegate callback out to every registered controller; each
+        // controller still gates side effects on its own UUID match.
+        Insta360BluetoothDelegateBroker.shared.register(self,
+                                                       on: bluetoothManager)
 
         // Capture stop arrives as `NSNotification.Name.INSCameraCaptureStopped`
         // because the SDK exposes that name as a Swift extension. The other
@@ -676,6 +682,7 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
 
     deinit {
         NotificationCenter.default.removeObserver(self)
+        Insta360BluetoothDelegateBroker.shared.unregister(self)
     }
 
     @objc private func onCaptureStopped(_ notification: Notification) {
@@ -2248,32 +2255,41 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
     }
 }
 
-// MARK: - INSBluetoothManagerDelegate
+// MARK: - INSBluetoothManagerDelegate (fanned in by broker)
 
-extension Insta360BLEController: INSBluetoothManagerDelegate {
-    public func deviceDidConnected(_ device: INSBluetoothDevice) {
+extension Insta360BLEController {
+    /// Broker-dispatched. Each registered controller receives every event;
+    /// gate side effects on the device-UUID match below.
+    func bluetoothDelegate_deviceDidConnected(_ device: INSBluetoothDevice) {
+        // Currently a no-op: the connect path lives in `pair(uuid:)` /
+        // `reconnect(...)` which use their own completion callbacks. Keep
+        // the entry point so future telemetry can hook in.
     }
 
-    public func device(_ device: INSBluetoothDevice, didDisconnectWithError error: Error?) {
-        InstaLog.log(.ble, level: .warn, "didDisconnectWithError",
-                     ["device": Self.displayName(for: device),
-                      "error": error?.localizedDescription ?? "none"])
-        // Match the incoming device against BOTH the live `connectedDevice`
-        // (typical drop) AND `lastKnownUUID` (rare cases where teardown
-        // ordering clears `connectedDevice` before CoreBluetooth surfaces
-        // the disconnect — observed during stop-recording flows). Without
-        // the second check the supervisor wouldn't be notified and would
-        // stay in `bleReady` while the link is gone.
+    /// Broker-dispatched. The same disconnect callback arrives on every
+    /// controller; we only act when the disconnected device is the one
+    /// THIS controller is bound to. The combined check (`connectedDevice`
+    /// vs `lastKnownUUID`) covers the stop-recording teardown race where
+    /// `connectedDevice` is cleared before CoreBluetooth surfaces the
+    /// drop.
+    func bluetoothDelegate_device(_ device: INSBluetoothDevice,
+                                  didDisconnectWithError error: Error?) {
         let isOurDevice =
             connectedDevice?.identifierUUIDStringSafe == device.identifierUUIDStringSafe
             || lastKnownUUID == device.identifierUUIDStringSafe
-        if isOurDevice {
-            Self.unregisterPaired(device.identifierUUIDStringSafe)
-            stopHeartbeat()
-            connectedDevice = nil
-            if let handler = unsolicitedDisconnectHandler {
-                Task { await handler(error) }
-            }
+        // Log only on our own controller to avoid N×duplicate lines when
+        // multiple controllers receive the same broker fan-out — the
+        // role-suffixed supervisor log downstream provides the audit
+        // trail for non-bound listeners.
+        guard isOurDevice else { return }
+        InstaLog.log(.ble, level: .warn, "didDisconnectWithError",
+                     ["device": Self.displayName(for: device),
+                      "error": error?.localizedDescription ?? "none"])
+        Self.unregisterPaired(device.identifierUUIDStringSafe)
+        stopHeartbeat()
+        connectedDevice = nil
+        if let handler = unsolicitedDisconnectHandler {
+            Task { await handler(error) }
         }
     }
 

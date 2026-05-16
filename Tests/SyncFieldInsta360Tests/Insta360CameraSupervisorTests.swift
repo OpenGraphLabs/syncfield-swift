@@ -170,6 +170,33 @@ final class Insta360CameraSupervisorTests: XCTestCase {
         await assertStateEquals(sup, .lost)
     }
 
+    /// S3 regression: when a camera physically goes out of range, the heartbeat
+    /// poll fails first (driving bleReady → bleDegraded), and CoreBluetooth
+    /// surfaces the disconnect somewhat later. The supervisor must accept the
+    /// disconnect from `.bleDegraded` and schedule reconnect, not get stuck
+    /// in degraded state.
+    func testDisconnectFromBleDegradedSchedulesReconnect() async {
+        let driverCalled = expectation(description: "reconnect driver invoked")
+        let (sup, obs) = await makeSupervisor(
+            reconnectDriver: { driverCalled.fulfill() })
+        await sup.handle(.attached)
+        await sup.handle(.scanHit(rssi: -65))
+        await sup.handle(.readinessProbeAck(elapsedMs: 100))
+        // Drive into bleDegraded via two heartbeat misses (matches the live
+        // SDK flow: out-of-range camera = RSSI probe failures).
+        await sup.handle(.heartbeatMiss)
+        await sup.handle(.heartbeatMiss)
+        await assertStateEquals(sup, .bleDegraded)
+        // CoreBluetooth surfaces the disconnect — supervisor must accept it
+        // even though current state is degraded, not bleReady.
+        await sup.handle(.unsolicitedDisconnect(error: "timed out"))
+
+        await fulfillment(of: [driverCalled], timeout: 1)
+        let states = (await obs.snapshotTransitions()).map(\.to)
+        XCTAssertTrue(states.contains(.reconnecting),
+                      "expected reconnecting transition from bleDegraded, got \(states)")
+    }
+
     // MARK: - Persistent classifier S9
 
     func testThreeEmptyScanWindowsClassifyAsLost() async {
