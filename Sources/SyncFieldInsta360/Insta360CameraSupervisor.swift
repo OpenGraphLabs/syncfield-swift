@@ -354,6 +354,15 @@ public actor Insta360CameraSupervisor {
             wakeAttemptStartedAtMs = nil
             wakeStallPromptEmitted = false
             consecutiveEmptyScanWindows = 0
+            // Reset the backoff counter too. Without this, repeatedly
+            // tapping "Force Reconnect" in Diagnostics on an off camera
+            // kept advancing `reconnectAttempt` through the ramp
+            // (1 → 2 → ... → 8+ with 60 s sleeps) — meaning each tap
+            // actually made the next retry SLOWER. A user-driven
+            // explicit retry should start fast (500 ms), like a fresh
+            // disconnect would.
+            reconnectAttempt = 0
+            lastUnsolicitedDisconnectAtMs = nil
             await transition(to: .searching, reason: "force_reconnect")
             scheduleReconnect()
 
