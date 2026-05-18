@@ -87,7 +87,7 @@ public struct VideoSettings: Sendable {
     public static let uhd4K = VideoSettings(width: 3840, height: 2160, fps: 30)
 }
 
-public final class iPhoneCameraStream: NSObject, SyncFieldStream, @unchecked Sendable {
+public final class iPhoneCameraStream: NSObject, SyncFieldStream, AudioReattachableStream, @unchecked Sendable {
     public nonisolated let streamId: String
     public nonisolated let capabilities = StreamCapabilities(
         requiresIngest: false, producesFile: true,
@@ -118,6 +118,26 @@ public final class iPhoneCameraStream: NSObject, SyncFieldStream, @unchecked Sen
     private var frameProcessor: ((@Sendable (CMSampleBuffer, Int) -> Void))?
     private var throttleHz: Double = 0
     private var lastProcessorCall: CFAbsoluteTime = 0
+
+    /// Wall-clock of the most recent audio `CMSampleBuffer` delivered to the
+    /// capture delegate. Used by the audio watchdog to detect a permanent
+    /// stall (interruption that we missed, or an unrecoverable
+    /// AVAudioSession deactivation). Updated unconditionally on every audio
+    /// callback, regardless of whether the buffer was appended.
+    private var lastAudioSampleHostTime: CFAbsoluteTime = 0
+    private var audioWatchdog: DispatchSourceTimer?
+    /// One-shot guard for the watchdog's automatic reattach. Production
+    /// failure modes that resist reattach (mic-locked by another app, an
+    /// in-progress phone call) shouldn't trigger a tight reattach loop —
+    /// emit `audioStalled` ticks instead and let the host UI surface it.
+    private var audioRecoveryAttempted = false
+
+    /// Audio sample buffers must arrive at least this often or the watchdog
+    /// declares a stall and attempts recovery. 2.0s is large enough to
+    /// absorb normal AVCaptureSession reconfiguration windows (~0.5s) and
+    /// the AVAssetWriter startWriting transient deactivate, while still
+    /// catching a real interruption within one tick.
+    private static let audioStallThresholdSeconds: Double = 2.0
 
     /// Set via `setIntrinsicMatrixHandler`. Fires once per sample buffer that
     /// carries a `kCMSampleBufferAttachmentKey_CameraIntrinsicMatrix`
@@ -505,9 +525,85 @@ public final class iPhoneCameraStream: NSObject, SyncFieldStream, @unchecked Sen
             self.assetWriterInput = input
             self.assetWriterAudioInput = newAudioInput
             self.isRecording = true
+            // Seed the watchdog so the first tick (at +stallThreshold) has
+            // a non-zero baseline. Without this, t=0 would itself look
+            // like a stall.
+            self.lastAudioSampleHostTime = CFAbsoluteTimeGetCurrent()
+            self.audioRecoveryAttempted = false
+            self.startAudioWatchdogOnVideoQueue()
         }
         #endif
     }
+
+    /// Re-create the AVCaptureDeviceInput for `.audio` and re-attach it to
+    /// the running capture session. Used by:
+    ///   - `AudioSessionInterruptionHandler` after `.ended`
+    ///   - `tickAudioWatchdog` after a sample-buffer stall is detected
+    ///
+    /// Wrapped in `beginConfiguration`/`commitConfiguration`. AVCaptureSession
+    /// supports this while running; a single frame may be dropped during
+    /// the configuration window. Cheaper than `stopRunning`/`startRunning`,
+    /// which would also re-apply AVAudioSession state and risk re-triggering
+    /// the very transient deactivate that started the problem.
+    ///
+    /// No-op on platforms without AVFoundation (Linux / non-Apple targets).
+    public func reattachAudioInput() async throws {
+        #if canImport(AVFoundation)
+        captureSession.beginConfiguration()
+        defer { captureSession.commitConfiguration() }
+        for input in captureSession.inputs {
+            if let di = input as? AVCaptureDeviceInput,
+               di.device.hasMediaType(.audio) {
+                captureSession.removeInput(di)
+            }
+        }
+        guard let device = AVCaptureDevice.default(for: .audio) else { return }
+        let newInput = try AVCaptureDeviceInput(device: device)
+        if captureSession.canAddInput(newInput) {
+            captureSession.addInput(newInput)
+        }
+        // Reset the watchdog baseline so the next tick doesn't immediately
+        // re-fire a stall before the first post-reattach buffer lands.
+        videoQueue.async { [weak self] in
+            self?.lastAudioSampleHostTime = CFAbsoluteTimeGetCurrent()
+            self?.audioRecoveryAttempted = false
+        }
+        await healthBus?.publish(.audioRecovered(streamId: streamId))
+        #endif
+    }
+
+    #if canImport(AVFoundation)
+    /// Must be called from `videoQueue` (it touches `audioWatchdog` and the
+    /// recording-state fields without a lock).
+    private func startAudioWatchdogOnVideoQueue() {
+        audioWatchdog?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: videoQueue)
+        timer.schedule(
+            deadline: .now() + Self.audioStallThresholdSeconds,
+            repeating: 1.0)
+        timer.setEventHandler { [weak self] in self?.tickAudioWatchdog() }
+        audioWatchdog = timer
+        timer.resume()
+    }
+
+    private func tickAudioWatchdog() {
+        guard isRecording else { return }
+        let silentFor = CFAbsoluteTimeGetCurrent() - lastAudioSampleHostTime
+        guard silentFor >= Self.audioStallThresholdSeconds else { return }
+        let sid = streamId
+        let hb = healthBus
+        let shouldTryReattach = !audioRecoveryAttempted
+        // Mark immediately so concurrent ticks don't queue up reattaches.
+        audioRecoveryAttempted = true
+        Task { [weak self] in
+            await hb?.publish(.audioStalled(streamId: sid,
+                                            silentForSeconds: silentFor))
+            if shouldTryReattach {
+                try? await self?.reattachAudioInput()
+            }
+        }
+    }
+    #endif
 
     public func stopRecording() async throws -> StreamStopReport {
         #if canImport(AVFoundation)
@@ -527,6 +623,8 @@ public final class iPhoneCameraStream: NSObject, SyncFieldStream, @unchecked Sen
             self.assetWriter = nil
             self.assetWriterInput = nil
             self.assetWriterAudioInput = nil
+            self.audioWatchdog?.cancel()
+            self.audioWatchdog = nil
         }
         capturedAudioInput?.markAsFinished()
         capturedVideoInput?.markAsFinished()
@@ -635,6 +733,10 @@ extension iPhoneCameraStream: AVCaptureVideoDataOutputSampleBufferDelegate,
         // dropped on purpose; otherwise appending audio before startSession
         // traps with the same "status is 0" exception as video.
         if output is AVCaptureAudioDataOutput {
+            // Update the watchdog baseline unconditionally on every audio
+            // callback — even if the buffer gets dropped by the guards
+            // below, the AVCaptureSession's audio capture path is alive.
+            lastAudioSampleHostTime = CFAbsoluteTimeGetCurrent()
             guard isRecording,
                   let writer = assetWriter,
                   writer.status == .writing,

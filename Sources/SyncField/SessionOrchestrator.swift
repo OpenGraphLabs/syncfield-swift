@@ -569,6 +569,10 @@ public actor SessionOrchestrator {
         for s in streams {
             try? await s.disconnect()
         }
+        #if canImport(AVFoundation) && os(iOS)
+        audioInterruption?.stop()
+        audioInterruption = nil
+        #endif
         bus.finish()
         state = .idle
     }
@@ -591,6 +595,10 @@ public actor SessionOrchestrator {
     private let preStopTailMarginMs: Double
     private let streamStartTimeoutSeconds: Double
     private let audioSessionPolicy: AudioSessionPolicy
+    /// Observes `AVAudioSession.interruptionNotification` while we hold
+    /// the audio session under `.managedBySDK`. Installed once at
+    /// `applyAudioSessionPolicy()` and torn down at `disconnect()`.
+    private var audioInterruption: AudioSessionInterruptionHandler?
     private let countdownTickPlayer = CountdownTickPlayer()
     private var startEmission: ChirpEmission?
     private var stopEmission: ChirpEmission?
@@ -726,6 +734,45 @@ public actor SessionOrchestrator {
             try SyncFieldAudioSession.applyManagedConfig()
         } catch {
             NSLog("[SyncField] AVAudioSession config failed (\(error.localizedDescription)); continuing with whatever the host left in place.")
+        }
+        // Install the interruption observer exactly once per `connect()`
+        // lifecycle. The handler keeps a weak ref to self via the Task
+        // closure below; teardown happens in `disconnect()`.
+        if audioInterruption == nil {
+            let handler = AudioSessionInterruptionHandler { [weak self] in
+                await self?.recoverFromInterruption()
+            }
+            handler.start()
+            audioInterruption = handler
+        }
+        #endif
+    }
+
+    /// Called after `AVAudioSession.interruptionNotification` fires with
+    /// `.ended`. Re-applies the managed configuration and reattaches the
+    /// audio capture input on every stream that supports it. Non-fatal —
+    /// failures are logged and the session continues; the audio watchdog
+    /// inside each stream catches anything that still hasn't recovered.
+    ///
+    /// No-op outside iOS (the notification only fires there).
+    private func recoverFromInterruption() async {
+        // No-op when we're not actively recording — `.ended` can arrive
+        // after `stopRecording` raced the system event.
+        guard state == .recording || state == .stopping else { return }
+        #if canImport(AVFoundation) && os(iOS)
+        do {
+            try SyncFieldAudioSession.applyManagedConfig()
+        } catch {
+            NSLog("[SyncField] interruption recovery: applyManagedConfig failed (\(error.localizedDescription))")
+        }
+        for stream in streams {
+            if let cam = stream as? AudioReattachableStream {
+                do {
+                    try await cam.reattachAudioInput()
+                } catch {
+                    NSLog("[SyncField] interruption recovery: reattach \(stream.streamId) failed (\(error.localizedDescription))")
+                }
+            }
         }
         #endif
     }
