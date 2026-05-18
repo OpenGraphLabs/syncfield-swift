@@ -118,6 +118,22 @@ public final class iPhoneCameraStream: NSObject, SyncFieldStream, AudioReattacha
     private var frameProcessor: ((@Sendable (CMSampleBuffer, Int) -> Void))?
     private var throttleHz: Double = 0
     private var lastProcessorCall: CFAbsoluteTime = 0
+    /// Off-queue dispatch for the host-supplied frame processor. Without
+    /// this the processor runs inline on `videoQueue` and any call that
+    /// exceeds the inter-frame interval (~33 ms at 30 fps) causes
+    /// `AVCaptureVideoDataOutput` to silently drop the next sample
+    /// (`alwaysDiscardsLateVideoFrames = true`). Heavy on-device
+    /// inferencers (MediaPipe hand landmarker on CPU, large Vision
+    /// requests) routinely exceed that window during egocentric capture
+    /// — production captures from May 2026 show the ego mp4 collapsing
+    /// to 8–20 fps while the wrist cameras (which encode on-device,
+    /// independent of this queue) hold a clean 30 fps.
+    ///
+    /// The gate enforces *drop-on-busy*: when a prior dispatch is still
+    /// running the new sample is rejected without queueing, mirroring
+    /// the capture-output policy so backpressure can't accumulate while
+    /// the detector recovers from a slow frame.
+    private let processorGate = FrameProcessorGate(label: "syncfield.camera.processor")
 
     /// Wall-clock of the most recent audio `CMSampleBuffer` delivered to the
     /// capture delegate. Used by the audio watchdog to detect a permanent
@@ -626,6 +642,14 @@ public final class iPhoneCameraStream: NSObject, SyncFieldStream, AudioReattacha
             self.audioWatchdog?.cancel()
             self.audioWatchdog = nil
         }
+        // Drain in-flight frame-processor work *after* clearing the
+        // writer references on videoQueue. A late processor callback
+        // can therefore touch host-side state only — never the
+        // assetWriter we're about to finish — and the surrounding host
+        // app can rely on "stopRecording returned ⇒ no more processor
+        // callbacks will fire" for its own teardown (the og-skill
+        // bridge releases `handDetection` immediately after).
+        processorGate.drain()
         capturedAudioInput?.markAsFinished()
         capturedVideoInput?.markAsFinished()
         if let w = capturedWriter, w.status == .writing {
@@ -651,6 +675,14 @@ public final class iPhoneCameraStream: NSObject, SyncFieldStream, AudioReattacha
     public func disconnect() async throws {
         #if canImport(AVFoundation)
         captureSession.stopRunning()
+        // After stopRunning the capture-output delegate stops firing,
+        // but a frame-processor dispatch already in flight on the gate
+        // is independent. Drain so the host's processor closure has
+        // fully returned by the time disconnect resolves — important
+        // for the preview-only path (processor wired but no recording),
+        // and for clean teardown when disconnect is called without a
+        // preceding stopRecording.
+        processorGate.drain()
         selectedVideoDevice = nil
         #endif
         await healthBus?.publish(.streamDisconnected(streamId: streamId, reason: "normal"))
@@ -748,13 +780,22 @@ extension iPhoneCameraStream: AVCaptureVideoDataOutputSampleBufferDelegate,
         }
 
         // Frame processor (throttled) — runs whether or not we're recording
-        // so previews keep working during preview-only phases.
+        // so previews keep working during preview-only phases. Dispatched
+        // through `processorGate` to a dedicated serial queue so the
+        // processor closure never blocks the capture queue. When a prior
+        // dispatch is still in flight the gate refuses the new sample and
+        // we drop it on the producer side rather than letting AVFoundation
+        // silently discard the *next* incoming frame. See the
+        // `processorGate` declaration for the motivating production data.
         if let processor = frameProcessor {
             let now = CFAbsoluteTimeGetCurrent()
             let interval = throttleHz > 0 ? 1.0 / throttleHz : 0
             if now - lastProcessorCall >= interval {
-                processor(sampleBuffer, frameCount)
-                lastProcessorCall = now
+                let snapshot = sampleBuffer
+                let frameIndex = frameCount
+                if processorGate.tryEnqueue({ processor(snapshot, frameIndex) }) {
+                    lastProcessorCall = now
+                }
             }
         }
 
