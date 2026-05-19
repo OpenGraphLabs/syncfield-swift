@@ -2,6 +2,30 @@
 
 All notable changes to **syncfield-swift** are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0] — 2026-05-19
+
+Stabilizes egocentric iPhone capture frame rate when the host installs a heavy frame processor. Source-compatible with 0.9.x.
+
+### Fixed
+- **`iPhoneCameraStream` frame processor no longer blocks the capture serial queue.** Before 0.10.0, the closure installed via `setFrameProcessor(throttleHz:_:)` ran inline on the `AVCaptureVideoDataOutput` delegate queue. Because the SDK sets `alwaysDiscardsLateVideoFrames = true` (the right default for real-time capture), any processor call that exceeded the inter-frame budget (~33 ms at 30 fps) caused AVFoundation to silently drop the next incoming sample. Hosts with on-device inference workloads — og-skill's MediaPipe hand-landmarker pipeline being the production case — saw the ego mp4 collapse to 8–20 fps while the on-camera-encoded wrist streams held a clean 30 fps. Production captures through 2026-05-18 show the bimodal "33 ms vs 67 ms" inter-frame gap signature in `cam_ego.timestamps.jsonl`, and within-session drop rates that climbed from 20 % to 75 % as the device warmed up.
+- The processor now dispatches through a new `FrameProcessorGate` to a dedicated serial queue (`syncfield.camera.processor`, `.userInitiated`). When a prior call is still running, new samples are rejected by the gate (`tryEnqueue` returns `false`) and dropped on the producer side rather than letting AVFoundation discard them silently. Captured frame count is unaffected by processor latency; only the processor invocation count drops.
+- `stopRecording` and `disconnect` now `drain()` the gate before returning, so hosts can rely on "stopRecording resolved ⇒ no more processor callbacks" for their own teardown (og-skill's bridge releases `HandDetectionEngine` immediately after stop).
+
+### Changed
+- `SyncFieldVersion.current` confirmed at `0.10.0`.
+
+### Compatibility
+- API source-compatible with 0.9.x. `setFrameProcessor(throttleHz:_:)` signature and semantics unchanged from the host's perspective. Only the dispatch queue the closure runs on changes: previously the capture serial queue (`syncfield.camera`), now a dedicated processor queue (`syncfield.camera.processor`). Hosts that already `Task { … }` or `await` inside the closure are unaffected. Hosts that read `__dispatch_queue_get_label(nil)` inside the closure will see the new label; no production host does this.
+- Drop-on-busy is enforced even when `throttleHz == 0`. A closure that occasionally exceeds the inter-frame budget will skip samples instead of producing them in lockstep with capture; this matches what AVFoundation was already doing silently, and is the only safe contract under serial-detector requirements (e.g. MediaPipe `.video` mode).
+
+### Tests
+- `FrameProcessorGateTests` — pure-Swift unit coverage of the gate (dispatch, drop-on-busy, drain, repeated-enqueue, under-load serialization). Runs on every platform.
+- `iPhoneCameraStreamTests` extended with four device-only end-to-end regressions:
+  - `test_slow_frame_processor_does_not_block_capture_queue` (60 ms processor → still ≥ 60 frames in 3 s)
+  - `test_drop_on_busy_caps_processor_invocations` (100 ms processor → ≤ 30 calls in 2 s, ≥ 40 frames captured)
+  - `test_fast_frame_processor_called_for_every_delivered_frame` (no-op processor → calls ≈ frames)
+  - `test_frame_processor_runs_on_dedicated_queue` (queue-label assertion)
+
 ## [0.9.7] — 2026-05-15
 
 Patch release that keeps queued Insta360 wrist cameras awake during batched multi-camera collect. Source-compatible with 0.9.x.
