@@ -8,6 +8,7 @@ public enum SessionError: Error, CustomStringConvertible, LocalizedError {
     case startFailed(cause: Error, rolledBack: [String])
     case manualStopRecoveryUnsupported(streamId: String)
     case notRunning
+    case deviceUnsupported(reason: String)
 
     public var description: String {
         switch self {
@@ -23,6 +24,36 @@ public enum SessionError: Error, CustomStringConvertible, LocalizedError {
             return "SessionError: stream '\(streamId)' does not support manual stop recovery"
         case .notRunning:
             return "SessionError: operation requires the session to be running"
+        case .deviceUnsupported(let reason):
+            return "SessionError: device unsupported (\(reason))"
+        }
+    }
+
+    public var errorDescription: String? { description }
+}
+
+/// Errors raised by the one-time `CameraCalibrationProber`. Caller (the host
+/// app's bridge) decides whether to fall back gracefully or surface to the
+/// user — the prober itself never silently swallows failure.
+public enum ProbeError: Error, Equatable, CustomStringConvertible, LocalizedError {
+    /// Device has no ultra-wide camera or no photo output supporting calibration.
+    case unsupportedDevice
+    /// Camera permission has not been granted (or was revoked).
+    case permissionDenied
+    /// Probe did not produce a `cameraCalibrationData` payload within the timeout.
+    case probeTimeout
+    /// AVFoundation delivered a photo but `cameraCalibrationData` was nil.
+    case calibrationDataMissing
+    /// Catch-all for AVFoundation failures wrapped with a description.
+    case underlying(String)
+
+    public var description: String {
+        switch self {
+        case .unsupportedDevice: return "ProbeError: unsupported device"
+        case .permissionDenied: return "ProbeError: camera permission denied"
+        case .probeTimeout: return "ProbeError: probe timed out"
+        case .calibrationDataMissing: return "ProbeError: calibration data missing from photo"
+        case .underlying(let msg): return "ProbeError: \(msg)"
         }
     }
 

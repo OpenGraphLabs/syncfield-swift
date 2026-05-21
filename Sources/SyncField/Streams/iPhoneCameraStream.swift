@@ -24,6 +24,28 @@ public struct ActiveCameraMetadata: Sendable {
     public let activeFormatWidth: Int
     public let activeFormatHeight: Int
     public let fieldOfViewDegrees: Double
+    /// Geometric Distortion Correction state of the device at configure time.
+    /// `false` ⇒ recorded video is fisheye-raw (Physical-AI-grade); `true` ⇒
+    /// iOS already undistorted the ultrawide stream into a quasi-pinhole frame
+    /// with a narrower effective FOV. The writer flips `is_fisheye_raw` in
+    /// `camera_intrinsics.json` based on this flag.
+    public let gdcEnabled: Bool
+
+    public init(
+        deviceTypeRawValue: String,
+        deviceLocalizedName: String,
+        activeFormatWidth: Int,
+        activeFormatHeight: Int,
+        fieldOfViewDegrees: Double,
+        gdcEnabled: Bool
+    ) {
+        self.deviceTypeRawValue = deviceTypeRawValue
+        self.deviceLocalizedName = deviceLocalizedName
+        self.activeFormatWidth = activeFormatWidth
+        self.activeFormatHeight = activeFormatHeight
+        self.fieldOfViewDegrees = fieldOfViewDegrees
+        self.gdcEnabled = gdcEnabled
+    }
 }
 
 /// Values extracted from a single `kCMSampleBufferAttachmentKey_CameraIntrinsicMatrix`
@@ -83,6 +105,13 @@ public struct VideoSettings: Sendable {
     public static let hd720_60 = VideoSettings(width: 1280, height: 720, fps: 60)
     /// 1920 × 1080 H.264 @ 30 fps — legacy default used before v0.2.10.
     public static let fullHD = VideoSettings(width: 1920, height: 1080, fps: 30)
+    /// 1920 × 1080 H.264 @ 30 fps tuned for Physical-AI-grade egocentric
+    /// capture: matches the EgoVerse phone-pipeline spec exactly and is the
+    /// resolution the host's calibration probe rescales factory intrinsics
+    /// against. Functionally identical to `.fullHD` today (kept as a separate
+    /// preset so future tuning — bitrate, color profile — can diverge
+    /// without breaking legacy callers).
+    public static let egocentric1080p = VideoSettings(width: 1920, height: 1080, fps: 30)
     /// 3840 × 2160 H.264 @ 30 fps — only on devices that expose a UHD back camera.
     public static let uhd4K = VideoSettings(width: 3840, height: 2160, fps: 30)
 }
@@ -95,6 +124,14 @@ public final class iPhoneCameraStream: NSObject, SyncFieldStream, AudioReattacha
         providesAudioTrack: true)
 
     private let videoSettings: VideoSettings
+    private let _probedCalibration: ProbedCameraCalibration?
+
+    /// Factory-calibrated lens parameters supplied at construction time
+    /// (typically from `CameraCalibrationProber`). Hosts pass `nil` when no
+    /// cached probe is available — the writer then falls back to its
+    /// FOV-based estimate. Exposed read-only so the host's intrinsics
+    /// writer can read this alongside `activeCameraMetadata`.
+    public var probedCalibration: ProbedCameraCalibration? { _probedCalibration }
 
     #if canImport(AVFoundation)
     public let captureSession = AVCaptureSession()
@@ -170,10 +207,31 @@ public final class iPhoneCameraStream: NSObject, SyncFieldStream, AudioReattacha
         self.init(streamId: streamId, videoSettings: .fullHD)
     }
 
-    public init(streamId: String, videoSettings: VideoSettings) {
+    public init(
+        streamId: String,
+        videoSettings: VideoSettings,
+        probedCalibration: ProbedCameraCalibration? = nil
+    ) {
         self.streamId = streamId
         self.videoSettings = videoSettings
+        self._probedCalibration = probedCalibration
         super.init()
+    }
+
+    /// Startup capability gate. Returns `true` only when the device exposes
+    /// `.builtInUltraWideCamera` as a physical back camera. Hosts call this
+    /// at app launch, before any AVCaptureSession is constructed, to route
+    /// unsupported hardware (iPhone SE / X / XS / XR / 8 and earlier) to an
+    /// "unsupported device" screen instead of falling through to a wrong-FOV
+    /// fallback.
+    public static func isDeviceSupported() -> Bool {
+        #if os(iOS) && canImport(AVFoundation)
+        return AVCaptureDevice.default(
+            .builtInUltraWideCamera, for: .video, position: .back
+        ) != nil
+        #else
+        return false
+        #endif
     }
 
     public func prepare() async throws {}
@@ -206,23 +264,28 @@ public final class iPhoneCameraStream: NSObject, SyncFieldStream, AudioReattacha
     private func configureSession() throws {
         captureSession.beginConfiguration()
         // Commit + post-commit configuration (stabilization, intrinsics
-        // delivery) run on `defer` so every early-exit path leaves the
-        // session in a consistent state. The connection that
-        // stabilization/intrinsics touch only exists after commit.
+        // delivery, GDC off) run on `defer` so every early-exit path leaves
+        // the session in a consistent state. The connection that
+        // stabilization/intrinsics touch only exists after commit; GDC
+        // toggles on the device but is grouped here so the post-commit
+        // sequence is the single source of truth for the lens state.
         defer {
             captureSession.commitConfiguration()
             disableVideoStabilization()
             enableCameraIntrinsicsDelivery()
+            disableGeometricDistortionCorrection()
         }
 
         captureSession.sessionPreset = matchingCapturePreset
 
         guard let device = Self.widestBackCamera() else {
+            // Strict ultra-wide-only gate. Hosts should have called
+            // `iPhoneCameraStream.isDeviceSupported()` at startup; reaching
+            // here means we are running on iPhone SE / X / XS / XR / 8 (no
+            // ultra-wide hardware) or a non-iOS platform.
             throw StreamError(streamId: streamId,
-                              underlying: NSError(domain: "SyncField.Camera",
-                                                  code: -1,
-                                                  userInfo: [NSLocalizedDescriptionKey:
-                                                  "back camera not available"]))
+                              underlying: SessionError.deviceUnsupported(
+                                reason: "ultra-wide back camera required (iPhone 11 or later, excluding SE)"))
         }
 
         configureWidestFormatAndZoom(device: device)
@@ -257,73 +320,28 @@ public final class iPhoneCameraStream: NSObject, SyncFieldStream, AudioReattacha
         // If mic is unavailable (permissions, hardware) we fall through without audio.
     }
 
-    /// Default-back-camera lookup that prefers the physical ultra-wide so
-    /// recordings get the widest possible field of view — the right
-    /// behaviour for egocentric / head-mounted capture, which is the SDK's
-    /// primary use case. On devices without a dedicated ultra-wide
-    /// (iPhone SE, X, 8 and earlier) `DiscoverySession` ranking falls back
-    /// to the standard wide-angle camera, preserving the pre-0.9 behaviour
-    /// on that hardware.
+    /// Strict ultra-wide-only back-camera lookup. Returning `nil` is a
+    /// terminal condition: hosts must gate at startup via
+    /// `iPhoneCameraStream.isDeviceSupported()` and route unsupported
+    /// devices (iPhone SE, iPhone X / XS / XR / 8 and earlier — no
+    /// ultra-wide hardware) to an "unsupported device" screen.
+    ///
+    /// Falling back to the standard wide-angle camera (the pre-0.9 SDK
+    /// behaviour) is intentionally removed: it produces visually similar
+    /// but geometrically different data (≈75° FOV vs ≈120° on ultra-wide),
+    /// silently polluting egocentric datasets. Failing loud is the right
+    /// behaviour for Physical-AI-grade capture.
     private static func widestBackCamera() -> AVCaptureDevice? {
         #if os(iOS)
-        if let ultraWide = AVCaptureDevice.default(
+        return AVCaptureDevice.default(
             .builtInUltraWideCamera,
             for: .video,
             position: .back
-        ) {
-            return ultraWide
-        }
-
-        let discovery = AVCaptureDevice.DiscoverySession(
-            deviceTypes: [
-                .builtInUltraWideCamera,
-                .builtInDualWideCamera,
-                .builtInTripleCamera,
-                .builtInWideAngleCamera
-            ],
-            mediaType: .video,
-            position: .back
         )
-
-        return discovery.devices.sorted { lhs, rhs in
-            let lhsRank = Self.devicePreferenceRank(lhs)
-            let rhsRank = Self.devicePreferenceRank(rhs)
-            if lhsRank != rhsRank { return lhsRank < rhsRank }
-            return Self.maximumFieldOfView(lhs) > Self.maximumFieldOfView(rhs)
-        }.first
         #else
-        // macOS: no ultra-wide / multi-lens variants exist; fall back to
-        // the standard wide-angle pick that preserved the pre-0.9 SDK
-        // behaviour.
-        return AVCaptureDevice.default(
-            .builtInWideAngleCamera, for: .video, position: .back
-        )
-        #endif
-    }
-
-    private static func devicePreferenceRank(_ device: AVCaptureDevice) -> Int {
-        #if os(iOS)
-        switch device.deviceType {
-        case .builtInUltraWideCamera:
-            return 0
-        case .builtInDualWideCamera, .builtInTripleCamera:
-            return 1
-        case .builtInWideAngleCamera:
-            return 2
-        default:
-            return 3
-        }
-        #else
-        return 0
-        #endif
-    }
-
-    private static func maximumFieldOfView(_ device: AVCaptureDevice) -> Float {
-        #if os(iOS)
-        return device.formats.map(\.videoFieldOfView).max()
-            ?? device.activeFormat.videoFieldOfView
-        #else
-        return 0
+        // macOS / non-iOS: no ultra-wide hardware exists. Caller treats nil
+        // as "unsupported device" and throws.
+        return nil
         #endif
     }
 
@@ -460,6 +478,10 @@ public final class iPhoneCameraStream: NSObject, SyncFieldStream, AudioReattacha
     /// cx/cy beyond an FOV-based estimate. Some formats / stabilization
     /// modes silently refuse the request — when that happens the property
     /// no-ops and `setIntrinsicMatrixHandler` simply never fires.
+    ///
+    /// Apple does not deliver this attachment on `.builtInUltraWideCamera`
+    /// (forum thread 666517). The opt-in is kept enabled defensively so
+    /// the path lights up for future iOS releases or different cameras.
     private func enableCameraIntrinsicsDelivery() {
         #if os(iOS)
         guard let connection = videoOutput.connection(with: .video),
@@ -467,6 +489,39 @@ public final class iPhoneCameraStream: NSObject, SyncFieldStream, AudioReattacha
             return
         }
         connection.isCameraIntrinsicMatrixDeliveryEnabled = true
+        #endif
+    }
+
+    /// Disable Geometric Distortion Correction on the active back camera so
+    /// the recorded ultra-wide video carries the lens's full fisheye field
+    /// of view (~120° HFOV at 1080p 16:9), not the iOS-default
+    /// quasi-pinhole-corrected ~107°. Pair with a `ProbedCameraCalibration`
+    /// from `CameraCalibrationProber` — the lens distortion lookup table is
+    /// captured against the same GDC-off lens state and applies directly to
+    /// the recorded frames.
+    ///
+    /// No-op on devices that don't expose the toggle (extremely rare on
+    /// modern iPhones — ultra-wide-capable hardware supports this since
+    /// iOS 13). `ActiveCameraMetadata.gdcEnabled` reflects the actual state
+    /// so the host writer can flip `is_fisheye_raw` accordingly.
+    private func disableGeometricDistortionCorrection() {
+        #if os(iOS)
+        guard let device = selectedVideoDevice else {
+            NSLog("[SyncField.Camera] GDC: no selectedVideoDevice")
+            return
+        }
+        guard device.isGeometricDistortionCorrectionSupported else {
+            NSLog("[SyncField.Camera] GDC toggle NOT supported on \(device.deviceType.rawValue) — recording will be GDC=on")
+            return
+        }
+        do {
+            try device.lockForConfiguration()
+            defer { device.unlockForConfiguration() }
+            device.isGeometricDistortionCorrectionEnabled = false
+            NSLog("[SyncField.Camera] GDC OFF: enabled=\(device.isGeometricDistortionCorrectionEnabled) fov=\(device.activeFormat.videoFieldOfView)")
+        } catch {
+            NSLog("[SyncField.Camera] failed to disable GDC: \(error)")
+        }
         #endif
     }
     #endif
@@ -477,10 +532,12 @@ public final class iPhoneCameraStream: NSObject, SyncFieldStream, AudioReattacha
         // Re-assert capture configuration that can drift between
         // configureSession and the first frame: zoom-floor (intervening
         // subsystem nudges), stabilization-off (some session reconfigs
-        // re-enable it), intrinsics delivery (toggled by format switches).
+        // re-enable it), intrinsics delivery (toggled by format switches),
+        // GDC-off (some session reconfigs reset to the iOS default of ON).
         enforceMinimumZoom()
         disableVideoStabilization()
         enableCameraIntrinsicsDelivery()
+        disableGeometricDistortionCorrection()
 
         self.clock = clock
         self.stampWriter = try writerFactory.makeStreamWriter(streamId: streamId)
@@ -735,15 +792,20 @@ public final class iPhoneCameraStream: NSObject, SyncFieldStream, AudioReattacha
         )
         #if os(iOS)
         let fov = Double(device.activeFormat.videoFieldOfView)
+        let gdc = device.isGeometricDistortionCorrectionSupported
+            ? device.isGeometricDistortionCorrectionEnabled
+            : true
         #else
         let fov = 0.0
+        let gdc = true
         #endif
         return ActiveCameraMetadata(
             deviceTypeRawValue: device.deviceType.rawValue,
             deviceLocalizedName: device.localizedName,
             activeFormatWidth: Int(dimensions.width),
             activeFormatHeight: Int(dimensions.height),
-            fieldOfViewDegrees: fov
+            fieldOfViewDegrees: fov,
+            gdcEnabled: gdc
         )
     }
     #endif
