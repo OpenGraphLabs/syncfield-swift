@@ -17,6 +17,7 @@ public enum InstaLogCategory: String, Sendable {
     case collect = "INSTA360.COLLECT"
     case stream  = "INSTA360.STREAM"
     case bridge  = "INSTA360.BRIDGE"
+    case probe   = "INSTA360.PROBE"
 }
 
 public enum InstaLogLevel: Int, Comparable, Sendable {
@@ -144,7 +145,7 @@ public enum InstaLog {
         var map: [InstaLogCategory: os.Logger] = [:]
         for category in [
             InstaLogCategory.coord, .sup, .ble, .wake, .radio, .wifi, .bg, .scan,
-            .collect, .stream, .bridge,
+            .collect, .stream, .bridge, .probe,
         ] {
             map[category] = os.Logger(subsystem: InstaLog.subsystem, category: category.rawValue)
         }
