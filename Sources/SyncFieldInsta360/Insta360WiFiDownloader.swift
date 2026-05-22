@@ -792,39 +792,18 @@ public final class Insta360WiFiDownloader: @unchecked Sendable {
         includeThumbnails: Bool = false,
         thumbnailReferenceDate: Date? = nil
     ) async throws -> [Insta360FileInfo] {
-        var errors: [String] = []
-
-        do {
-            let files = try await fetchGo3SEditFileInfoList(timeoutSeconds: timeoutSeconds)
-            if !files.isEmpty {
-                NSLog("[WiFiDownloader] listFiles api=go3sEditList files=\(files.count)")
-                return includeThumbnails
-                    ? await enrichFileInfoWithThumbnails(
-                        files,
-                        referenceDate: thumbnailReferenceDate)
-                    : files
-            }
-            NSLog("[WiFiDownloader] listFiles api=go3sEditList returned empty; falling back to HTTP video list")
-        } catch {
-            errors.append("go3sEditList: \(error.localizedDescription)")
-            NSLog("[WiFiDownloader] listFiles api=go3sEditList failed: \(error.localizedDescription)")
-        }
-
-        do {
-            let files = try await fetchHTTPVideoFileInfoList(timeoutSeconds: timeoutSeconds)
-            NSLog("[WiFiDownloader] listFiles api=httpVideoList files=\(files.count)")
-            return includeThumbnails
-                ? await enrichFileInfoWithThumbnails(
-                    files,
-                    referenceDate: thumbnailReferenceDate)
-                : files
-        } catch {
-            errors.append("httpVideoList: \(error.localizedDescription)")
-            NSLog("[WiFiDownloader] listFiles api=httpVideoList failed: \(error.localizedDescription)")
-        }
-
-        throw Insta360Error.downloadFailed(
-            "camera album listing failed (\(errors.joined(separator: "; ")))")
+        // The GO3S edit-list endpoint returns the full set of files on the
+        // camera in one call, including duration-deriving modifyTimestamp.
+        // The legacy HTTP `fetchVideoList` fallback used to live here but
+        // probe runs confirmed it returns "fetch resource failed." on the
+        // GO3S over WiFi — see `docs/insta360-metadata-probe.md`. Removed
+        // to keep the single supported path honest.
+        let files = try await fetchGo3SEditFileInfoList(timeoutSeconds: timeoutSeconds)
+        NSLog("[WiFiDownloader] listFiles api=go3sEditList files=\(files.count)")
+        guard includeThumbnails else { return files }
+        return await enrichVideosWithMnd(
+            files,
+            referenceDate: thumbnailReferenceDate)
     }
 
     private func fetchGo3SEditFileInfoList(timeoutSeconds: TimeInterval) async throws -> [Insta360FileInfo] {
@@ -854,103 +833,63 @@ public final class Insta360WiFiDownloader: @unchecked Sendable {
         }
     }
 
-    private func fetchHTTPVideoFileInfoList(timeoutSeconds: TimeInterval) async throws -> [Insta360FileInfo] {
-        let http = INSCameraHTTPManager.socket()
-        return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<[Insta360FileInfo], Error>) in
-            let gate = ContinuationGate<[Insta360FileInfo]>()
-            let timeout = DispatchWorkItem {
-                gate.resume(cont, throwing: Insta360Error.downloadFailed(
-                    "fetchVideoList timed out after \(timeoutSeconds)s"))
-            }
-            DispatchQueue.global(qos: .utility).asyncAfter(
-                deadline: .now() + timeoutSeconds,
-                execute: timeout)
-
-            let task = http.fetchVideoList(completion: { error, list in
-                timeout.cancel()
-                if let error = error {
-                    gate.resume(cont, throwing: Insta360Error.downloadFailed(
-                        "fetchVideoList failed: \(error.localizedDescription)"))
-                    return
-                }
-                var files: [Insta360FileInfo] = []
-                if let list = list as? [Any] {
-                    for item in list {
-                        let obj = item as AnyObject
-                        guard obj.responds(to: NSSelectorFromString("uri")),
-                              let uri = obj.value(forKey: "uri") as? String,
-                              !uri.isEmpty
-                        else {
-                            continue
-                        }
-                        guard self.isDownloadableCameraVideoURI(uri) else { continue }
-                        files.append(self.fileInfo(
-                            uri: uri,
-                            durationSec: (obj.value(forKey: "totalTime") as? NSNumber)?.doubleValue ?? 0,
-                            sizeBytes: (obj.value(forKey: "fileSize") as? NSNumber)?.uint64Value ?? 0,
-                            fallbackTimestampSec: nil))
-                    }
-                }
-                gate.resume(cont, returning: self.sortedUniqueFileInfo(files))
-            })
-            if task == nil {
-                timeout.cancel()
-                gate.resume(cont, throwing: Insta360Error.downloadFailed(
-                    "fetchVideoList returned nil task"))
-            }
-        }
-    }
-
-    private func enrichFileInfoWithThumbnails(
+    // Enrich the candidate set with per-file camera serial number, fetched
+    // via `getFileMndWithURI:type:` on the WiFi command socket (confirmed
+    // working on GO3S firmware in the metadata probe). Used by the JS
+    // recovery matcher to verify a candidate was produced by the same
+    // physical camera as the recording session.
+    //
+    // **Thumbnail enrichment is deliberately not implemented.** The camera
+    // does return a thumbnail blob over `getFileMnd type=2` (65–67 KB per
+    // GO3S video), but the payload is Insta360's proprietary H.264-NAL
+    // container with non-standard NAL types — decodable only via
+    // `INSThumbnailRender` inside `INSCameraSDK.xcframework`, which is
+    // excluded from this build per `Frameworks/Insta360/Insta360SDK.podspec`
+    // (it transitively pulls in NvEffectSdkCore). The HTTP path
+    // (`fetchVideoThumbnailWithURI:`) is dead on this firmware too. Future
+    // work: relink INSCameraSDK if the licensing tradeoff is acceptable.
+    //
+    // Only top-N candidates closest to `referenceDate` are enriched —
+    // full 472-file enrich would add ~10s. The JS UI lists candidates by
+    // confidence so the enriched serial lands on the cards the user looks
+    // at first.
+    private func enrichVideosWithMnd(
         _ files: [Insta360FileInfo],
         referenceDate: Date?,
-        limit: Int = 6
+        limit: Int = 8
     ) async -> [Insta360FileInfo] {
         guard !files.isEmpty else { return files }
 
         var output = files
-        let requestedIndices = thumbnailCandidateIndices(
+        let indices = enrichCandidateIndices(
             in: files,
             referenceDate: referenceDate,
             limit: limit)
-        let capped = requestedIndices.count
-        var successCount = 0
-        var failureCount = 0
-        var consecutiveFailureCount = 0
+        var serialOk = 0
+        var durationOk = 0
+        var sizeOk = 0
 
-        for index in requestedIndices {
+        for index in indices {
             if Task.isCancelled { break }
             let file = files[index]
-            do {
-                let thumbnailUri = try await fetchVideoThumbnailURI(
-                    for: file.fileUri,
-                    timeoutSeconds: 2.0)
-                output[index] = Insta360FileInfo(
-                    fileUri: file.fileUri,
-                    createdAtIso: file.createdAtIso,
-                    durationSec: file.durationSec,
-                    sizeBytes: file.sizeBytes,
-                    thumbnailUri: thumbnailUri)
-                successCount += 1
-                consecutiveFailureCount = 0
-            } catch {
-                failureCount += 1
-                consecutiveFailureCount += 1
-                if failureCount <= 3 {
-                    NSLog("[WiFiDownloader] thumbnail fetch failed uri=\(file.fileUri): \(error.localizedDescription)")
-                }
-                if consecutiveFailureCount >= 3 {
-                    NSLog("[WiFiDownloader] thumbnail fetch stopped after \(consecutiveFailureCount) consecutive failures")
-                    break
-                }
-            }
+            let metadata = await fetchExtraMetadata(forFileURI: file.fileUri)
+            guard let metadata else { continue }
+            output[index] = Insta360FileInfo(
+                fileUri: file.fileUri,
+                createdAtIso: file.createdAtIso,
+                durationSec: metadata.durationSec ?? file.durationSec,
+                sizeBytes: metadata.sizeBytes ?? file.sizeBytes,
+                thumbnailUri: file.thumbnailUri,
+                cameraSerial: metadata.serialNumber ?? file.cameraSerial)
+            if metadata.serialNumber != nil { serialOk += 1 }
+            if metadata.durationSec != nil { durationOk += 1 }
+            if metadata.sizeBytes != nil { sizeOk += 1 }
         }
-
-        NSLog("[WiFiDownloader] thumbnails enriched success=\(successCount) failed=\(failureCount) requested=\(capped)")
+        NSLog("[WiFiDownloader] mnd enrich requested=\(indices.count) serialOk=\(serialOk) durationOk=\(durationOk) sizeOk=\(sizeOk)")
         return output
     }
 
-    private func thumbnailCandidateIndices(
+    private func enrichCandidateIndices(
         in files: [Insta360FileInfo],
         referenceDate: Date?,
         limit: Int
@@ -976,52 +915,59 @@ public final class Insta360WiFiDownloader: @unchecked Sendable {
             .map(\.offset)
     }
 
-    private func fetchVideoThumbnailURI(
-        for uri: String,
-        timeoutSeconds: TimeInterval
-    ) async throws -> String {
-        let http = INSCameraHTTPManager.socket()
-        return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<String, Error>) in
-            let gate = ContinuationGate<String>()
-            var task: URLSessionTask?
-            let timeout = DispatchWorkItem {
-                task?.cancel()
-                gate.resume(cont, throwing: Insta360Error.downloadFailed(
-                    "fetchVideoThumbnail timed out after \(timeoutSeconds)s"))
+    /// Fetch the camera's per-file metadata sidecar (`INSFileMndType.Metadata`)
+    /// and decode the fields we care about. `INSExtraMetadata` is a protobuf
+    /// blob — we walk only the three fields needed for ego↔wrist mapping
+    /// (serial, duration, fileSize) instead of pulling the full proto
+    /// reflection runtime into the build. See
+    /// `docs/insta360-metadata-probe.md` for the reverse-engineered wire
+    /// format we rely on.
+    ///
+    /// Sanitization runs after parsing so any value outside its
+    /// domain-realistic range (a sign the firmware re-assigned a field
+    /// number) becomes nil — the JS UI surfaces that as "unknown" rather
+    /// than trusting a drift-corrupted value.
+    private func fetchExtraMetadata(forFileURI uri: String) async -> Insta360ExtraMetadata? {
+        guard let data = await getFileMndData(uri: uri, type: 1, timeoutSec: 6) else {
+            return nil
+        }
+        let raw = Self.parseInsta360ExtraMetadata(data)
+        return Self.sanitize(raw)
+    }
+
+    /// Low-level: invoke `commandsImpl.getFileMndWithURI:type:completion:`
+    /// over the WiFi socket. Verified to work on GO3S via the probe even
+    /// though the protocol method is documented as USB-only.
+    private func getFileMndData(uri: String, type: Int, timeoutSec: TimeInterval) async -> Data? {
+        let cmd = INSCameraManager.socket().commandsImpl as NSObject
+        let sel = NSSelectorFromString("getFileMndWithURI:type:completion:")
+        guard cmd.responds(to: sel) else { return nil }
+
+        return await withCheckedContinuation { (cont: CheckedContinuation<Data?, Never>) in
+            // Lightweight single-resume guard. Avoids the throwing
+            // `ContinuationGate` in this file since the SDK callback
+            // doesn't throw — failures are reported as `error != nil` and
+            // we collapse them to `nil`.
+            let lock = NSLock()
+            var fired = false
+            func resumeOnce(_ value: Data?) {
+                lock.lock(); defer { lock.unlock() }
+                guard !fired else { return }
+                fired = true
+                cont.resume(returning: value)
             }
+            let timeout = DispatchWorkItem { resumeOnce(nil) }
             DispatchQueue.global(qos: .utility).asyncAfter(
-                deadline: .now() + timeoutSeconds,
-                execute: timeout)
+                deadline: .now() + timeoutSec, execute: timeout)
 
-            task = http.fetchVideoThumbnail(withURI: uri) { error, data in
+            let block: @convention(block) (NSError?, NSData?) -> Void = { error, data in
                 timeout.cancel()
-                if let error = error {
-                    gate.resume(cont, throwing: Insta360Error.downloadFailed(
-                        "fetchVideoThumbnail failed: \(error.localizedDescription)"))
-                    return
-                }
-                guard let data, !data.isEmpty else {
-                    gate.resume(cont, throwing: Insta360Error.downloadFailed(
-                        "fetchVideoThumbnail returned empty data"))
-                    return
-                }
-
-                do {
-                    let fileURL = try self.thumbnailCacheURL(for: uri)
-                    try FileManager.default.createDirectory(
-                        at: fileURL.deletingLastPathComponent(),
-                        withIntermediateDirectories: true)
-                    try data.write(to: fileURL, options: [.atomic])
-                    gate.resume(cont, returning: fileURL.absoluteString)
-                } catch {
-                    gate.resume(cont, throwing: error)
-                }
+                resumeOnce(error == nil ? (data as Data?) : nil)
             }
-            if task == nil {
-                timeout.cancel()
-                gate.resume(cont, throwing: Insta360Error.downloadFailed(
-                    "fetchVideoThumbnail returned nil task"))
-            }
+            typealias IMP3 = @convention(c) (NSObject, Selector, NSString, UInt, @convention(block) (NSError?, NSData?) -> Void) -> Void
+            let imp = cmd.method(for: sel)
+            let function = unsafeBitCast(imp, to: IMP3.self)
+            function(cmd, sel, uri as NSString, UInt(type), block)
         }
     }
 
@@ -1066,12 +1012,17 @@ public final class Insta360WiFiDownloader: @unchecked Sendable {
             else {
                 continue
             }
-            let modifyTimestamp = item.favoriteInfo?.modifyTimestamp
+            // Probe captures confirmed `favoriteInfo.modifyTimestamp` is
+            // always 0 on the GO3S edit-list response (the SDK exposes the
+            // struct but the camera doesn't populate it). Duration + size
+            // come from the per-file mnd type=1 enrich pass — we leave
+            // them as 0 here ("unknown") and let `enrichVideosWithMnd`
+            // fill them in for the top candidates.
             files.append(fileInfo(
                 uri: uri,
                 durationSec: 0,
                 sizeBytes: 0,
-                fallbackTimestampSec: modifyTimestamp.flatMap { $0 > 0 ? $0 : nil }))
+                fallbackTimestampSec: nil))
         }
     }
 
@@ -1469,7 +1420,7 @@ public final class Insta360WiFiDownloader: @unchecked Sendable {
             message.contains("camera ap reachable timeout")
     }
 
-    private func applyHotspot(
+    internal func applyHotspot(
         ssid: String,
         passphrase: String,
         applyTimeoutSeconds: TimeInterval = 8
@@ -1562,7 +1513,7 @@ public final class Insta360WiFiDownloader: @unchecked Sendable {
 
     // MARK: - Reachability
 
-    private func waitForReachability(attempts: Int) async throws {
+    internal func waitForReachability(attempts: Int) async throws {
         NSLog("[WiFiDownloader] Probing \(cameraHost):\(cameraPort) (\(attempts) attempts)...")
         for attempt in 1...attempts {
             if await isHostReachable(host: cameraHost, port: cameraPort) {
@@ -1574,7 +1525,7 @@ public final class Insta360WiFiDownloader: @unchecked Sendable {
         throw Insta360Error.cameraNotReachable
     }
 
-    private func waitForSocketCameraReady(timeoutSeconds: TimeInterval) async -> Bool {
+    internal func waitForSocketCameraReady(timeoutSeconds: TimeInterval) async -> Bool {
         let deadline = DispatchTime.now().uptimeNanoseconds
             + UInt64(max(0, timeoutSeconds) * 1_000_000_000)
         var polls = 0
@@ -1670,4 +1621,169 @@ public final class Insta360WiFiDownloader: @unchecked Sendable {
     }
 
     #endif // canImport(INSCameraServiceSDK) && canImport(NetworkExtension)
+}
+
+// MARK: - Pure helpers (unit-testable; no SDK / network dependency)
+
+// `derivedDurationSec` was removed in the metadata-enrich PR — probe
+// captures confirmed `favoriteInfo.modifyTimestamp` is always 0 on GO3S
+// firmware, so the heuristic returned 0 for every file. Real duration now
+// comes from the per-file mnd type=1 protobuf parse in
+// `parseInsta360ExtraMetadata`.
+
+extension Insta360WiFiDownloader {
+    /// Subset of `INSExtraMetadata` fields we successfully reverse-engineered
+    /// from real GO3S protobuf payloads (see metadata probe captures in
+    /// `docs/insta360-metadata-probe.md`). Every field is optional: the
+    /// camera firmware sometimes omits one or the other (photos don't have
+    /// duration, derivative LRV previews carry a different fileSize, etc).
+    public struct Insta360ExtraMetadata: Sendable, Equatable {
+        public var serialNumber: String?
+        public var durationSec: Double?
+        public var sizeBytes: UInt64?
+
+        public init(
+            serialNumber: String? = nil,
+            durationSec: Double? = nil,
+            sizeBytes: UInt64? = nil
+        ) {
+            self.serialNumber = serialNumber
+            self.durationSec = durationSec
+            self.sizeBytes = sizeBytes
+        }
+    }
+
+    /// Domain-realistic ranges for each field. Any parsed value that falls
+    /// outside is treated as "unknown" — defends against schema drift in
+    /// future GO3S firmware updates where Insta360 might re-assign the
+    /// field numbers we're decoding by hand (the wire format itself is
+    /// stable, but field-number semantics are an inferred contract).
+    public enum Insta360ExtraMetadataSanity {
+        /// Single GO3S clip is capped at 6 hours by the camera's own
+        /// recording limit (default settings). Anything ≤ 0 or > 6 h is
+        /// almost certainly a misinterpreted varint.
+        public static let durationRangeSec: ClosedRange<Double> = 0.05...(6 * 3600)
+        /// Realistic clip sizes: tens of KB (truncated/error) through 16 GB
+        /// (FAT32 single-file ceiling, also the GO3S max card partition).
+        public static let sizeRangeBytes: ClosedRange<UInt64> = 10_000...(16 * 1_073_741_824)
+        /// Insta360 serials are ASCII printable, fixed-length 14 today
+        /// (`IATEFXXXXXXXXX`). Accept 4–32 chars to absorb cosmetic format
+        /// changes while still rejecting binary garbage.
+        public static let serialLengthRange: ClosedRange<Int> = 4...32
+    }
+
+    /// Clamp parsed metadata to known-good ranges. Out-of-range fields
+    /// become `nil` so the JS layer falls back to "unknown" instead of
+    /// trusting a drift-corrupted value. Rejections are logged so we can
+    /// detect schema drift from production captures (any sudden spike in
+    /// nil-after-sanity is a signal a firmware update changed semantics).
+    public static func sanitize(_ raw: Insta360ExtraMetadata) -> Insta360ExtraMetadata {
+        var sanitized = Insta360ExtraMetadata()
+
+        if let serial = raw.serialNumber {
+            if Insta360ExtraMetadataSanity.serialLengthRange.contains(serial.count),
+               serial.allSatisfy({ $0.isASCII && $0.isLetter || $0.isNumber }) {
+                sanitized.serialNumber = serial
+            } else {
+                NSLog("[WiFiDownloader] sanity rejected serial=\(serial.prefix(16)) len=\(serial.count)")
+            }
+        }
+        if let duration = raw.durationSec {
+            if Insta360ExtraMetadataSanity.durationRangeSec.contains(duration) {
+                sanitized.durationSec = duration
+            } else {
+                NSLog("[WiFiDownloader] sanity rejected durationSec=\(duration)")
+            }
+        }
+        if let size = raw.sizeBytes {
+            if Insta360ExtraMetadataSanity.sizeRangeBytes.contains(size) {
+                sanitized.sizeBytes = size
+            } else {
+                NSLog("[WiFiDownloader] sanity rejected sizeBytes=\(size)")
+            }
+        }
+        return sanitized
+    }
+
+    /// Minimal protobuf walker for the camera's per-file metadata blob
+    /// (`getFileMnd type=1`). Only reads the three fields we know how to
+    /// interpret:
+    ///
+    ///   field 1 (string, tag 0x0a)  → serialNumber
+    ///   field 9 (varint, tag 0x48)  → sizeBytes
+    ///   field 10 (varint, tag 0x50) → durationSec
+    ///
+    /// Anything else is skipped. The walker is tolerant: unknown tags,
+    /// continuation-varint lengths, fixed64/fixed32 fields, malformed
+    /// trailers — none of these abort parsing. We return whatever fields
+    /// we managed to read before hitting an unrecoverable shape.
+    static func parseInsta360ExtraMetadata(_ data: Data) -> Insta360ExtraMetadata {
+        var result = Insta360ExtraMetadata()
+        var idx = 0
+        let end = data.count
+
+        while idx < end {
+            // Tag varint.
+            guard let (tag, afterTag) = readVarint(data, at: idx) else { break }
+            idx = afterTag
+            let wireType = Int(tag & 0x7)
+            let fieldNumber = Int(tag >> 3)
+
+            switch wireType {
+            case 0: // varint
+                guard let (value, afterValue) = readVarint(data, at: idx) else { return result }
+                idx = afterValue
+                switch fieldNumber {
+                case 9:  result.sizeBytes = value
+                case 10: result.durationSec = Double(value)
+                default: break
+                }
+            case 1: // fixed64
+                guard idx + 8 <= end else { return result }
+                idx += 8
+            case 2: // length-delimited
+                guard let (length, afterLength) = readVarint(data, at: idx) else { return result }
+                idx = afterLength
+                let payloadLen = Int(length)
+                guard payloadLen >= 0, idx + payloadLen <= end else { return result }
+                if fieldNumber == 1 {
+                    let bytes = data.subdata(in: idx..<(idx + payloadLen))
+                    result.serialNumber = String(data: bytes, encoding: .utf8)
+                }
+                idx += payloadLen
+            case 5: // fixed32
+                guard idx + 4 <= end else { return result }
+                idx += 4
+            default:
+                // Group-start (3) / group-end (4) are deprecated and not
+                // expected in this schema. Anything else means we've lost
+                // sync — bail with whatever we have.
+                return result
+            }
+        }
+        return result
+    }
+
+    /// Standard protobuf varint decode. Returns the decoded UInt64 and the
+    /// index just past the last byte read, or nil on truncation. Caps at 10
+    /// bytes (max varint length for 64-bit ints) so a malformed continuation
+    /// chain can't OOB-read.
+    static func readVarint(_ data: Data, at start: Int) -> (UInt64, Int)? {
+        var value: UInt64 = 0
+        var shift: UInt64 = 0
+        var idx = start
+        let end = data.count
+        var bytesRead = 0
+        while idx < end && bytesRead < 10 {
+            let byte = data[idx]
+            value |= UInt64(byte & 0x7f) << shift
+            idx += 1
+            bytesRead += 1
+            if (byte & 0x80) == 0 {
+                return (value, idx)
+            }
+            shift += 7
+        }
+        return nil
+    }
 }

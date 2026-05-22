@@ -161,17 +161,15 @@ public actor Insta360Collector {
         return try await Insta360ConnectionCoordinator.shared.withWiFi(
             bindingKey: uuid
         ) { _ in
+            // Enrich the top-N candidates closest to `referenceDate` with
+            // per-file mnd metadata (serial number). Thumbnail rendering is
+            // not enabled in this build — see comment in
+            // `Insta360WiFiDownloader.enrichVideosWithMnd`.
             try await downloader.listFiles(
                 ssid: creds.ssid,
                 passphrase: creds.passphrase,
                 thumbnailReferenceDate: thumbnailReferenceDate,
-                includeThumbnails: false,
-                beforeRestore: { files in
-                    await enrichMissingThumbnailsWithBLE(
-                        files,
-                        ble: ble,
-                        referenceDate: thumbnailReferenceDate)
-                })
+                includeThumbnails: true)
         }
         #else
         throw Insta360Error.frameworkNotLinked
@@ -204,85 +202,6 @@ public actor Insta360Collector {
             ssid: ssid,
             cameraLabel: cameraLabel)
     }
-
-    #if canImport(INSCameraServiceSDK)
-    private static func enrichMissingThumbnailsWithBLE(
-        _ files: [Insta360FileInfo],
-        ble: Insta360BLEController,
-        referenceDate: Date?,
-        limit: Int = 8
-    ) async -> [Insta360FileInfo] {
-        guard !files.isEmpty else { return files }
-
-        var output = files
-        let requestedIndices = thumbnailCandidateIndices(
-            in: files,
-            referenceDate: referenceDate,
-            limit: limit)
-        var successCount = 0
-        var failureCount = 0
-        var consecutiveFailureCount = 0
-
-        for index in requestedIndices {
-            if Task.isCancelled { break }
-            let file = output[index]
-            guard file.thumbnailUri == nil else { continue }
-
-            do {
-                let thumbnailUri = try await ble.miniThumbnailURI(for: file.fileUri)
-                output[index] = Insta360FileInfo(
-                    fileUri: file.fileUri,
-                    createdAtIso: file.createdAtIso,
-                    durationSec: file.durationSec,
-                    sizeBytes: file.sizeBytes,
-                    thumbnailUri: thumbnailUri)
-                successCount += 1
-                consecutiveFailureCount = 0
-            } catch {
-                failureCount += 1
-                consecutiveFailureCount += 1
-                if failureCount <= 3 {
-                    NSLog("[Insta360Collector] BLE mini thumbnail failed uri=\(file.fileUri): \(error.localizedDescription)")
-                }
-                if consecutiveFailureCount >= 3 {
-                    NSLog("[Insta360Collector] BLE mini thumbnails stopped after \(consecutiveFailureCount) consecutive failures")
-                    break
-                }
-            }
-        }
-
-        if successCount > 0 || failureCount > 0 {
-            NSLog("[Insta360Collector] BLE mini thumbnails enriched success=\(successCount) failed=\(failureCount) requested=\(requestedIndices.count)")
-        }
-        return output
-    }
-
-    private static func thumbnailCandidateIndices(
-        in files: [Insta360FileInfo],
-        referenceDate: Date?,
-        limit: Int
-    ) -> [Int] {
-        let capped = min(limit, files.count)
-        guard let referenceDate else {
-            return Array(0..<capped)
-        }
-
-        let iso = ISO8601DateFormatter()
-        return files.enumerated()
-            .sorted { lhs, rhs in
-                let lhsDate = iso.date(from: lhs.element.createdAtIso)
-                let rhsDate = iso.date(from: rhs.element.createdAtIso)
-                let lhsDelta = lhsDate.map { abs($0.timeIntervalSince(referenceDate)) }
-                    ?? Double.greatestFiniteMagnitude
-                let rhsDelta = rhsDate.map { abs($0.timeIntervalSince(referenceDate)) }
-                    ?? Double.greatestFiniteMagnitude
-                if lhsDelta != rhsDelta { return lhsDelta < rhsDelta }
-                return lhs.offset < rhs.offset
-            }
-            .prefix(capped)
-            .map(\.offset)
-    }
-    #endif
 
     // MARK: - Pure helper (unit-tested)
 
