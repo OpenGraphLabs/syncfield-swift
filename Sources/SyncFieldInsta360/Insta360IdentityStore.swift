@@ -241,6 +241,40 @@ internal actor Insta360IdentityStore {
     }
 }
 
+/// Host-app entry point for trimming `Insta360IdentityStore` records that
+/// got dragged in by shared-environment scans (foreign cameras briefly
+/// accepted via `assertActionCamHost`'s provisional-metadata fallback).
+/// Pure addition — the underlying actor stays internal; this only routes
+/// `all()`/`remove(...)` for the prune use case.
+public enum Insta360IdentityHousekeeping {
+    /// Drop records whose `serialLast6` is NOT in `keepSerialsLast6` AND
+    /// whose `lastSeenAt` is older than `cutoff`. Returns the resulting
+    /// `(kept, removed)` counts. No-op (and returns zero counts) when
+    /// `keepSerialsLast6` is empty — protects first-time users with no
+    /// saved mapping yet from accidental wipe on screen entry.
+    @discardableResult
+    public static func pruneStaleRecords(
+        keepSerialsLast6: Set<String>,
+        olderThan cutoff: Date
+    ) async -> (kept: Int, removed: Int) {
+        guard !keepSerialsLast6.isEmpty else { return (0, 0) }
+        let keep = Set(keepSerialsLast6.map { $0.uppercased() })
+        let store = Insta360IdentityStore.shared
+        let records = await store.all()
+        var kept = 0
+        var removed = 0
+        for record in records {
+            if keep.contains(record.serialLast6) || record.lastSeenAt >= cutoff {
+                kept += 1
+                continue
+            }
+            await store.remove(serialLast6: record.serialLast6)
+            removed += 1
+        }
+        return (kept, removed)
+    }
+}
+
 private enum KeychainHelper {
     static func read(service: String, account: String) -> Data? {
         var query = baseQuery(service: service, account: account)
