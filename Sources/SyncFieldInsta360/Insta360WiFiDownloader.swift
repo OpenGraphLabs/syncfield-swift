@@ -139,10 +139,16 @@ public final class Insta360WiFiDownloader: @unchecked Sendable {
         var files: [Insta360FileInfo]?
 
         do {
+            // No explicit applyTimeoutSeconds — fall through to the default
+            // (30 s, as of the user-dialog reaction-time fix). listFiles is
+            // the entry point for the wrist-recovery candidate enumeration,
+            // which is identical to a fresh camera-AP join from the user's
+            // perspective (iOS shows the system dialog) and was hitting the
+            // same false-timeout pattern as `joinCameraHotspot` with the
+            // previous explicit 10 s budget.
             try await applyHotspot(
                 ssid: ssid,
-                passphrase: passphrase,
-                applyTimeoutSeconds: 10)
+                passphrase: passphrase)
             try await waitForReachability(attempts: 8)
 
             for attempt in 1...2 {
@@ -1423,7 +1429,7 @@ public final class Insta360WiFiDownloader: @unchecked Sendable {
     internal func applyHotspot(
         ssid: String,
         passphrase: String,
-        applyTimeoutSeconds: TimeInterval = 8
+        applyTimeoutSeconds: TimeInterval = 30
     ) async throws {
         // Two attempts. `NEHotspotConfiguration.apply` occasionally fails
         // with `internal` / `system` error codes when iOS is still in the
@@ -1460,7 +1466,7 @@ public final class Insta360WiFiDownloader: @unchecked Sendable {
     private func applyHotspotOnce(
         ssid: String,
         passphrase: String,
-        applyTimeoutSeconds: TimeInterval = 8
+        applyTimeoutSeconds: TimeInterval = 30
     ) async throws {
         let config = NEHotspotConfiguration(ssid: ssid, passphrase: passphrase, isWEP: false)
         config.joinOnce = true
@@ -1468,13 +1474,26 @@ public final class Insta360WiFiDownloader: @unchecked Sendable {
         let sendUptimeNs = DispatchTime.now().uptimeNanoseconds
         NSLog("[WiFiDownloader.timing] applyHotspot SEND ssid=\(ssid)")
 
-        // Wrap in a short timeout. NEHotspotConfiguration.apply has no
+        // Wrap in a timeout. NEHotspotConfiguration.apply has no
         // built-in deadline; if iOS' WiFi state machine deadlocks (most
         // commonly when we removeConfiguration for camera N and apply for
         // camera N+1 in quick succession), the completion never fires and the
-        // entire collect hangs forever. Typical apply is ~1-3 s; 8 s is long
-        // enough for normal iOS state-machine lag while keeping denial/stuck
-        // cases actionable.
+        // entire collect hangs forever.
+        //
+        // First-time-per-SSID applies trigger an iOS system dialog ("Allow
+        // this app to join <SSID>?"), and the apply callback doesn't fire
+        // until the user taps Connect. Real-world reaction time on that
+        // dialog is 5-15 s (verified on Mexico-office field traces, build
+        // 35+). The previous 8 s budget falsely-failed almost every
+        // multi-camera collect: timeout fired, code threw, the catch path
+        // then `removeConfiguration`'d the SSID iOS had just associated to,
+        // and the next attempt either rode `alreadyAssociated` (cam #1 luck)
+        // or re-prompted the user and failed again (cam #2). 30 s gives
+        // generous headroom for the human-in-the-loop step while still
+        // catching the pathological NECP-deadlock case in a useful window.
+        // Typical no-dialog apply is ~1-3 s (`alreadyAssociated` returns
+        // immediately); only first-time-per-SSID paths spend serious time
+        // here.
         try await withThrowingTaskGroup(of: Void.self) { group in
             group.addTask {
                 try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
