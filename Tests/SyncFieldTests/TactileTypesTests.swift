@@ -38,5 +38,27 @@ final class TactileTypesTests: XCTestCase {
         XCTAssertEqual(m.channels.count, 5)
         XCTAssertEqual(m.locationForChannel(0), "thumb")
         XCTAssertEqual(m.locationForChannel(4), "pinky")
+        XCTAssertEqual(m.schemaVer, 0)  // legacy
+    }
+
+    // schema_ver=4 firmware sends `channels` as a flat string array (not objects),
+    // plus values_per_sample / sample_shape. Decoding must not throw.
+    func test_manifest_parses_schema_v4_string_channels() throws {
+        let json = """
+        {"device":"oglo","schema_ver":4,"side":"left","hw_rev":"RDR02_FLEX5_REV_C",
+         "rate_hz":100,"samples_per_packet":2,"values_per_sample":80,
+         "sample_order":"finger,row,col","sample_shape":[5,4,4],
+         "channels":["pinky","ring","middle","index","thumb"]}
+        """
+        let m = try JSONDecoder().decode(DeviceManifest.self, from: Data(json.utf8))
+        XCTAssertEqual(m.schemaVer, 4)
+        XCTAssertEqual(m.side, .left)
+        XCTAssertEqual(m.valuesPerSample, 80)
+        XCTAssertEqual(m.samplesPerPacket, 2)
+        XCTAssertEqual(m.sampleShape, [5, 4, 4])
+        XCTAssertTrue(m.channels.isEmpty)              // no object channels in v4
+        XCTAssertEqual(m.fingerLabels, ["pinky", "ring", "middle", "index", "thumb"])
+        XCTAssertEqual(m.locationForChannel(0), "pinky")  // finger index → name
+        XCTAssertEqual(m.locationForChannel(4), "thumb")
     }
 }
