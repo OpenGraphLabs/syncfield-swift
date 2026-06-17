@@ -71,6 +71,61 @@ final class TactilePacketParserV4Tests: XCTestCase {
         XCTAssertThrowsError(try TactilePacketParser.parseV4(Data(bytes), valuesPerSample: 80))
     }
 
+    // Method C (FW >= 0.6.5): taxels-only sample slots, then ONE packet-level IMU block.
+    func test_parsesV4_methodC_packet_level_imu() throws {
+        let vps = 4
+        // header: count=3, flags=0x02 (packet-level IMU), base_ts=1_000_000
+        var bytes: [UInt8] = [0x03, 0x02, 0x40, 0x42, 0x0F, 0x00]
+        // 3 taxel-only sample slots
+        bytes += u16LE(11) + u16LE(12) + u16LE(13) + u16LE(14)
+        bytes += u16LE(21) + u16LE(22) + u16LE(23) + u16LE(24)
+        bytes += u16LE(31) + u16LE(32) + u16LE(33) + u16LE(34)
+        // one trailing 17B IMU block
+        bytes += i16LE(100) + i16LE(-200)        // roll, pitch
+        bytes += i16LE(1) + i16LE(2) + i16LE(3)  // ax, ay, az
+        bytes += i16LE(4) + i16LE(5) + i16LE(6)  // gx, gy, gz
+        bytes += [0x01]                          // imu_ok = true
+
+        let p = try TactilePacketParser.parseV4(Data(bytes), valuesPerSample: vps)
+        XCTAssertEqual(p.count, 3)
+        XCTAssertEqual(p.batchTimestampUs, 1_000_000)
+        XCTAssertEqual(p.samples[0], [11, 12, 13, 14])
+        XCTAssertEqual(p.samples[2], [31, 32, 33, 34])
+        // No per-sample IMU in Method C.
+        XCTAssertNil(p.imu[0]); XCTAssertNil(p.imu[2])
+        // Exactly one packet-level IMU sample.
+        XCTAssertEqual(p.packetImu?.rollCdeg, 100)
+        XCTAssertEqual(p.packetImu?.pitchCdeg, -200)
+        XCTAssertEqual(p.packetImu?.gz, 6)
+        XCTAssertEqual(p.packetImu?.ok, true)
+    }
+
+    // Regression safety: a Method C packet whose trailing IMU block is truncated
+    // must still yield the full taxel payload (IMU best-effort, never drops taxels).
+    func test_methodC_truncated_imu_keeps_taxels() throws {
+        let vps = 4
+        var bytes: [UInt8] = [0x02, 0x02, 0x00, 0x00, 0x00, 0x00]  // count=2, flags=0x02
+        bytes += u16LE(11) + u16LE(12) + u16LE(13) + u16LE(14)
+        bytes += u16LE(21) + u16LE(22) + u16LE(23) + u16LE(24)
+        bytes += [0x00, 0x00, 0x00]  // only 3 of 17 IMU bytes present
+
+        let p = try TactilePacketParser.parseV4(Data(bytes), valuesPerSample: vps)
+        XCTAssertEqual(p.samples[0], [11, 12, 13, 14])
+        XCTAssertEqual(p.samples[1], [21, 22, 23, 24])
+        XCTAssertNil(p.packetImu)  // skipped, not crashed
+    }
+
+    // Method B per-sample IMU must remain unaffected (no packet-level IMU emitted).
+    func test_methodB_has_no_packet_imu() throws {
+        let vps = 3
+        var bytes: [UInt8] = [0x01, 0x01, 0x00, 0x00, 0x00, 0x00]  // count=1, flags=0x01
+        bytes += u16LE(1) + u16LE(2) + u16LE(3)
+        bytes += Array(repeating: 0, count: 17)
+        let p = try TactilePacketParser.parseV4(Data(bytes), valuesPerSample: vps)
+        XCTAssertNotNil(p.imu[0])
+        XCTAssertNil(p.packetImu)
+    }
+
     // Legacy 5-FSR parser must remain byte-identical (regression anchor).
     func test_legacy_parser_unchanged() throws {
         func u16(_ v: UInt16) -> [UInt8] { [UInt8(v & 0xFF), UInt8(v >> 8)] }

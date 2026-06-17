@@ -20,32 +20,41 @@ public struct TactileImuSample: Sendable {
     public let ok: Bool
 }
 
-/// schema_ver >= 4 packet: taxel matrix per sample, optional per-sample IMU.
+/// schema_ver >= 4 packet: taxel matrix per sample, with IMU in one of two framings.
 public struct TactilePacketV4: Sendable {
     public let count: Int
     public let batchTimestampUs: UInt32
     public let samples: [[UInt16]]          // [sample_index][taxel_index] — length valuesPerSample
-    public let imu: [TactileImuSample?]      // parallel to samples; nil when IMU absent
+    public let imu: [TactileImuSample?]      // Method B: parallel to samples; nil when absent
+    /// Method C: a single packet-level IMU sample for the whole notify batch
+    /// (sample slots are taxels-only). nil when the packet carries no packet-level IMU.
+    public let packetImu: TactileImuSample?
 }
 
 public enum TactilePacketParser {
     public enum Error: Swift.Error { case truncated, sizeMismatch }
 
-    /// Parse a schema_ver >= 4 packet. Header is [count:u8][flags:u8][base_ts_us:u32le],
-    /// then `count` samples each of `valuesPerSample` u16le taxels + an optional 17B IMU
-    /// block (present when flags bit0 is set).
+    /// Parse a schema_ver >= 4 packet. Header is [count:u8][flags:u8][base_ts_us:u32le].
+    /// IMU comes in one of two mutually-exclusive framings (firmware decides per-packet):
+    ///   • Method B (flags bit0): each sample is `valuesPerSample` u16le taxels + a 17B IMU block.
+    ///   • Method C (flags bit1): each sample is taxels-only, then ONE 17B IMU block after all samples.
+    /// Taxels are always parsed first; the IMU is decoded best-effort so a truncated or
+    /// absent IMU block never drops the taxel payload.
     public static func parseV4(_ data: Data, valuesPerSample: Int) throws -> TactilePacketV4 {
         guard data.count >= TactileConstants.v4HeaderBytes else { throw Error.truncated }
 
         let count = Int(byte(data, 0))
         let flags = byte(data, 1)
         let batchTsUs = u32LE(data, offset: 2)
-        let imuPresent = (flags & TactileConstants.v4FlagImuPresent) != 0
-        let imuLen = imuPresent ? TactileConstants.v4ImuBytes : 0
+        let perSampleImu = (flags & TactileConstants.v4FlagImuPresent) != 0  // Method B
+        let packetImuFlag = (flags & TactileConstants.v4FlagPacketImu) != 0  // Method C
+        let imuLen = perSampleImu ? TactileConstants.v4ImuBytes : 0
         let stride = valuesPerSample * 2 + imuLen
 
-        let expected = TactileConstants.v4HeaderBytes + count * stride
-        guard data.count >= expected else { throw Error.sizeMismatch }
+        // Taxels must be fully present. (Method C's trailing packet-level IMU is
+        // decoded best-effort below and never gates this guard.)
+        let taxelExpected = TactileConstants.v4HeaderBytes + count * stride
+        guard data.count >= taxelExpected else { throw Error.sizeMismatch }
 
         var samples: [[UInt16]] = []
         var imuOut: [TactileImuSample?] = []
@@ -61,25 +70,40 @@ public enum TactilePacketParser {
             }
             samples.append(taxels)
 
-            if imuPresent {
-                let i = base + valuesPerSample * 2
-                imuOut.append(TactileImuSample(
-                    rollCdeg: i16LE(data, offset: i + 0),
-                    pitchCdeg: i16LE(data, offset: i + 2),
-                    ax: i16LE(data, offset: i + 4),
-                    ay: i16LE(data, offset: i + 6),
-                    az: i16LE(data, offset: i + 8),
-                    gx: i16LE(data, offset: i + 10),
-                    gy: i16LE(data, offset: i + 12),
-                    gz: i16LE(data, offset: i + 14),
-                    ok: byte(data, i + 16) != 0))
+            if perSampleImu {
+                imuOut.append(decodeImu(data, at: base + valuesPerSample * 2))
             } else {
                 imuOut.append(nil)
             }
         }
 
+        // Method C: one packet-level IMU block after all taxel samples. Best-effort
+        // — only decode when the bytes are actually present.
+        var packetImu: TactileImuSample? = nil
+        if packetImuFlag {
+            let imuOffset = TactileConstants.v4HeaderBytes + count * stride
+            if data.count >= imuOffset + TactileConstants.v4ImuBytes {
+                packetImu = decodeImu(data, at: imuOffset)
+            }
+        }
+
         return TactilePacketV4(count: count, batchTimestampUs: batchTsUs,
-                               samples: samples, imu: imuOut)
+                               samples: samples, imu: imuOut, packetImu: packetImu)
+    }
+
+    /// Decode a 17B IMU block: roll,pitch,ax,ay,az,gx,gy,gz (8×i16le) + ok(u8).
+    @inline(__always)
+    private static func decodeImu(_ d: Data, at i: Int) -> TactileImuSample {
+        TactileImuSample(
+            rollCdeg: i16LE(d, offset: i + 0),
+            pitchCdeg: i16LE(d, offset: i + 2),
+            ax: i16LE(d, offset: i + 4),
+            ay: i16LE(d, offset: i + 6),
+            az: i16LE(d, offset: i + 8),
+            gx: i16LE(d, offset: i + 10),
+            gy: i16LE(d, offset: i + 12),
+            gz: i16LE(d, offset: i + 14),
+            ok: byte(d, i + 16) != 0)
     }
 
     public static func parse(_ data: Data) throws -> TactilePacket {

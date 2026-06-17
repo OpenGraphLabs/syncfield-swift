@@ -226,18 +226,22 @@ public final class TactileStream: SyncFieldStream, @unchecked Sendable {
                 emit(frame: frame, captureNs: captureNs, deviceTsNs: deviceTsNs,
                      channels: channelsOut, handler: handler)
 
-                // IMU → separate wrist_imu_<side>.jsonl (same timestamps), kept as
-                // its own modality. Dropped if no sibling is linked.
+                // Method B IMU → separate wrist_imu_<side>.jsonl (same timestamps),
+                // kept as its own modality. Dropped if no sibling is linked.
+                // (Method C packets have all-nil per-sample IMU; handled once below.)
                 if let imu = packet.imu[i], let sibling = wristImuSibling {
                     sibling.append(captureNs: captureNs, deviceTimestampNs: deviceTsNs,
-                                   channels: [
-                                       "roll_cdeg": Int(imu.rollCdeg),
-                                       "pitch_cdeg": Int(imu.pitchCdeg),
-                                       "ax": Int(imu.ax), "ay": Int(imu.ay), "az": Int(imu.az),
-                                       "gx": Int(imu.gx), "gy": Int(imu.gy), "gz": Int(imu.gz),
-                                       "ok": imu.ok ? 1 : 0,
-                                   ])
+                                   channels: imuChannels(imu))
                 }
+            }
+
+            // Method C: one packet-level IMU sample for the whole notify batch.
+            // Align to the batch's first sample so wrist_imu timestamps stay
+            // monotonic and inside the tactile batch window.
+            if let imu = packet.packetImu, let sibling = wristImuSibling {
+                sibling.append(captureNs: arrivalNs,
+                               deviceTimestampNs: UInt64(packet.batchTimestampUs) &* 1_000,
+                               channels: imuChannels(imu))
             }
         } else {
             guard let packet = try? TactilePacketParser.parse(data) else { return }
@@ -276,6 +280,18 @@ public final class TactileStream: SyncFieldStream, @unchecked Sendable {
                                          channels: channelsAny, deviceTimestampNs: deviceTsNs)
             }
         }
+    }
+
+    /// Wrist-IMU JSONL channel layout, shared by Method B (per-sample) and
+    /// Method C (packet-level) so both framings write identical rows.
+    private func imuChannels(_ imu: TactileImuSample) -> [String: Int] {
+        [
+            "roll_cdeg": Int(imu.rollCdeg),
+            "pitch_cdeg": Int(imu.pitchCdeg),
+            "ax": Int(imu.ax), "ay": Int(imu.ay), "az": Int(imu.az),
+            "gx": Int(imu.gx), "gy": Int(imu.gy), "gz": Int(imu.gz),
+            "ok": imu.ok ? 1 : 0,
+        ]
     }
 
     /// Detect dropped notifies via firmware base-timestamp gaps and surface them as

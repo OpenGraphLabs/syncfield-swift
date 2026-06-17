@@ -23,11 +23,17 @@ public enum TactileConstants {
     public static let bytesPerSample    = channelsPerSample * 2  // 10
     public static let sampleIntervalUs: UInt32 = 10_000          // 100 Hz nominal
 
-    // --- schema_ver >= 4 (taxel matrix + per-sample IMU) ---
+    // --- schema_ver >= 4 (taxel matrix + IMU) ---
     // Header is the same 6 bytes but interpreted as [count:u8][flags:u8][base_ts_us:u32le].
+    // Two IMU framings (firmware decides per-packet via the flags byte):
+    //   • Method B (bit0): every sample slot carries its own 17B IMU block.
+    //   • Method C (bit1, FW >= 0.6.5): sample slots are taxels-only, followed by
+    //     ONE packet-level 17B IMU block after all samples (lower notify pressure).
+    // Parsers must accept both; they are mutually exclusive on the wire.
     public static let v4HeaderBytes = 6
     public static let v4ImuBytes    = 17           // roll,pitch,ax,ay,az,gx,gy,gz (8×i16) + imu_ok(u8)
-    public static let v4FlagImuPresent: UInt8 = 0x01
+    public static let v4FlagImuPresent: UInt8 = 0x01  // Method B: per-sample IMU
+    public static let v4FlagPacketImu: UInt8  = 0x02  // Method C: one packet-level IMU block
     public static let v4DefaultValuesPerSample = 80 // 5 fingers × 4 rows × 4 cols
 }
 
