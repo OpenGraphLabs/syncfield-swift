@@ -9,146 +9,101 @@ public enum TactileConstants {
     public static let serviceUUID    = UUID(uuidString: "4652535F-424C-4500-0000-000000000001")!
     public static let sensorCharUUID = UUID(uuidString: "4652535F-424C-4500-0001-000000000001")!
     public static let configCharUUID = UUID(uuidString: "4652535F-424C-4500-0002-000000000001")!
-    // Reserved for future use (firmware schema_ver=4 exposes these). NOT written in v1 —
-    // runtime command writes were observed to destabilise the BLE link, so the stream is
-    // consumed at the firmware default and never reconfigured at runtime.
+    // Reserved for future use. NOT written at runtime — command writes were observed
+    // to destabilise the BLE link, so the stream is consumed at the firmware default
+    // and never reconfigured at runtime.
     public static let commandCharUUID = UUID(uuidString: "4652535F-424C-4500-0003-000000000001")!
     public static let logCharUUID     = UUID(uuidString: "4652535F-424C-4500-0004-000000000001")!
     public static let nameFilter = "oglo"
     public static let canonicalFingerOrder = ["thumb", "index", "middle", "ring", "pinky"]
 
-    // --- schema_ver < 4 (legacy 5-FSR) ---
-    public static let packetHeaderBytes = 6
-    public static let channelsPerSample = 5
-    public static let bytesPerSample    = channelsPerSample * 2  // 10
-    public static let sampleIntervalUs: UInt32 = 10_000          // 100 Hz nominal
-
-    // --- schema_ver >= 4 (taxel matrix + IMU) ---
-    // Header is the same 6 bytes but interpreted as [count:u8][flags:u8][base_ts_us:u32le].
-    // Two IMU framings (firmware decides per-packet via the flags byte):
-    //   • Method B (bit0): every sample slot carries its own 17B IMU block.
-    //   • Method C (bit1, FW >= 0.6.5): sample slots are taxels-only, followed by
-    //     ONE packet-level 17B IMU block after all samples (lower notify pressure).
-    // Parsers must accept both; they are mutually exclusive on the wire.
-    public static let v4HeaderBytes = 6
-    public static let v4ImuBytes    = 17           // roll,pitch,ax,ay,az,gx,gy,gz (8×i16) + imu_ok(u8)
-    public static let v4FlagImuPresent: UInt8 = 0x01  // Method B: per-sample IMU
-    public static let v4FlagPacketImu: UInt8  = 0x02  // Method C: one packet-level IMU block
-    public static let v4DefaultValuesPerSample = 80 // 5 fingers × 4 rows × 4 cols
+    // --- schema_ver 5 (packed12_v5): the only supported OGLO wire format ---
+    // Firmware FW >= 0.7.0 (golden 0.7.1-cfgfit). Packed 12-bit taxels + per-sample
+    // RAW 6-axis IMU, with a real per-sample device timestamp.
+    //
+    // Header (10B): [count:u8][flags:u8(0x04)][seq_base:u32le][t_base_us:u32le]
+    // Per sample (stride 134B for 80 taxels):
+    //   [dt_us:u16le][80 × 12-bit packed taxels = 120B][6 × i16le raw IMU = 12B]
+    // Firmware source of truth: oglo-hardware/firmware/OGLO-MT-RDR-02/oglo_rdr02_ble/oglo_rdr02_ble.ino
+    // (BLE_FLAG_PACKED, packTaxels12, putImuRaw, PKD_SAMPLE_STRIDE).
+    public static let schemaVer = 5
+    public static let v5HeaderBytes = 10
+    public static let v5TaxelPackedBytes = 120        // 80 taxels × 12-bit, packed 2-per-3-bytes
+    public static let v5ImuRawBytes = 12              // ax,ay,az,gx,gy,gz (6 × i16le)
+    public static let v5SampleStride = 2 + v5TaxelPackedBytes + v5ImuRawBytes  // 134
+    public static let v5FlagPacked: UInt8 = 0x04
+    public static let defaultValuesPerSample = 80     // 5 fingers × 4 rows × 4 cols
 }
 
-/// Firmware config blob read from the config characteristic.
+/// Firmware config blob read from the config characteristic (schema_ver 5).
 ///
-/// Tolerant of two on-wire shapes:
-///   • legacy (schema_ver < 4): `channels` is an array of `{id, loc, type, bits}` objects.
-///   • schema_ver >= 4: `channels` is a flat array of finger-name strings
-///     (e.g. `["pinky","ring","middle","index","thumb"]`), plus `values_per_sample`,
-///     `sample_shape`, `sample_order`.
-///
-/// `fingerLabels` is the normalised finger order regardless of input shape.
+/// `channels` is a flat array of side-aware finger-name strings
+/// (e.g. `["pinky","ring","middle","index","thumb"]`); `fingerLabels` exposes that
+/// order (falling back to `canonicalFingerOrder`). Unknown JSON keys are ignored.
 public struct DeviceManifest: Codable, Sendable {
-    public struct Channel: Codable, Sendable {
-        public let id: Int
-        public let loc: String
-        public let type: String
-        public let bits: Int
-    }
-
     public let device: String
     public let side: TactileSide
-    public let hwRev: String?
-    public let rateHz: Int
-    /// Legacy object channels; empty for schema_ver >= 4.
-    public let channels: [Channel]
-
-    // schema_ver >= 4 fields (nil/0 on legacy firmware)
     public let schemaVer: Int
+    public let packetFormat: String?
+    public let rateHz: Int
     public let valuesPerSample: Int?
     public let samplesPerPacket: Int?
     public let sampleShape: [Int]?
-    public let sampleOrder: String?
-    /// Ordered finger names. From legacy `channels[*].loc`, from v4 string `channels`,
-    /// or `canonicalFingerOrder` as a last resort.
+    /// Ordered finger names from the manifest `channels` array.
     public let fingerLabels: [String]
-
-    /// Label for a legacy FSR channel id, or the finger name at `id` for v4.
-    public func locationForChannel(_ id: Int) -> String? {
-        if !channels.isEmpty { return channels.first(where: { $0.id == id })?.loc }
-        if id >= 0 && id < fingerLabels.count { return fingerLabels[id] }
-        return nil
-    }
 
     enum CodingKeys: String, CodingKey {
         case device
         case side
-        case hwRev = "hw_rev"
-        case rateHz = "rate_hz"
-        case channels
         case schemaVer = "schema_ver"
+        case packetFormat = "packet_format"
+        case rateHz = "rate_hz"
         case valuesPerSample = "values_per_sample"
         case samplesPerPacket = "samples_per_packet"
         case sampleShape = "sample_shape"
-        case sampleOrder = "sample_order"
+        case channels
     }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         device = try c.decode(String.self, forKey: .device)
         side = try c.decode(TactileSide.self, forKey: .side)
-        hwRev = try c.decodeIfPresent(String.self, forKey: .hwRev)
-        rateHz = try c.decodeIfPresent(Int.self, forKey: .rateHz) ?? 100
         schemaVer = try c.decodeIfPresent(Int.self, forKey: .schemaVer) ?? 0
+        packetFormat = try c.decodeIfPresent(String.self, forKey: .packetFormat)
+        rateHz = try c.decodeIfPresent(Int.self, forKey: .rateHz) ?? 100
         valuesPerSample = try c.decodeIfPresent(Int.self, forKey: .valuesPerSample)
         samplesPerPacket = try c.decodeIfPresent(Int.self, forKey: .samplesPerPacket)
         sampleShape = try c.decodeIfPresent([Int].self, forKey: .sampleShape)
-        sampleOrder = try c.decodeIfPresent(String.self, forKey: .sampleOrder)
-
-        // `channels` may be objects (legacy) or strings (v4).
-        if let objs = try? c.decode([Channel].self, forKey: .channels) {
-            channels = objs
-            fingerLabels = objs.map { $0.loc }
-        } else if let strs = try? c.decode([String].self, forKey: .channels) {
-            channels = []
-            fingerLabels = strs
-        } else {
-            channels = []
-            fingerLabels = TactileConstants.canonicalFingerOrder
-        }
+        let strs = try c.decodeIfPresent([String].self, forKey: .channels)
+        fingerLabels = (strs?.isEmpty == false) ? strs! : TactileConstants.canonicalFingerOrder
     }
 
     public func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
         try c.encode(device, forKey: .device)
         try c.encode(side, forKey: .side)
-        try c.encodeIfPresent(hwRev, forKey: .hwRev)
+        try c.encode(schemaVer, forKey: .schemaVer)
+        try c.encodeIfPresent(packetFormat, forKey: .packetFormat)
         try c.encode(rateHz, forKey: .rateHz)
-        if schemaVer != 0 { try c.encode(schemaVer, forKey: .schemaVer) }
         try c.encodeIfPresent(valuesPerSample, forKey: .valuesPerSample)
         try c.encodeIfPresent(samplesPerPacket, forKey: .samplesPerPacket)
         try c.encodeIfPresent(sampleShape, forKey: .sampleShape)
-        try c.encodeIfPresent(sampleOrder, forKey: .sampleOrder)
-        if !channels.isEmpty {
-            try c.encode(channels, forKey: .channels)
-        } else {
-            try c.encode(fingerLabels, forKey: .channels)
-        }
+        try c.encode(fingerLabels, forKey: .channels)
     }
 
     /// Test/utility initialiser.
-    public init(device: String, side: TactileSide, hwRev: String?, rateHz: Int,
-                channels: [Channel], schemaVer: Int = 0, valuesPerSample: Int? = nil,
-                samplesPerPacket: Int? = nil, sampleShape: [Int]? = nil,
-                sampleOrder: String? = nil, fingerLabels: [String]? = nil) {
+    public init(device: String, side: TactileSide, schemaVer: Int,
+                rateHz: Int = 100, packetFormat: String? = "packed12_v5",
+                valuesPerSample: Int? = 80, samplesPerPacket: Int? = nil,
+                sampleShape: [Int]? = [5, 4, 4], fingerLabels: [String]? = nil) {
         self.device = device
         self.side = side
-        self.hwRev = hwRev
-        self.rateHz = rateHz
-        self.channels = channels
         self.schemaVer = schemaVer
+        self.packetFormat = packetFormat
+        self.rateHz = rateHz
         self.valuesPerSample = valuesPerSample
         self.samplesPerPacket = samplesPerPacket
         self.sampleShape = sampleShape
-        self.sampleOrder = sampleOrder
-        self.fingerLabels = fingerLabels ?? channels.map { $0.loc }
+        self.fingerLabels = fingerLabels ?? TactileConstants.canonicalFingerOrder
     }
 }

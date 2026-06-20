@@ -64,6 +64,7 @@ public final class TactileBLEClient: NSObject, @unchecked Sendable {
         case disconnected(String?)
         case missingCharacteristic
         case manifestParseFailed(Swift.Error)
+        case unsupportedSchema(Int)
     }
     #endif
 
@@ -163,7 +164,13 @@ public final class TactileBLEClient: NSObject, @unchecked Sendable {
             throw Error.manifestParseFailed(error)
         }
 
-        // Step 5: validate side matches what this TactileStream was configured for
+        // Step 5: validate schema. Only schema_ver 5 (packed12_v5) is supported —
+        // fail clearly rather than misparse an older/newer firmware (no fallback).
+        guard manifest.schemaVer == TactileConstants.schemaVer else {
+            throw Error.unsupportedSchema(manifest.schemaVer)
+        }
+
+        // Step 6: validate side matches what this TactileStream was configured for
         guard manifest.side == expectedSide else {
             throw Error.wrongSide(expected: expectedSide, actual: manifest.side)
         }

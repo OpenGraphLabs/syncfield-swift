@@ -13,10 +13,10 @@ public struct TactileSampleEvent: Sendable {
     public let frame: Int
     /// Host monotonic nanoseconds (same domain as `SessionClock.nowMonotonicNs()`).
     public let monotonicNs: UInt64
-    /// Firmware hardware clock in nanoseconds.
+    /// Firmware hardware clock in nanoseconds (`t_base_us + dt_us`).
     public let deviceTimestampNs: UInt64
-    /// Channel label → raw 12-bit FSR value (0–4095).
-    /// Labels come from the firmware manifest (`thumb`, `index`, `middle`, `ring`, `pinky`).
+    /// Channel label → raw 12-bit taxel value (0–4095). Labels are `<finger>_<row>_<col>`
+    /// from the firmware manifest finger order and `sample_shape` (e.g. `thumb_0_1`).
     public let channels: [String: Int]
 }
 
@@ -31,9 +31,9 @@ public final class TactileStream: SyncFieldStream, @unchecked Sendable {
 
     private let client = TactileBLEClient()
 
-    /// Optional sibling stream that receives this glove's wrist IMU (schema_ver>=4).
-    /// Set by the bridge so the IMU lands in its own `wrist_imu_<side>.jsonl` with
-    /// the SAME timestamps as the tactile rows. nil → IMU is omitted (legacy/none).
+    /// Optional sibling stream that receives this glove's wrist IMU. Set by the bridge
+    /// so the per-sample raw 6-axis IMU lands in its own `wrist_imu_<side>.jsonl` with
+    /// the SAME timestamps as the tactile rows. nil → IMU is omitted.
     public weak var wristImuSibling: WristImuStream?
 
     private var writer: SensorWriter?
@@ -189,77 +189,53 @@ public final class TactileStream: SyncFieldStream, @unchecked Sendable {
     private func handlePacket(_ data: Data, arrivalNs: UInt64) {
         guard isSubscribed, let manifest = manifest else { return }
 
-        let rateHz = manifest.rateHz > 0 ? manifest.rateHz : 100
-        let intervalUs = UInt64(1_000_000 / rateHz)
-
         handlerLock.lock()
         let handler = _sampleHandler
         handlerLock.unlock()
 
-        if manifest.schemaVer >= 4 {
-            let vps = manifest.valuesPerSample ?? TactileConstants.v4DefaultValuesPerSample
-            guard let packet = try? TactilePacketParser.parseV4(data, valuesPerSample: vps) else { return }
-            detectLoss(batchTsUs: packet.batchTimestampUs, count: packet.count, intervalUs: intervalUs)
+        let vps = manifest.valuesPerSample ?? TactileConstants.defaultValuesPerSample
+        guard let packet = try? TactilePacketParser.parseV5(data, valuesPerSample: vps) else { return }
 
-            let shape = manifest.sampleShape ?? [5, 4, 4]
-            let rows = shape.count > 1 ? shape[1] : 4
-            let cols = shape.count > 2 ? shape[2] : 4
-            let perFinger = max(rows * cols, 1)
+        let rateHz = manifest.rateHz > 0 ? manifest.rateHz : 100
+        let intervalUs = UInt64(1_000_000 / rateHz)
+        detectLoss(batchTsUs: packet.tBaseUs, count: packet.count, intervalUs: intervalUs)
 
-            for (i, taxels) in packet.samples.enumerated() {
-                let frame = frameCount
-                frameCount += 1
-                let captureNs = arrivalNs &+ UInt64(i) &* (intervalUs &* 1_000)
-                let deviceTsNs = (UInt64(packet.batchTimestampUs) &+ UInt64(i) &* intervalUs) &* 1_000
+        let shape = manifest.sampleShape ?? [5, 4, 4]
+        let rows = shape.count > 1 ? shape[1] : 4
+        let cols = shape.count > 2 ? shape[2] : 4
+        let perFinger = max(rows * cols, 1)
 
-                // Taxels → tactile stream (preview + tactile_<side>.jsonl).
-                var channelsOut: [String: Int] = [:]
-                channelsOut.reserveCapacity(taxels.count)
-                for (t, raw) in taxels.enumerated() {
-                    let f = t / perFinger
-                    let rem = t % perFinger
-                    let r = cols > 0 ? rem / cols : 0
-                    let c = cols > 0 ? rem % cols : 0
-                    let finger = (f < manifest.fingerLabels.count) ? manifest.fingerLabels[f] : "f\(f)"
-                    channelsOut["\(finger)_\(r)_\(c)"] = Int(raw)
-                }
-                emit(frame: frame, captureNs: captureNs, deviceTsNs: deviceTsNs,
-                     channels: channelsOut, handler: handler)
+        for (i, taxels) in packet.samples.enumerated() {
+            let frame = frameCount
+            frameCount += 1
 
-                // Method B IMU → separate wrist_imu_<side>.jsonl (same timestamps),
-                // kept as its own modality. Dropped if no sibling is linked.
-                // (Method C packets have all-nil per-sample IMU; handled once below.)
-                if let imu = packet.imu[i], let sibling = wristImuSibling {
-                    sibling.append(captureNs: captureNs, deviceTimestampNs: deviceTsNs,
-                                   channels: imuChannels(imu))
-                }
+            // Real per-sample timestamps from the firmware clock (t_base_us + dt_us),
+            // not a synthesised cadence. captureNs uses the same dt for true intra-batch
+            // spacing relative to packet arrival.
+            let dtNs = UInt64(packet.dtUs[i]) &* 1_000
+            let captureNs = arrivalNs &+ dtNs
+            let deviceTsNs = (UInt64(packet.tBaseUs) &+ UInt64(packet.dtUs[i])) &* 1_000
+
+            // Taxels → tactile stream (preview + tactile_<side>.jsonl).
+            var channelsOut: [String: Int] = [:]
+            channelsOut.reserveCapacity(taxels.count)
+            for (t, raw) in taxels.enumerated() {
+                let f = t / perFinger
+                let rem = t % perFinger
+                let r = cols > 0 ? rem / cols : 0
+                let c = cols > 0 ? rem % cols : 0
+                let finger = (f < manifest.fingerLabels.count) ? manifest.fingerLabels[f] : "f\(f)"
+                channelsOut["\(finger)_\(r)_\(c)"] = Int(raw)
             }
+            emit(frame: frame, captureNs: captureNs, deviceTsNs: deviceTsNs,
+                 channels: channelsOut, handler: handler)
 
-            // Method C: one packet-level IMU sample for the whole notify batch.
-            // Align to the batch's first sample so wrist_imu timestamps stay
-            // monotonic and inside the tactile batch window.
-            if let imu = packet.packetImu, let sibling = wristImuSibling {
-                sibling.append(captureNs: arrivalNs,
-                               deviceTimestampNs: UInt64(packet.batchTimestampUs) &* 1_000,
-                               channels: imuChannels(imu))
-            }
-        } else {
-            guard let packet = try? TactilePacketParser.parse(data) else { return }
-            detectLoss(batchTsUs: packet.batchTimestampUs, count: packet.count, intervalUs: intervalUs)
-
-            for (i, channels) in packet.samples.enumerated() {
-                let frame = frameCount
-                frameCount += 1
-                let captureNs = arrivalNs &+ UInt64(i) &* (intervalUs &* 1_000)
-                let deviceTsNs = (UInt64(packet.batchTimestampUs) &+ UInt64(i) &* intervalUs) &* 1_000
-
-                var channelsOut: [String: Int] = [:]
-                for (cid, raw) in channels.enumerated() {
-                    let label = manifest.locationForChannel(cid) ?? "ch\(cid)"
-                    channelsOut[label] = Int(raw)
-                }
-                emit(frame: frame, captureNs: captureNs, deviceTsNs: deviceTsNs,
-                     channels: channelsOut, handler: handler)
+            // Per-sample raw 6-axis IMU → separate wrist_imu_<side>.jsonl (same
+            // timestamps), kept as its own modality. Dropped if no sibling is linked
+            // or the IMU block was truncated.
+            if let imu = packet.imu[i], let sibling = wristImuSibling {
+                sibling.append(captureNs: captureNs, deviceTimestampNs: deviceTsNs,
+                               channels: rawImuChannels(imu))
             }
         }
     }
@@ -282,15 +258,12 @@ public final class TactileStream: SyncFieldStream, @unchecked Sendable {
         }
     }
 
-    /// Wrist-IMU JSONL channel layout, shared by Method B (per-sample) and
-    /// Method C (packet-level) so both framings write identical rows.
-    private func imuChannels(_ imu: TactileImuSample) -> [String: Int] {
+    /// Wrist-IMU JSONL channel layout: raw 6-axis only (schema_ver 5). The firmware
+    /// no longer computes on-device roll/pitch fusion, so those columns are gone.
+    private func rawImuChannels(_ imu: TactileRawImuSample) -> [String: Int] {
         [
-            "roll_cdeg": Int(imu.rollCdeg),
-            "pitch_cdeg": Int(imu.pitchCdeg),
             "ax": Int(imu.ax), "ay": Int(imu.ay), "az": Int(imu.az),
             "gx": Int(imu.gx), "gy": Int(imu.gy), "gz": Int(imu.gz),
-            "ok": imu.ok ? 1 : 0,
         ]
     }
 
