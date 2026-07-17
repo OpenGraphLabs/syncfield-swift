@@ -352,93 +352,13 @@ public final class iPhoneCameraStream: NSObject, SyncFieldStream, AudioReattacha
     /// expose several formats with different FOV (some cropped for
     /// stabilization headroom), and the minimum zoom factor floor is what
     /// keeps recording at the physical ultra-wide framing rather than the
-    /// virtual-camera default which crops in.
+    /// virtual-camera default which crops in. Delegates the actual
+    /// format/fps/zoom policy to `CameraDeviceConfig` so `MultiCamCameraStream`
+    /// can reuse the identical ranking logic.
     private func configureWidestFormatAndZoom(device: AVCaptureDevice) {
         #if os(iOS)
-        do {
-            try device.lockForConfiguration()
-            defer { device.unlockForConfiguration() }
-
-            if let format = Self.widestUsableFormat(on: device, settings: videoSettings) {
-                device.activeFormat = format
-            }
-
-            if let fps = Self.appliedFrameRate(for: device.activeFormat, targetFps: videoSettings.fps) {
-                let duration = CMTime(value: 1, timescale: CMTimeScale(max(1, Int32(fps.rounded()))))
-                device.activeVideoMinFrameDuration = duration
-                device.activeVideoMaxFrameDuration = duration
-            }
-
-            device.videoZoomFactor = device.minAvailableVideoZoomFactor
-        } catch {
-            NSLog("[SyncField.Camera] failed to configure widest FOV: \(error)")
-        }
+        CameraDeviceConfig.applyLensPolicy(device, settings: videoSettings)
         #endif
-    }
-
-    private static func widestUsableFormat(
-        on device: AVCaptureDevice,
-        settings: VideoSettings
-    ) -> AVCaptureDevice.Format? {
-        let targetFps = Double(settings.fps)
-        let requestedPixels = Int64(settings.width) * Int64(settings.height)
-        let requestedAspect = Double(settings.width) / Double(settings.height)
-
-        let fpsCompatible = device.formats.filter { format in
-            supports(format: format, fps: targetFps)
-        }
-        let resolutionCompatible = fpsCompatible.filter { format in
-            let dimensions = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
-            return Int64(dimensions.width) * Int64(dimensions.height) >= requestedPixels
-        }
-        let pool = !resolutionCompatible.isEmpty
-            ? resolutionCompatible
-            : (!fpsCompatible.isEmpty ? fpsCompatible : device.formats)
-
-        return pool.max { lhs, rhs in
-            #if os(iOS)
-            let lhsFov = lhs.videoFieldOfView
-            let rhsFov = rhs.videoFieldOfView
-            if abs(lhsFov - rhsFov) > 0.1 {
-                return lhsFov < rhsFov
-            }
-            #endif
-
-            let lhsDimensions = CMVideoFormatDescriptionGetDimensions(lhs.formatDescription)
-            let rhsDimensions = CMVideoFormatDescriptionGetDimensions(rhs.formatDescription)
-            let lhsAspect = Double(lhsDimensions.width) / Double(lhsDimensions.height)
-            let rhsAspect = Double(rhsDimensions.width) / Double(rhsDimensions.height)
-            let lhsAspectDelta = abs(lhsAspect - requestedAspect)
-            let rhsAspectDelta = abs(rhsAspect - requestedAspect)
-            if abs(lhsAspectDelta - rhsAspectDelta) > 0.01 {
-                return lhsAspectDelta > rhsAspectDelta
-            }
-
-            let lhsPixels = Int64(lhsDimensions.width) * Int64(lhsDimensions.height)
-            let rhsPixels = Int64(rhsDimensions.width) * Int64(rhsDimensions.height)
-            return lhsPixels > rhsPixels
-        }
-    }
-
-    private static func supports(format: AVCaptureDevice.Format, fps: Double) -> Bool {
-        guard fps > 0 else { return true }
-        return format.videoSupportedFrameRateRanges.contains { range in
-            range.minFrameRate <= fps && range.maxFrameRate >= fps
-        }
-    }
-
-    private static func appliedFrameRate(
-        for format: AVCaptureDevice.Format,
-        targetFps: Int
-    ) -> Double? {
-        let target = Double(targetFps)
-        guard target > 0 else { return nil }
-        if format.videoSupportedFrameRateRanges.contains(where: {
-            $0.minFrameRate <= target && $0.maxFrameRate >= target
-        }) {
-            return target
-        }
-        return format.videoSupportedFrameRateRanges.map(\.maxFrameRate).max()
     }
 
     /// Re-apply the minimum-zoom floor. Called from `startRecording` as
