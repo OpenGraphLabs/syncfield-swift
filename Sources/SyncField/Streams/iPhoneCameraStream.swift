@@ -668,14 +668,16 @@ public final class iPhoneCameraStream: NSObject, SyncFieldStream, AudioReattacha
     // MARK: Frame processor hook
 
     #if canImport(AVFoundation)
+    /// Thin forwarder to `CameraTimestamps.midpointCorrectedTimestampNs`.
+    /// Retained so `CameraMidpointTimestampTests` keeps pinning the behaviour
+    /// through this type; the implementation now lives in the shared helper
+    /// that `MultiCamCameraStream` also uses.
     static func midpointCorrectedTimestampNs(
         ptsSeconds: Double,
         exposureSeconds: Double
     ) -> (captureNs: UInt64, rawPtsNs: UInt64) {
-        let safeExposure = exposureSeconds.isFinite ? max(0.0, exposureSeconds) : 0.0
-        let rawPtsNs = UInt64(max(0.0, ptsSeconds) * 1_000_000_000)
-        let captureNs = UInt64(max(0.0, ptsSeconds + safeExposure / 2.0) * 1_000_000_000)
-        return (captureNs, rawPtsNs)
+        CameraTimestamps.midpointCorrectedTimestampNs(
+            ptsSeconds: ptsSeconds, exposureSeconds: exposureSeconds)
     }
 
     private func currentExposureDurationSeconds() -> Double {
