@@ -13,14 +13,29 @@ public struct Manifest: Codable, Sendable {
         /// connection). Omitted from the JSON when nil so single-entry
         /// streams stay byte-compatible with existing manifests.
         public let syncGroupId: String?
+        /// Set to `"truncated"` when this stream stopped early but the rest
+        /// of the session kept recording — e.g. the wide leg of a stereo
+        /// capture that iOS dropped under system pressure while the
+        /// ultra-wide leg and audio continued. `nil` (⇒ implicitly "ok") for
+        /// streams that ran to the normal stop. Omitted from the JSON when
+        /// nil, same byte-compat rule as `syncGroupId`.
+        public let status: String?
+        /// Session-monotonic timestamp (ns) of the frame after which this
+        /// stream produced no more data, paired with `status == "truncated"`.
+        /// Omitted from the JSON when nil.
+        public let truncatedAtNs: UInt64?
 
         public init(streamId: String, filePath: String, frameCount: Int,
                     kind: String, capabilities: StreamCapabilities,
-                    syncGroupId: String? = nil) {
+                    syncGroupId: String? = nil,
+                    status: String? = nil,
+                    truncatedAtNs: UInt64? = nil) {
             self.streamId = streamId; self.filePath = filePath
             self.frameCount = frameCount; self.kind = kind
             self.capabilities = capabilities
             self.syncGroupId = syncGroupId
+            self.status = status
+            self.truncatedAtNs = truncatedAtNs
         }
 
         enum CodingKeys: String, CodingKey {
@@ -30,6 +45,8 @@ public struct Manifest: Codable, Sendable {
             case kind
             case capabilities
             case syncGroupId  = "sync_group_id"
+            case status
+            case truncatedAtNs = "truncated_at_ns"
         }
     }
 
