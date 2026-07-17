@@ -2,6 +2,25 @@
 
 All notable changes to **syncfield-swift** are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.1] — 2026-07-17
+
+Removes the stereo photo-calibration probe and replaces it with the two inputs that actually work on dual-wide hardware: FOV-estimated intrinsics (host-side) and device-level factory extrinsics. The 0.11.0 stereo photo probe never delivered calibration in the field — `AVCapturePhotoOutput.isCameraCalibrationDataDeliverySupported` is true only when the source device's `geometricDistortionCorrectionEnabled == NO`, and the wide constituent of a dual-wide device cannot disable GDC, so calibration delivery is structurally unsupported (confirmed on-device; production has been 100% `fov_estimate`). The mono `iPhoneCameraStream` path and its `probe(deviceModel:)` are unchanged.
+
+### Removed
+- **Stereo photo-calibration probe (public surface).** `AVPhotoCalibrationProbeExecutor.probeStereo(...)`, the `StereoCalibrationProbeExecutor` protocol, and `CameraCalibrationProber.probeStereoIfNeeded()` / `cachedStereo()` / `clearStereoCache()` / the `stereoExecutor` dependency are gone. Hosts no longer run a stereo photo capture; the stereo sidecar is built from FOV intrinsics + device-level extrinsics instead.
+- **`MultiCamCameraStream.probedCalibration`** and its `probedCalibration:` initializer argument — the stream no longer carries a photo-probe result.
+
+### Added
+- **`MultiCamCameraStream.wideActiveCameraMetadata`** — wide-leg (`cam_ego_wide`) device/format metadata (device type, dimensions, field of view, actual GDC state), mirroring `activeCameraMetadata` (the ultra-wide leg) with the same post-configuration semantics. Lets the host write honest per-leg FOV-estimate intrinsics + `gdc_enabled` into `cam_ego.calibration.json`.
+- **`MultiCamCameraStream.stereoExtrinsics() -> StereoExtrinsics?`** and the static **`deviceStereoExtrinsics(uwDevice:wideDevice:)`** — device-level ultra-wide → wide factory extrinsics from `AVCaptureDevice.extrinsicMatrix(from:to:)` (iOS 13+). No photo capture, no running session; resolves the physical back cameras when the stream's own constituents aren't set (so a host diagnostics harness can call it pre-`connect()`). Returns `nil` when the SDK provides no factory calibration — an explicit "not available", never a substituted value.
+- **`Calibration/StereoExtrinsicsMath.swift`** — the pure `StereoExtrinsics` value type and the simd decode/compose math (`directExtrinsics(fromMatrixData:)`, …) moved into their own file so they survive the probe removal and stay macOS-unit-testable.
+
+### Notes
+- `StereoProbedCalibration` (and the internal `runStereoProbe` / photo delegate) remain solely as the return container of the still-present mono `PhotoCalibrationProbeExecutor.probe(deviceModel:)`. That mono photo probe is the same structurally-dead path and is recommended for a later, separate removal.
+
+### Changed
+- `SyncFieldVersion.current` bumped to `0.11.1`.
+
 ## [0.11.0] — 2026-07-16
 
 Adds hardware-paired stereo (ultra-wide + wide) egocentric capture: a factory calibration probe, a new `MultiCamCameraStream` that hosts opt into explicitly, and the manifest additions needed to describe a stream that demuxes into more than one output file. Source-compatible with 0.10.x; the mono `iPhoneCameraStream` path is behaviorally unchanged except for a documented calibration-probe requirement.
