@@ -8,12 +8,19 @@ public struct Manifest: Codable, Sendable {
         public let frameCount: Int
         public let kind: String           // "video" | "sensor"
         public let capabilities: StreamCapabilities
+        /// Groups entries produced by the same physical stream (e.g. a
+        /// stereo camera stream emitting `cam_ego` + `cam_ego_wide` from one
+        /// connection). Omitted from the JSON when nil so single-entry
+        /// streams stay byte-compatible with existing manifests.
+        public let syncGroupId: String?
 
         public init(streamId: String, filePath: String, frameCount: Int,
-                    kind: String, capabilities: StreamCapabilities) {
+                    kind: String, capabilities: StreamCapabilities,
+                    syncGroupId: String? = nil) {
             self.streamId = streamId; self.filePath = filePath
             self.frameCount = frameCount; self.kind = kind
             self.capabilities = capabilities
+            self.syncGroupId = syncGroupId
         }
 
         enum CodingKeys: String, CodingKey {
@@ -22,6 +29,7 @@ public struct Manifest: Codable, Sendable {
             case frameCount   = "frame_count"
             case kind
             case capabilities
+            case syncGroupId  = "sync_group_id"
         }
     }
 

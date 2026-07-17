@@ -68,3 +68,37 @@ actor MockStream: SyncFieldStream {
         connected = false
     }
 }
+
+/// A stream that owns a single connection but demuxes into more than one
+/// manifest entry — simulates a future stereo camera stream that emits two
+/// video streams (`cam_ego` + `cam_ego_wide`) from one `SyncFieldStream`.
+struct MultiEntryFakeStream: SyncFieldStream {
+    let streamId: String
+    let capabilities: StreamCapabilities
+    let entries: [Manifest.StreamEntry]
+
+    init(streamId: String, entries: [Manifest.StreamEntry]) {
+        self.streamId = streamId
+        self.capabilities = StreamCapabilities(producesFile: true)
+        self.entries = entries
+    }
+
+    func prepare() async throws {}
+    func connect(context: StreamConnectContext) async throws {}
+    func startRecording(clock: SessionClock, writerFactory: WriterFactory) async throws {}
+
+    func stopRecording() async throws -> StreamStopReport {
+        StreamStopReport(streamId: streamId, frameCount: 0, kind: "video")
+    }
+
+    func ingest(into episodeDirectory: URL,
+                progress: @Sendable (Double) -> Void) async throws -> StreamIngestReport {
+        StreamIngestReport(streamId: streamId, filePath: nil, frameCount: nil)
+    }
+
+    func disconnect() async throws {}
+
+    func manifestEntries(report: StreamIngestReport?) -> [Manifest.StreamEntry] {
+        entries
+    }
+}

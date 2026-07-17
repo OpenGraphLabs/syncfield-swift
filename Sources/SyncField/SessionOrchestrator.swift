@@ -814,16 +814,8 @@ public actor SessionOrchestrator {
 
     private func writeManifest(
         from results: [String: Result<StreamIngestReport, Error>]) throws {
-        let entries: [Manifest.StreamEntry] = streams.map { s in
-            let report = (try? results[s.streamId]?.get()) ?? nil
-            return Manifest.StreamEntry(
-                streamId: s.streamId,
-                filePath: report?.filePath ?? Self.defaultFilePath(
-                    streamId: s.streamId,
-                    kind: s.capabilities.producesFile ? "video" : "sensor"),
-                frameCount: report?.frameCount ?? 0,
-                kind: s.capabilities.producesFile ? "video" : "sensor",
-                capabilities: s.capabilities)
+        let entries: [Manifest.StreamEntry] = streams.flatMap { s in
+            s.manifestEntries(report: (try? results[s.streamId]?.get()) ?? nil)
         }
         let manifest = Manifest(
             sdkVersion: SyncFieldVersion.current,
@@ -835,7 +827,11 @@ public actor SessionOrchestrator {
             to: episodeDirectory.appendingPathComponent("manifest.json"))
     }
 
-    private static func defaultFilePath(streamId: String, kind: String) -> String {
+    /// Default file name for a stream's manifest entry when its ingest/stop
+    /// report doesn't supply one. Shared with `SyncFieldStream`'s default
+    /// `manifestEntries` implementation, so it's internal rather than
+    /// private to this file.
+    static func defaultFilePath(streamId: String, kind: String) -> String {
         kind == "video" ? "\(streamId).mp4" : "\(streamId).jsonl"
     }
 }

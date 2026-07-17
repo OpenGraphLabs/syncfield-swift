@@ -56,6 +56,31 @@ public protocol SyncFieldStream: Sendable {
     func ingest(into episodeDirectory: URL,
                 progress: @Sendable (Double) -> Void) async throws -> StreamIngestReport
     func disconnect() async throws
+
+    /// Manifest entries this stream contributes. `SessionOrchestrator`
+    /// flat-maps this across every registered stream when writing
+    /// `manifest.json`, instead of assuming one entry per stream.
+    ///
+    /// Most streams contribute exactly one entry — the default
+    /// implementation below, which existing conforming types get for free.
+    /// A stream that demuxes one connection into multiple output files
+    /// (e.g. a stereo camera stream producing `cam_ego` + `cam_ego_wide`
+    /// video files from a single connected device) overrides this to
+    /// return more than one entry.
+    nonisolated func manifestEntries(report: StreamIngestReport?) -> [Manifest.StreamEntry]
+}
+
+public extension SyncFieldStream {
+    nonisolated func manifestEntries(report: StreamIngestReport?) -> [Manifest.StreamEntry] {
+        let kind = capabilities.producesFile ? "video" : "sensor"
+        return [Manifest.StreamEntry(
+            streamId: streamId,
+            filePath: report?.filePath ?? SessionOrchestrator.defaultFilePath(
+                streamId: streamId, kind: kind),
+            frameCount: report?.frameCount ?? 0,
+            kind: kind,
+            capabilities: capabilities)]
+    }
 }
 
 /// Optional stream contract for hardware that needs a live pre-start check
