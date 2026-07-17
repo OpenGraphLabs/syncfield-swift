@@ -204,6 +204,28 @@ final class StereoProbedCalibrationTests: XCTestCase {
         }
     }
 
+    func test_probeStereoIfNeeded_propagates_executor_error() async {
+        let stereoExecutor = StubStereoProbeExecutor(result: .failure(ProbeError.calibrationDataMissing))
+        let prober = CameraCalibrationProber(
+            cacheDirectory: workDir, deviceModel: "iPhone17,1",
+            executor: StubProbeExecutorForStereoTests(),
+            stereoExecutor: stereoExecutor
+        )
+
+        do {
+            _ = try await prober.probeStereoIfNeeded()
+            XCTFail("expected ProbeError.calibrationDataMissing")
+        } catch let error as ProbeError {
+            XCTAssertEqual(error, .calibrationDataMissing)
+        } catch {
+            XCTFail("unexpected error type: \(error)")
+        }
+
+        // Failed probe must NOT write a stereo cache file (would poison future calls).
+        let cacheURL = workDir.appendingPathComponent("camera_calibration_stereo_iPhone17,1.json")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: cacheURL.path))
+    }
+
     func test_mono_and_stereo_caches_do_not_collide() async throws {
         let monoFixture = makeMono()
         let monoExecutor = StubProbeExecutorForStereoTests(result: .success(monoFixture))
