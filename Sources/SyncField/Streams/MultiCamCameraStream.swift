@@ -12,8 +12,9 @@ import AVFoundation
 /// where `cam_ego_wide` was truncated. Pure value type — no AVFoundation — so
 /// it round-trips on any platform.
 public struct StereoDegradationEvent: Codable, Equatable, Sendable {
-    /// Session-monotonic timestamp (ns) at which the wide leg was declared
-    /// dead. Sourced from `SessionClock.nowMonotonicNs()`.
+    /// `capture_ns` of the last wide frame recorded before the leg was
+    /// declared dead — the same value written as the wide entry's
+    /// `truncated_at_ns`, so it lines up with `cam_ego_wide.timestamps.jsonl`.
     public let atNs: UInt64
     /// The stream that degraded — always `"cam_ego_wide"` for this stream.
     public let stream: String
@@ -50,10 +51,14 @@ public struct StereoDegradationEvent: Codable, Equatable, Sendable {
 /// - Reporting + degradation facts (`uwFrameCount`, `wideFrameCount`,
 ///   `wideDegraded`, `wideTruncatedAtNs`) are pure-Swift state guarded by
 ///   `stateLock` so they are readable from `manifestEntries` (nonisolated,
-///   off-queue) and writable from KVO/notification callbacks (arbitrary
-///   threads). KVO/notification handlers never touch a writer directly — they
-///   funnel through `markWideDegraded`, which hops the actual writer teardown
-///   back onto `syncQueue`.
+///   off-queue).
+/// - Degradation has ONE detector: the wide-frame watchdog on `syncQueue`
+///   (fires only when the UW leg is still delivering while the wide leg has
+///   gone silent). KVO `systemPressureState` + session interruption/runtime
+///   notifications are diagnostic-only — they log and drop an attribution hint
+///   onto `syncQueue`, but never mark truncation themselves, so a whole-session
+///   stall can't produce a false wide truncation. The watchdog calls
+///   `markWideDegraded`, which hops the wide-writer teardown onto `syncQueue`.
 public final class MultiCamCameraStream: NSObject, SyncFieldStream, @unchecked Sendable {
     public nonisolated let streamId: String
     public nonisolated let wideStreamId: String
@@ -119,7 +124,6 @@ public final class MultiCamCameraStream: NSObject, SyncFieldStream, @unchecked S
     private var isRecording = false
     private var uwStartPTS: CMTime = .zero
     private var wideStartPTS: CMTime = .zero
-    private var clock: SessionClock?
 
     // Frame processor (UW frames only), same drop-on-busy gate as the mono stream.
     private var frameProcessor: (@Sendable (CMSampleBuffer, Int) -> Void)?
@@ -133,6 +137,20 @@ public final class MultiCamCameraStream: NSObject, SyncFieldStream, @unchecked S
     private var wideWatchdog: DispatchSourceTimer?
     private var lastUWFrameHostTime: CFAbsoluteTime = 0
     private var lastWideFrameHostTime: CFAbsoluteTime = 0
+    /// capture_ns (monotonic, midpoint-corrected) of the most recent wide
+    /// frame actually appended — syncQueue-confined. Becomes `truncated_at_ns`
+    /// when the watchdog declares the wide leg dead, so the truncation point
+    /// matches a real line in `cam_ego_wide.timestamps.jsonl` rather than the
+    /// (later) detection instant.
+    private var lastWideCaptureNs: UInt64 = 0
+    /// Attribution hint set by the KVO/interruption/runtime-error handlers via
+    /// a syncQueue hop so the watchdog — the SOLE degradation detector — can
+    /// name the cause. `nil` ⇒ `"wide_frames_stopped"`. syncQueue-confined.
+    private var pendingWideDegradeReasonHint: String?
+    /// Tracks the wide writer's async `finishWriting` when a mid-episode
+    /// degradation finalizes it, so `stopRecording` can await completion and
+    /// never race an unfinalized moov. Thread-safe primitive — no confinement.
+    private let wideFinalizeGroup = DispatchGroup()
 
     /// How long the wide leg may be silent while the UW leg keeps delivering
     /// before we declare the wide leg dead. 1.5s absorbs a slow first frame
@@ -300,8 +318,10 @@ public final class MultiCamCameraStream: NSObject, SyncFieldStream, @unchecked S
         enforceMinimumZoom()
         configureVideoConnections()
         disableGDC()
-
-        self.clock = clock
+        // Note: `clock` is intentionally not stored. Truncation timestamps come
+        // from the wide leg's own last capture_ns (see `lastWideCaptureNs`), and
+        // no other code path needs a session clock off the syncQueue — so there
+        // is no shared `clock` field for KVO/notification threads to race on.
 
         // UW writer: video + audio, exactly like iPhoneCameraStream cam_ego.
         let uwStamp = try writerFactory.makeStreamWriter(streamId: streamId)
@@ -344,6 +364,8 @@ public final class MultiCamCameraStream: NSObject, SyncFieldStream, @unchecked S
             self.wideWriter = wideW
             self.wideVideoInput = wideVInput
             self.wideStampWriter = wideStamp
+            self.lastWideCaptureNs = 0
+            self.pendingWideDegradeReasonHint = nil
             let now = CFAbsoluteTimeGetCurrent()
             self.lastUWFrameHostTime = now
             self.lastWideFrameHostTime = now
@@ -387,11 +409,19 @@ public final class MultiCamCameraStream: NSObject, SyncFieldStream, @unchecked S
         if let w = uwW, w.status == .writing {
             await withCheckedContinuation { cont in w.finishWriting { cont.resume() } }
         }
-        // Wide may already be finalized by a mid-episode degradation; finish
-        // only if it's still writing.
+        // Wide leg: exactly one of two paths finalizes the moov.
+        //  - No degradation: this barrier captured a live wideWriter → finish
+        //    it here (awaited).
+        //  - Mid-episode degradation: finalizeWideWriterAfterDegradation()
+        //    already took the writer (wideW == nil here) and kicked off its
+        //    async finishWriting under wideFinalizeGroup → await that group so
+        //    teardown never races an unfinalized moov.
         wideVInput?.markAsFinished()
         if let w = wideW, w.status == .writing {
             await withCheckedContinuation { cont in w.finishWriting { cont.resume() } }
+        }
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            wideFinalizeGroup.notify(queue: syncQueue) { cont.resume() }
         }
         try await uwStamp?.close()
         try await wideStamp?.close()
@@ -697,15 +727,24 @@ extension MultiCamCameraStream {
             name: .AVCaptureSessionRuntimeError, object: multiCamSession)
     }
 
+    // KVO/notification handlers are DIAGNOSTIC-ONLY. They never mark the wide
+    // leg truncated themselves — that decision belongs solely to the
+    // wide-frame watchdog (uwFresh && wideStale), a single robust path that
+    // (a) cannot fire spuriously on a whole-session/transient interruption
+    // because it requires the UW leg to still be delivering, and (b) leaves a
+    // real UW gap visible as a timestamp gap instead of a false truncation.
+    // These handlers only record an attribution *hint* so the watchdog can
+    // name the cause when it does fire.
+
     private func handleSystemPressure(device: AVCaptureDevice, isWide: Bool) {
         guard device.systemPressureState.level == .shutdown else { return }
-        let atNs = clock?.nowMonotonicNs() ?? 0
         if isWide {
-            markWideDegraded(atNs: atNs, reason: "system_pressure_shutdown")
+            NSLog("[SyncField.MultiCam] wide system pressure SHUTDOWN — watchdog will truncate cam_ego_wide")
+            noteWideDegradeHint("system_pressure_shutdown")
         } else {
-            // UW shutdown = whole-stream failure (existing mono semantics): we
-            // can't salvage the primary leg. Surface it; the short cam_ego.mp4
-            // is reported by stopRecording as usual.
+            // UW shutdown = whole-stream failure (existing mono semantics): the
+            // primary leg can't be salvaged. Surface it; the short cam_ego.mp4
+            // is reported by stopRecording as usual. Not a wide truncation.
             NSLog("[SyncField.MultiCam] ULTRA-WIDE system pressure SHUTDOWN — cam_ego capture failing")
             let hb = healthBus
             let sid = streamId
@@ -720,23 +759,37 @@ extension MultiCamCameraStream {
         case .videoDeviceNotAvailableDueToSystemPressure,
              .videoDeviceNotAvailableWithMultipleForegroundApps:
             // Under these, iOS reduces multicam hardware cost by dropping the
-            // secondary (wide) camera while keeping UW + audio alive.
-            markWideDegraded(atNs: clock?.nowMonotonicNs() ?? 0, reason: "session_interruption")
+            // secondary (wide) camera while keeping UW + audio alive. Wide
+            // frames stop, so the watchdog truncates; we only supply the cause.
+            NSLog("[SyncField.MultiCam] session interrupted reason=\(reason.rawValue) — wide likely dropped, watchdog will truncate")
+            noteWideDegradeHint("session_interruption")
         default:
-            NSLog("[SyncField.MultiCam] session interrupted (reason=\(reason.rawValue)) — UW path unaffected")
+            // Whole-session / transient interruption: UW stops too, so the
+            // watchdog's uwFresh gate keeps it from raising a false truncation.
+            NSLog("[SyncField.MultiCam] session interrupted reason=\(reason.rawValue) — whole-session, no wide truncation")
         }
     }
 
     @objc private func sessionRuntimeError(_ note: Notification) {
         let err = note.userInfo?[AVCaptureSessionErrorKey] as? NSError
         NSLog("[SyncField.MultiCam] runtime error: \(err?.localizedDescription ?? "unknown")")
-        // A wide-only runtime failure manifests as the wide output going
-        // silent — the watchdog catches and attributes it. A whole-session
-        // failure kills UW too; there is no fallback (Jerry's rule), so we
-        // just surface it and let stop report the truncated files.
+        // A wide-only runtime failure manifests as the wide output going silent
+        // — the watchdog catches it. A whole-session failure kills UW too (no
+        // fallback, Jerry's rule); surface it and let stop report the files.
+        noteWideDegradeHint("session_runtime_error")
         let hb = healthBus
         let sid = streamId
         Task { await hb?.publish(.streamDisconnected(streamId: sid, reason: "session_runtime_error")) }
+    }
+
+    /// Record a cause hint for the watchdog, confined to `syncQueue` (where the
+    /// watchdog reads it). First hint wins so the earliest signal names the
+    /// cause; a later generic signal never overwrites a specific one.
+    private func noteWideDegradeHint(_ reason: String) {
+        syncQueue.async { [weak self] in
+            guard let self, self.pendingWideDegradeReasonHint == nil else { return }
+            self.pendingWideDegradeReasonHint = reason
+        }
     }
 
     /// Scheduled on `syncQueue`; reads the last-frame host times written by the
@@ -750,6 +803,9 @@ extension MultiCamCameraStream {
         timer.resume()
     }
 
+    /// The SOLE degradation detector. Fires only when the UW leg is still
+    /// delivering (uwFresh) AND the wide leg has gone silent (wideStale) — so a
+    /// whole-session stall never produces a false wide truncation.
     private func tickWideWatchdog() {
         guard isRecording, !isWideDegradedSnapshot() else { return }
         // Only judge once the UW leg is genuinely flowing — otherwise a slow
@@ -759,7 +815,10 @@ extension MultiCamCameraStream {
         let uwFresh = (now - lastUWFrameHostTime) < Self.wideStallThresholdSeconds
         let wideStale = (now - lastWideFrameHostTime) >= Self.wideStallThresholdSeconds
         guard uwFresh, wideStale else { return }
-        markWideDegraded(atNs: clock?.nowMonotonicNs() ?? 0, reason: "wide_frames_stopped")
+        // truncated_at_ns = the last wide frame's own capture_ns (a real line in
+        // cam_ego_wide.timestamps.jsonl), not this detection instant.
+        let reason = pendingWideDegradeReasonHint ?? "wide_frames_stopped"
+        markWideDegraded(atNs: lastWideCaptureNs, reason: reason)
     }
 
     /// Finish the wide writer cleanly on `syncQueue` after degradation, then
@@ -777,7 +836,12 @@ extension MultiCamCameraStream {
             self.wideStampWriter = nil
             input?.markAsFinished()
             if writer.status == .writing {
-                writer.finishWriting { }
+                // Track completion so stopRecording can await it (fix 2): the
+                // moov must be fully written before teardown proceeds.
+                self.wideFinalizeGroup.enter()
+                writer.finishWriting { [weak self] in
+                    self?.wideFinalizeGroup.leave()
+                }
             }
             if let stamp {
                 Task { try? await stamp.close() }
@@ -870,6 +934,9 @@ extension MultiCamCameraStream: AVCaptureDataOutputSynchronizerDelegate {
         let stamp = CameraTimestamps.midpointCorrectedTimestampNs(
             ptsSeconds: CMTimeGetSeconds(pts),
             exposureSeconds: wideDevice?.exposureDuration.seconds ?? 0)
+        // Remember this frame's capture_ns so a later watchdog truncation points
+        // at a real cam_ego_wide.timestamps.jsonl line (syncQueue-confined).
+        lastWideCaptureNs = stamp.captureNs
         let frame = nextWideFrameIndex()
         let w = wideStampWriter
         Task {

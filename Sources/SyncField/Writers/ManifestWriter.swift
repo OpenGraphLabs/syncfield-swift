@@ -20,9 +20,10 @@ public struct Manifest: Codable, Sendable {
         /// streams that ran to the normal stop. Omitted from the JSON when
         /// nil, same byte-compat rule as `syncGroupId`.
         public let status: String?
-        /// Session-monotonic timestamp (ns) of the frame after which this
-        /// stream produced no more data, paired with `status == "truncated"`.
-        /// Omitted from the JSON when nil.
+        /// `capture_ns` of the LAST frame this stream produced before it was
+        /// truncated — i.e. a real line in the stream's `.timestamps.jsonl`,
+        /// not the (later) instant truncation was detected. Paired with
+        /// `status == "truncated"`; omitted from the JSON when nil.
         public let truncatedAtNs: UInt64?
 
         public init(streamId: String, filePath: String, frameCount: Int,
