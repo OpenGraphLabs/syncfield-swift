@@ -118,6 +118,36 @@ final class StereoCalibrationExtractionTests: XCTestCase {
         assertClose(result.translationMillimeters, [1, 2, 3])
     }
 
+    // MARK: - Direct extrinsics (device-level API passthrough, no composition)
+
+    /// The device-level `AVCaptureDevice.extrinsicMatrix(from:to:)` already carries
+    /// the from→to transform, so `directExtrinsics` must pass R/t through verbatim
+    /// (row-major), NOT compose. An asymmetric Rz(90°) catches accidental transpose.
+    func test_direct_extrinsics_is_passthrough_not_composed() {
+        let m = extrinsic(rotation: rotZ90, translation: SIMD3(19.2, 1, -2))
+        let result = StereoExtrinsicsMath.directExtrinsics(fromMatrix: m)
+        XCTAssertEqual(result.rotationRowMajor, [0, -1, 0, 1, 0, 0, 0, 0, 1])
+        assertClose(result.translationMillimeters, [19.2, 1, -2])
+    }
+
+    /// Decoding Apple's NSData payload (native `matrix_float4x3` layout) must match
+    /// decoding the struct directly — locks the 64-byte column-major byte layout.
+    func test_direct_extrinsics_from_data_matches_struct() throws {
+        let m = extrinsic(rotation: rotationX(0.5236), translation: SIMD3(4, -5, 6))
+        var matrix = m
+        let data = withUnsafeBytes(of: &matrix) { Data($0) }
+        XCTAssertEqual(data.count, MemoryLayout<matrix_float4x3>.size)
+
+        let fromData = try XCTUnwrap(StereoExtrinsicsMath.directExtrinsics(fromMatrixData: data))
+        let fromMatrix = StereoExtrinsicsMath.directExtrinsics(fromMatrix: m)
+        XCTAssertEqual(fromData.rotationRowMajor, fromMatrix.rotationRowMajor)
+        XCTAssertEqual(fromData.translationMillimeters, fromMatrix.translationMillimeters)
+    }
+
+    func test_direct_extrinsics_from_short_data_returns_nil() {
+        XCTAssertNil(StereoExtrinsicsMath.directExtrinsics(fromMatrixData: Data([1, 2, 3])))
+    }
+
     // MARK: - Full round-trip
 
     /// End-to-end derivation check: build UW and wide extrinsics from a shared

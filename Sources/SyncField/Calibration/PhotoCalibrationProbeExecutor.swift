@@ -61,6 +61,34 @@ enum StereoExtrinsicsMath {
         )
     }
 
+    /// The direct extrinsics carried by a single `[R|t]` matrix that already
+    /// expresses the desired from→to transform — no composition. Rotation is the
+    /// first three columns (serialized row-major), translation is the fourth
+    /// column (millimeters). Used for `AVCaptureDevice.extrinsicMatrix(from:to:)`,
+    /// which per AVCaptureDevice.h maps X_to = [R|t]·X_from directly.
+    static func directExtrinsics(fromMatrix m: matrix_float4x3) -> StereoExtrinsics {
+        StereoExtrinsics(
+            rotationRowMajor: rowMajor(rotation(of: m)),
+            translationMillimeters: [m.columns.3.x, m.columns.3.y, m.columns.3.z]
+        )
+    }
+
+    /// Decode Apple's `AVCaptureDevice.extrinsicMatrix(from:to:)` NSData payload —
+    /// the native in-memory representation of a column-major `matrix_float4x3` —
+    /// into direct extrinsics. Returns nil if the payload is smaller than a
+    /// `matrix_float4x3` (defensive; Apple returns exactly that struct). Copies
+    /// into an aligned stack value rather than `load(as:)` since `Data`'s backing
+    /// bytes are not guaranteed to meet simd's 16-byte alignment.
+    static func directExtrinsics(fromMatrixData data: Data) -> StereoExtrinsics? {
+        let byteCount = MemoryLayout<matrix_float4x3>.size
+        guard data.count >= byteCount else { return nil }
+        var m = matrix_float4x3()
+        withUnsafeMutableBytes(of: &m) { dst in
+            _ = data.copyBytes(to: dst, count: byteCount)
+        }
+        return directExtrinsics(fromMatrix: m)
+    }
+
     /// The rotation block (first three columns) of an extrinsic matrix as a
     /// column-major `simd_float3x3`.
     private static func rotation(of m: matrix_float4x3) -> simd_float3x3 {
@@ -180,6 +208,26 @@ public final class AVPhotoCalibrationProbeExecutor: NSObject, PhotoCalibrationPr
             }
         }
 
+        // Device-level factory extrinsics between the two physical constituents,
+        // independent of the photo capture. `AVCaptureDevice.extrinsicMatrix(from:to:)`
+        // (iOS 13+) returns an NSData wrapping a column-major `matrix_float4x3`
+        // `[R|t]` such that X_to = [R|t]·X_from with t in millimeters (see
+        // AVCaptureDevice.h). Called (from: ultra-wide, to: wide) it is ALREADY the
+        // UW→wide transform — no composition needed. Apple provides it only for
+        // physical cameras that have a factory calibration; virtual cameras (and
+        // any device lacking one) return nil, in which case we record nil.
+        let ultrawideDevice = constituents.first { $0.deviceType == .builtInUltraWideCamera }
+        let wideDevice = constituents.first { $0.deviceType == .builtInWideAngleCamera }
+        var deviceExtrinsics: StereoExtrinsics?
+        if let ultrawideDevice, let wideDevice,
+           let matrixData = AVCaptureDevice.extrinsicMatrix(from: ultrawideDevice, to: wideDevice) {
+            deviceExtrinsics = StereoExtrinsicsMath.directExtrinsics(fromMatrixData: matrixData)
+            NSLog("[SyncField.Probe] device-level extrinsics: \(deviceExtrinsics != nil ? "decoded" : "unparseable") bytes=\(matrixData.count)")
+        } else {
+            deviceExtrinsics = nil
+            NSLog("[SyncField.Probe] device-level extrinsics unavailable (nil)")
+        }
+
         // Build a transient capture session distinct from the recording one.
         let session = AVCaptureSession()
         session.beginConfiguration()
@@ -269,7 +317,7 @@ public final class AVPhotoCalibrationProbeExecutor: NSObject, PhotoCalibrationPr
             NSLog("[SyncField.Probe] skipping settings calibration enable — output.supported=false")
         }
 
-        let delegate = StereoProbeDelegate(deviceModel: deviceModel)
+        let delegate = StereoProbeDelegate(deviceModel: deviceModel, deviceExtrinsics: deviceExtrinsics)
         NSLog("[SyncField.Probe] capturePhoto fired")
         photoOutput.capturePhoto(with: settings, delegate: delegate)
 
@@ -309,6 +357,9 @@ public final class AVPhotoCalibrationProbeExecutor: NSObject, PhotoCalibrationPr
 /// fails the whole probe.
 private final class StereoProbeDelegate: NSObject, AVCapturePhotoCaptureDelegate, @unchecked Sendable {
     private let deviceModel: String
+    /// Device-level UW→wide extrinsics from `AVCaptureDevice.extrinsicMatrix(from:to:)`,
+    /// computed before capture; nil when the SDK returns no factory data.
+    private let deviceExtrinsics: StereoExtrinsics?
     private var continuation: CheckedContinuation<StereoProbedCalibration, Error>?
     private let lock = NSLock()
 
@@ -318,8 +369,9 @@ private final class StereoProbeDelegate: NSObject, AVCapturePhotoCaptureDelegate
     private var uwExtrinsic: matrix_float4x3?
     private var wideExtrinsic: matrix_float4x3?
 
-    init(deviceModel: String) {
+    init(deviceModel: String, deviceExtrinsics: StereoExtrinsics?) {
         self.deviceModel = deviceModel
+        self.deviceExtrinsics = deviceExtrinsics
         super.init()
     }
 
@@ -387,12 +439,10 @@ private final class StereoProbeDelegate: NSObject, AVCapturePhotoCaptureDelegate
             ultrawide: uw,
             wide: wide,
             extrinsicsUWToWide: extrinsics,
-            // AVFoundation exposes inter-camera extrinsics only via
-            // `AVCameraCalibrationData.extrinsicMatrix` (per-constituent,
-            // relative to the virtual-device reference camera). There is no
-            // device-level `AVCaptureDevice`→`AVCaptureDevice` extrinsics API on
-            // iOS, so no independent cross-check snapshot exists — record nil.
-            deviceExtrinsicsUWToWide: nil,
+            // Independent cross-check: the device-level factory transform from
+            // `AVCaptureDevice.extrinsicMatrix(from: uw, to: wide)`, captured
+            // before this photo probe. nil only when the SDK provided none.
+            deviceExtrinsicsUWToWide: deviceExtrinsics,
             probedAtISO8601: ISO8601DateFormatter().string(from: Date())
         )
         resume(returning: stereo)
