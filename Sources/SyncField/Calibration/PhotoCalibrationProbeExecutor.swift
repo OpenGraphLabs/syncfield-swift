@@ -3,6 +3,9 @@ import Foundation
 #if canImport(AVFoundation)
 import AVFoundation
 #endif
+#if canImport(simd)
+import simd
+#endif
 
 /// Single-call interface that performs the actual one-time photo capture and
 /// returns a `ProbedCameraCalibration`. Real implementation drives
@@ -11,6 +14,68 @@ import AVFoundation
 public protocol PhotoCalibrationProbeExecutor: Sendable {
     func probe(deviceModel: String) async throws -> ProbedCameraCalibration
 }
+
+// MARK: - Pure extrinsics composition (platform-independent)
+
+#if canImport(simd)
+
+/// Pure composition of the two constituent `AVCameraCalibrationData.extrinsicMatrix`
+/// values into the ultra-wide → wide rigid transform. Deliberately free of
+/// AVFoundation so it compiles and unit-tests on macOS — `matrix_float4x3` is a
+/// simd type, not an AVFoundation one.
+enum StereoExtrinsicsMath {
+    /// Composes the per-constituent extrinsics into the transform that maps a
+    /// point expressed in the ultra-wide camera frame into the wide camera frame
+    /// (spec §5.1 `ego_to_wide`). Returns nil unless both matrices are present.
+    ///
+    /// Apple, `AVCameraCalibrationData.extrinsicMatrix` — the matrix is a
+    /// `matrix_float4x3` whose first three columns hold the camera's 3x3 rotation
+    /// R and whose fourth column holds the translation t (millimeters), both
+    /// expressed relative to the virtual device's reference (primary) constituent
+    /// camera. So for a reference-frame point p_ref the point in camera c is
+    ///     p_c = R_c · p_ref + t_c.
+    ///
+    /// We want UW → wide: given p_uw, produce p_wide. Since R_u is a rotation
+    /// (R_u⁻¹ = R_uᵀ):
+    ///     p_ref  = R_uᵀ · (p_uw − t_u)
+    ///     p_wide = R_w · R_uᵀ · (p_uw − t_u) + t_w
+    ///            = (R_w · R_uᵀ) · p_uw + (t_w − R_w · R_uᵀ · t_u)
+    /// hence R = R_w · R_uᵀ and t = t_w − R · t_u.
+    static func stereoExtrinsics(fromUW uwMatrix: matrix_float4x3?,
+                                 wide wideMatrix: matrix_float4x3?) -> StereoExtrinsics? {
+        guard let uwMatrix, let wideMatrix else { return nil }
+
+        let rUW = rotation(of: uwMatrix)
+        let tUW = uwMatrix.columns.3
+        let rWide = rotation(of: wideMatrix)
+        let tWide = wideMatrix.columns.3
+
+        let rotationUWToWide = rWide * rUW.transpose        // R_w · R_uᵀ
+        let translationUWToWide = tWide - rotationUWToWide * tUW  // t_w − R · t_u
+
+        return StereoExtrinsics(
+            rotationRowMajor: rowMajor(rotationUWToWide),
+            translationMillimeters: [translationUWToWide.x,
+                                     translationUWToWide.y,
+                                     translationUWToWide.z]
+        )
+    }
+
+    /// The rotation block (first three columns) of an extrinsic matrix as a
+    /// column-major `simd_float3x3`.
+    private static func rotation(of m: matrix_float4x3) -> simd_float3x3 {
+        simd_float3x3(columns: (m.columns.0, m.columns.1, m.columns.2))
+    }
+
+    /// Flatten a column-major `simd_float3x3` into a row-major `[Float]` of 9.
+    private static func rowMajor(_ m: simd_float3x3) -> [Float] {
+        [m.columns.0.x, m.columns.1.x, m.columns.2.x,
+         m.columns.0.y, m.columns.1.y, m.columns.2.y,
+         m.columns.0.z, m.columns.1.z, m.columns.2.z]
+    }
+}
+
+#endif // canImport(simd)
 
 #if canImport(AVFoundation) && os(iOS)
 
@@ -27,10 +92,11 @@ public protocol PhotoCalibrationProbeExecutor: Sendable {
 /// We therefore probe via `.builtInDualWideCamera` (ultra-wide + wide,
 /// available on every iPhone with an ultra-wide back camera since iPhone
 /// 11). The probe captures one virtual-device photo, AVFoundation invokes
-/// the delegate twice — once per constituent device — and we keep the
-/// ultra-wide-sourced calibration. The wide-camera calibration is
-/// discarded; we record at ultra-wide only.
-public final class AVPhotoCalibrationProbeExecutor: NSObject, PhotoCalibrationProbeExecutor, @unchecked Sendable {
+/// the delegate twice — once per constituent device — and we KEEP both the
+/// ultra-wide and wide calibrations plus the rigid transform between them
+/// (`StereoProbedCalibration`). The mono `probe(deviceModel:)` entry point
+/// runs the same capture and returns the ultra-wide half.
+public final class AVPhotoCalibrationProbeExecutor: NSObject, PhotoCalibrationProbeExecutor, StereoCalibrationProbeExecutor, @unchecked Sendable {
     private let timeout: TimeInterval
 
     public init(timeout: TimeInterval = 3.0) {
@@ -38,7 +104,20 @@ public final class AVPhotoCalibrationProbeExecutor: NSObject, PhotoCalibrationPr
         super.init()
     }
 
+    /// Mono entry point — shares the stereo capture path and returns the
+    /// ultra-wide constituent. A single virtual-device capture delivers both
+    /// constituents, so there is no separate, lighter code path (Jerry's rule:
+    /// one clear path, no fallback).
     public func probe(deviceModel: String) async throws -> ProbedCameraCalibration {
+        try await runStereoProbe(deviceModel: deviceModel).ultrawide
+    }
+
+    /// Stereo entry point — returns both constituents plus the UW→wide extrinsics.
+    public func probeStereo(deviceModel: String) async throws -> StereoProbedCalibration {
+        try await runStereoProbe(deviceModel: deviceModel)
+    }
+
+    private func runStereoProbe(deviceModel: String) async throws -> StereoProbedCalibration {
         NSLog("[SyncField.Probe] begin deviceModel=\(deviceModel)")
 
         // Permission gate first — we run BEFORE the recording session starts,
@@ -176,7 +255,7 @@ public final class AVPhotoCalibrationProbeExecutor: NSObject, PhotoCalibrationPr
         settings.photoQualityPrioritization = .quality
         // Select all constituents so AVFoundation will deliver one photo
         // per device, each carrying its own calibration data. We keep the
-        // ultra-wide photo's calibration; the others are discarded.
+        // ultra-wide AND wide photos; any others (tele) are discarded.
         settings.virtualDeviceConstituentPhotoDeliveryEnabledDevices = constituents
         // Settings-level enable would raise an Objective-C exception (which
         // Swift can't catch) if calibrationSupported is false. Gate strictly.
@@ -190,11 +269,11 @@ public final class AVPhotoCalibrationProbeExecutor: NSObject, PhotoCalibrationPr
             NSLog("[SyncField.Probe] skipping settings calibration enable — output.supported=false")
         }
 
-        let delegate = ProbeDelegate(deviceModel: deviceModel)
+        let delegate = StereoProbeDelegate(deviceModel: deviceModel)
         NSLog("[SyncField.Probe] capturePhoto fired")
         photoOutput.capturePhoto(with: settings, delegate: delegate)
 
-        let result = try await withThrowingTaskGroup(of: ProbedCameraCalibration.self) { group in
+        let result = try await withThrowingTaskGroup(of: StereoProbedCalibration.self) { group in
             group.addTask {
                 try await delegate.awaitResult()
             }
@@ -209,27 +288,42 @@ public final class AVPhotoCalibrationProbeExecutor: NSObject, PhotoCalibrationPr
             group.cancelAll()
             return first
         }
-        NSLog("[SyncField.Probe] SUCCESS fx=\(result.fx) fy=\(result.fy) refDims=\(result.referenceWidth)x\(result.referenceHeight) lookupCount=\(result.lookupTableRadial.count)")
+
+        // Sanity guard: a plausible UW↔wide baseline on iPhones is ~2 cm. If the
+        // composed baseline falls outside a generous band we still return the
+        // data (the app-side writer records it verbatim); we only flag it.
+        if let baseline = result.baselineMillimeters, baseline < 5 || baseline > 200 {
+            NSLog("[StereoProbe] baseline outside sanity band")
+        }
+
+        NSLog("[SyncField.Probe] SUCCESS uw.fx=\(result.ultrawide.fx) wide.fx=\(result.wide.fx) baselineMM=\(result.baselineMillimeters.map { String($0) } ?? "nil") extrinsics=\(result.extrinsicsUWToWide != nil ? "present" : "nil")")
         return result
     }
 }
 
-/// Photo-capture delegate. AVFoundation delivers one
+/// Photo-capture delegate for the stereo probe. AVFoundation delivers one
 /// `didFinishProcessingPhoto:` callback per constituent device when virtual-
-/// device constituent photo delivery is enabled. We keep the ultra-wide
-/// photo; the wide-camera callback is ignored. The continuation is resumed
-/// the first time we get a usable ultra-wide calibration.
-private final class ProbeDelegate: NSObject, AVCapturePhotoCaptureDelegate, @unchecked Sendable {
+/// device constituent photo delivery is enabled. We retain BOTH the ultra-wide
+/// and wide calibrations and resume once both have arrived; other constituents
+/// (tele) are ignored. Any error, or a UW/wide photo missing usable calibration,
+/// fails the whole probe.
+private final class StereoProbeDelegate: NSObject, AVCapturePhotoCaptureDelegate, @unchecked Sendable {
     private let deviceModel: String
-    private var continuation: CheckedContinuation<ProbedCameraCalibration, Error>?
+    private var continuation: CheckedContinuation<StereoProbedCalibration, Error>?
     private let lock = NSLock()
+
+    // Per-constituent state, guarded by `lock`.
+    private var uwProbed: ProbedCameraCalibration?
+    private var wideProbed: ProbedCameraCalibration?
+    private var uwExtrinsic: matrix_float4x3?
+    private var wideExtrinsic: matrix_float4x3?
 
     init(deviceModel: String) {
         self.deviceModel = deviceModel
         super.init()
     }
 
-    func awaitResult() async throws -> ProbedCameraCalibration {
+    func awaitResult() async throws -> StereoProbedCalibration {
         try await withCheckedThrowingContinuation { cont in
             lock.lock()
             continuation = cont
@@ -255,18 +349,60 @@ private final class ProbeDelegate: NSObject, AVCapturePhotoCaptureDelegate, @unc
         let calibPresent = photo.cameraCalibrationData != nil
         NSLog("[SyncField.Probe] delegate photo arrived: source=\(sourceType?.rawValue ?? "nil") calibration=\(calibPresent ? "present" : "nil")")
 
-        // Multi-photo delivery: keep the ultra-wide source. Other constituents
-        // (wide, tele) are skipped.
-        guard sourceType == .builtInUltraWideCamera else {
-            // Wait for the next callback (the ultra-wide one).
+        // Only the two dual-wide constituents matter; ignore any others (tele).
+        guard sourceType == .builtInUltraWideCamera || sourceType == .builtInWideAngleCamera else {
             return
         }
         guard let calibration = photo.cameraCalibrationData else {
-            NSLog("[SyncField.Probe] ultra-wide photo arrived but calibration data missing")
+            NSLog("[SyncField.Probe] \(sourceType?.rawValue ?? "?") photo arrived but calibration data missing")
+            resume(throwing: .calibrationDataMissing)
+            return
+        }
+        guard let probed = Self.probedCalibration(from: calibration, deviceModel: deviceModel) else {
             resume(throwing: .calibrationDataMissing)
             return
         }
 
+        lock.lock()
+        if sourceType == .builtInUltraWideCamera {
+            uwProbed = probed
+            uwExtrinsic = calibration.extrinsicMatrix
+        } else {
+            wideProbed = probed
+            wideExtrinsic = calibration.extrinsicMatrix
+        }
+        let uw = uwProbed
+        let wide = wideProbed
+        let uwEx = uwExtrinsic
+        let wideEx = wideExtrinsic
+        lock.unlock()
+
+        guard let uw, let wide else {
+            // Still waiting for the other constituent.
+            return
+        }
+
+        let extrinsics = StereoExtrinsicsMath.stereoExtrinsics(fromUW: uwEx, wide: wideEx)
+        let stereo = StereoProbedCalibration(
+            ultrawide: uw,
+            wide: wide,
+            extrinsicsUWToWide: extrinsics,
+            // AVFoundation exposes inter-camera extrinsics only via
+            // `AVCameraCalibrationData.extrinsicMatrix` (per-constituent,
+            // relative to the virtual-device reference camera). There is no
+            // device-level `AVCaptureDevice`→`AVCaptureDevice` extrinsics API on
+            // iOS, so no independent cross-check snapshot exists — record nil.
+            deviceExtrinsicsUWToWide: nil,
+            probedAtISO8601: ISO8601DateFormatter().string(from: Date())
+        )
+        resume(returning: stereo)
+    }
+
+    /// Extract the per-lens intrinsics/distortion from an `AVCameraCalibrationData`.
+    /// Returns nil if focal lengths are missing or non-finite. Mirrors the mono
+    /// extraction verbatim so the ultra-wide half is unchanged.
+    private static func probedCalibration(from calibration: AVCameraCalibrationData,
+                                          deviceModel: String) -> ProbedCameraCalibration? {
         let m = calibration.intrinsicMatrix
         let refDims = calibration.intrinsicMatrixReferenceDimensions
         let lookup = calibration.lensDistortionLookupTable ?? Data()
@@ -281,10 +417,9 @@ private final class ProbeDelegate: NSObject, AVCapturePhotoCaptureDelegate, @unc
         let cx = Double(m.columns.2.x)
         let cy = Double(m.columns.2.y)
         guard fx > 0, fy > 0, fx.isFinite, fy.isFinite else {
-            resume(throwing: .calibrationDataMissing)
-            return
+            return nil
         }
-        let probed = ProbedCameraCalibration(
+        return ProbedCameraCalibration(
             fx: fx, fy: fy, cx: cx, cy: cy,
             referenceWidth: Int(refDims.width),
             referenceHeight: Int(refDims.height),
@@ -293,10 +428,9 @@ private final class ProbeDelegate: NSObject, AVCapturePhotoCaptureDelegate, @unc
             distortionCenterY: Double(calibration.lensDistortionCenter.y),
             deviceModel: deviceModel
         )
-        resume(returning: probed)
     }
 
-    private func resume(returning value: ProbedCameraCalibration) {
+    private func resume(returning value: StereoProbedCalibration) {
         lock.lock()
         let c = continuation
         continuation = nil
