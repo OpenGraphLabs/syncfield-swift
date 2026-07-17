@@ -14,6 +14,7 @@ Adds hardware-paired stereo (ultra-wide + wide) egocentric capture: a factory ca
 - **`Manifest.StreamEntry.syncGroupId`** — groups entries produced by the same physical stream (e.g. `cam_ego` + `cam_ego_wide` from one `MultiCamCameraStream` connection).
 - **`Manifest.StreamEntry.status` / `.truncatedAtNs`** — `status: "truncated"` plus `truncated_at_ns` (the last frame's `capture_ns`, matching a real line in that stream's `.timestamps.jsonl`) on a stream entry that stopped early while the rest of the session kept recording.
 - **`SyncFieldStream.manifestEntries(report:)`** — new protocol requirement, with a default implementation matching the previous one-entry-per-stream behavior. Lets a stream that demuxes one connection into multiple output files (stereo camera) contribute more than one manifest entry; `SessionOrchestrator.writeManifest` now flat-maps this across registered streams instead of assuming exactly one entry per stream.
+- **`MultiCamCameraStream.activeCameraMetadata`** — ultra-wide-leg device/format metadata (device type, dimensions, field of view, GDC state) so hosts can write FOV-estimate-tier intrinsics when the factory probe is unavailable.
 
 ### Changed
 - `SyncFieldVersion.current` bumped to `0.11.0`.
