@@ -2,6 +2,34 @@
 
 All notable changes to **syncfield-swift** are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0] — 2026-07-16
+
+Adds hardware-paired stereo (ultra-wide + wide) egocentric capture: a factory calibration probe, a new `MultiCamCameraStream` that hosts opt into explicitly, and the manifest additions needed to describe a stream that demuxes into more than one output file. Source-compatible with 0.10.x; the mono `iPhoneCameraStream` path is behaviorally unchanged except for a documented calibration-probe requirement.
+
+### Added
+- **`MultiCamCameraStream`** — `AVCaptureMultiCamSession`-based stream that records ultra-wide (`cam_ego`, contract-frozen) and wide (`cam_ego_wide`) simultaneously from one hardware-shared clock, mirroring `iPhoneCameraStream`'s per-camera lens policy, timestamp schema, and writer state machine. `cam_ego_wide` has no audio track. The frame processor taps ultra-wide frames only. `isSupported()` / `unsupportedReason()` gate strictly on multicam support, both physical back cameras, the pair being in `supportedMultiCamDeviceSets`, and a strict multicam-1080p30 format check on both — hosts must check this before constructing the stream. If the wide leg stops mid-episode (iOS drops the secondary camera under system pressure), the session, ultra-wide leg, and audio keep recording; the wide leg is finalized cleanly and reported via `setStereoDegradationHandler(_:)` as a `StereoDegradationEvent` — no silent retry or downgrade. If the ultra-wide leg stops, the whole stream fails, matching mono semantics.
+- **`StereoDegradationEvent`** — pure `Codable` value (`at_ns`, `stream`, `reason`) describing a mid-episode wide-leg truncation, matching the `truncated_at_ns` written to the wide manifest entry.
+- **`StereoProbedCalibration` / `StereoExtrinsics`** — factory calibration for both constituent cameras of a dual-wide virtual device (ultra-wide + wide), plus the UW→wide rigid transform (millimeters) composed from `AVCameraCalibrationData.extrinsicMatrix`, and a device-level `AVCaptureDevice.extrinsicMatrix(from:to:)` snapshot for cross-check.
+- **`CameraCalibrationProber.probeStereoIfNeeded()` / `cachedStereo()` / `clearStereoCache()`** — disk-cached stereo probe mirroring the existing mono `probeIfNeeded()` flow, cached separately at `camera_calibration_stereo_<model>.json`. Requires a `StereoCalibrationProbeExecutor` (e.g. `AVPhotoCalibrationProbeExecutor`); throws `ProbeError.unsupportedDevice` if none is configured. The mono cache and API are untouched.
+- **`Manifest.StreamEntry.syncGroupId`** — groups entries produced by the same physical stream (e.g. `cam_ego` + `cam_ego_wide` from one `MultiCamCameraStream` connection).
+- **`Manifest.StreamEntry.status` / `.truncatedAtNs`** — `status: "truncated"` plus `truncated_at_ns` (the last frame's `capture_ns`, matching a real line in that stream's `.timestamps.jsonl`) on a stream entry that stopped early while the rest of the session kept recording.
+- **`SyncFieldStream.manifestEntries(report:)`** — new protocol requirement, with a default implementation matching the previous one-entry-per-stream behavior. Lets a stream that demuxes one connection into multiple output files (stereo camera) contribute more than one manifest entry; `SessionOrchestrator.writeManifest` now flat-maps this across registered streams instead of assuming exactly one entry per stream.
+
+### Changed
+- `SyncFieldVersion.current` bumped to `0.11.0`.
+
+### Compatibility
+- Manifest keys (`sync_group_id`, `status`, `truncated_at_ns`) are additive and omitted from the JSON when `nil` — existing single-entry manifests stay byte-compatible, and downstream consumers that don't know these keys are unaffected.
+- `iPhoneCameraStream` (mono) capture behavior is unchanged. Hosts opt into stereo capture explicitly by checking `MultiCamCameraStream.isSupported()` and constructing `MultiCamCameraStream` — nothing about the existing mono stream construction or defaults changes.
+- **Behavior change:** `PhotoCalibrationProbeExecutor.probe(deviceModel:)` (mono calibration probe) now internally runs the same dual-wide virtual-device capture as the stereo probe and requires both the ultra-wide and wide constituents to be observable, rather than a lighter ultra-wide-only path. This is an implementation/observability change on real hardware (one capture path, no fallback, per Jerry's no-fallback rule); the mono probe's public signature and `ProbedCameraCalibration` return type are unchanged.
+- `SyncFieldStream.manifestEntries(report:)` is a new protocol requirement, but ships with a default implementation, so existing conforming stream types need no changes to keep compiling.
+
+### Tests
+- `StereoProbedCalibrationTests`, `StereoCalibrationExtractionTests` — stereo model Codable round-trip, per-model cache hit/miss/corrupt, executor-failure leaves no cache file, pure extrinsics composition (both direct and composed) and NSData decode/short-payload handling.
+- `MultiCamCameraStreamTests` — support-gate reasons, degradation-event emission and idempotency, manifest entries (sync group, truncated status/timestamp) on macOS without a capture session.
+- `ManifestWriterTests`, `SessionOrchestratorIngestTests` — `sync_group_id`/`status`/`truncated_at_ns` encode-omit-when-nil and multi-entry manifest flat-mapping.
+- Full suite: 371/371 pass on macOS (`swift test`); `iphonesimulator` cross-build clean.
+
 ## [0.10.0] — 2026-05-19
 
 Stabilizes egocentric iPhone capture frame rate when the host installs a heavy frame processor. Source-compatible with 0.9.x.
