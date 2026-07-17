@@ -15,96 +15,6 @@ public protocol PhotoCalibrationProbeExecutor: Sendable {
     func probe(deviceModel: String) async throws -> ProbedCameraCalibration
 }
 
-// MARK: - Pure extrinsics composition (platform-independent)
-
-#if canImport(simd)
-
-/// Pure composition of the two constituent `AVCameraCalibrationData.extrinsicMatrix`
-/// values into the ultra-wide → wide rigid transform. Deliberately free of
-/// AVFoundation so it compiles and unit-tests on macOS — `matrix_float4x3` is a
-/// simd type, not an AVFoundation one.
-enum StereoExtrinsicsMath {
-    /// Composes the per-constituent extrinsics into the transform that maps a
-    /// point expressed in the ultra-wide camera frame into the wide camera frame
-    /// (spec §5.1 `ego_to_wide`). Returns nil unless both matrices are present.
-    ///
-    /// Apple, `AVCameraCalibrationData.extrinsicMatrix` — the matrix is a
-    /// `matrix_float4x3` whose first three columns hold the camera's 3x3 rotation
-    /// R and whose fourth column holds the translation t (millimeters), both
-    /// expressed relative to the virtual device's reference (primary) constituent
-    /// camera. So for a reference-frame point p_ref the point in camera c is
-    ///     p_c = R_c · p_ref + t_c.
-    ///
-    /// We want UW → wide: given p_uw, produce p_wide. Since R_u is a rotation
-    /// (R_u⁻¹ = R_uᵀ):
-    ///     p_ref  = R_uᵀ · (p_uw − t_u)
-    ///     p_wide = R_w · R_uᵀ · (p_uw − t_u) + t_w
-    ///            = (R_w · R_uᵀ) · p_uw + (t_w − R_w · R_uᵀ · t_u)
-    /// hence R = R_w · R_uᵀ and t = t_w − R · t_u.
-    static func stereoExtrinsics(fromUW uwMatrix: matrix_float4x3?,
-                                 wide wideMatrix: matrix_float4x3?) -> StereoExtrinsics? {
-        guard let uwMatrix, let wideMatrix else { return nil }
-
-        let rUW = rotation(of: uwMatrix)
-        let tUW = uwMatrix.columns.3
-        let rWide = rotation(of: wideMatrix)
-        let tWide = wideMatrix.columns.3
-
-        let rotationUWToWide = rWide * rUW.transpose        // R_w · R_uᵀ
-        let translationUWToWide = tWide - rotationUWToWide * tUW  // t_w − R · t_u
-
-        return StereoExtrinsics(
-            rotationRowMajor: rowMajor(rotationUWToWide),
-            translationMillimeters: [translationUWToWide.x,
-                                     translationUWToWide.y,
-                                     translationUWToWide.z]
-        )
-    }
-
-    /// The direct extrinsics carried by a single `[R|t]` matrix that already
-    /// expresses the desired from→to transform — no composition. Rotation is the
-    /// first three columns (serialized row-major), translation is the fourth
-    /// column (millimeters). Used for `AVCaptureDevice.extrinsicMatrix(from:to:)`,
-    /// which per AVCaptureDevice.h maps X_to = [R|t]·X_from directly.
-    static func directExtrinsics(fromMatrix m: matrix_float4x3) -> StereoExtrinsics {
-        StereoExtrinsics(
-            rotationRowMajor: rowMajor(rotation(of: m)),
-            translationMillimeters: [m.columns.3.x, m.columns.3.y, m.columns.3.z]
-        )
-    }
-
-    /// Decode Apple's `AVCaptureDevice.extrinsicMatrix(from:to:)` NSData payload —
-    /// the native in-memory representation of a column-major `matrix_float4x3` —
-    /// into direct extrinsics. Returns nil if the payload is smaller than a
-    /// `matrix_float4x3` (defensive; Apple returns exactly that struct). Copies
-    /// into an aligned stack value rather than `load(as:)` since `Data`'s backing
-    /// bytes are not guaranteed to meet simd's 16-byte alignment.
-    static func directExtrinsics(fromMatrixData data: Data) -> StereoExtrinsics? {
-        let byteCount = MemoryLayout<matrix_float4x3>.size
-        guard data.count >= byteCount else { return nil }
-        var m = matrix_float4x3()
-        withUnsafeMutableBytes(of: &m) { dst in
-            _ = data.copyBytes(to: dst, count: byteCount)
-        }
-        return directExtrinsics(fromMatrix: m)
-    }
-
-    /// The rotation block (first three columns) of an extrinsic matrix as a
-    /// column-major `simd_float3x3`.
-    private static func rotation(of m: matrix_float4x3) -> simd_float3x3 {
-        simd_float3x3(columns: (m.columns.0, m.columns.1, m.columns.2))
-    }
-
-    /// Flatten a column-major `simd_float3x3` into a row-major `[Float]` of 9.
-    private static func rowMajor(_ m: simd_float3x3) -> [Float] {
-        [m.columns.0.x, m.columns.1.x, m.columns.2.x,
-         m.columns.0.y, m.columns.1.y, m.columns.2.y,
-         m.columns.0.z, m.columns.1.z, m.columns.2.z]
-    }
-}
-
-#endif // canImport(simd)
-
 #if canImport(AVFoundation) && os(iOS)
 
 /// Real iOS implementation that performs the calibration probe.
@@ -124,7 +34,7 @@ enum StereoExtrinsicsMath {
 /// ultra-wide and wide calibrations plus the rigid transform between them
 /// (`StereoProbedCalibration`). The mono `probe(deviceModel:)` entry point
 /// runs the same capture and returns the ultra-wide half.
-public final class AVPhotoCalibrationProbeExecutor: NSObject, PhotoCalibrationProbeExecutor, StereoCalibrationProbeExecutor, @unchecked Sendable {
+public final class AVPhotoCalibrationProbeExecutor: NSObject, PhotoCalibrationProbeExecutor, @unchecked Sendable {
     private let timeout: TimeInterval
 
     public init(timeout: TimeInterval = 3.0) {
@@ -138,11 +48,6 @@ public final class AVPhotoCalibrationProbeExecutor: NSObject, PhotoCalibrationPr
     /// one clear path, no fallback).
     public func probe(deviceModel: String) async throws -> ProbedCameraCalibration {
         try await runStereoProbe(deviceModel: deviceModel).ultrawide
-    }
-
-    /// Stereo entry point — returns both constituents plus the UW→wide extrinsics.
-    public func probeStereo(deviceModel: String) async throws -> StereoProbedCalibration {
-        try await runStereoProbe(deviceModel: deviceModel)
     }
 
     private func runStereoProbe(deviceModel: String) async throws -> StereoProbedCalibration {

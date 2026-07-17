@@ -1,30 +1,21 @@
 // Sources/SyncField/Calibration/StereoProbedCalibration.swift
 import Foundation
 
-/// Rigid transform between two camera frames of a virtual device, captured
-/// from `AVCameraCalibrationData.extrinsicMatrix` during a stereo calibration
-/// probe (see `StereoProbedCalibration`).
-public struct StereoExtrinsics: Codable, Equatable, Sendable {
-    /// Row-major 3x3 rotation matrix, 9 values.
-    public let rotationRowMajor: [Float]
-    /// Translation in millimeters, 3 values (x, y, z).
-    public let translationMillimeters: [Float]
-
-    public init(rotationRowMajor: [Float], translationMillimeters: [Float]) {
-        self.rotationRowMajor = rotationRowMajor
-        self.translationMillimeters = translationMillimeters
-    }
-}
-
 /// Factory calibration data for BOTH constituent cameras of a dual-wide
 /// virtual device (ultra-wide + wide), extracted from a one-time stereo
-/// `AVCameraCalibrationData` photo probe and persisted to disk per device
-/// model.
+/// `AVCameraCalibrationData` photo probe.
+///
+/// NOTE: the stereo photo-calibration probe was removed in 0.11.1 (dual-wide
+/// hardware cannot disable geometric distortion correction on the wide
+/// constituent, so `isCameraCalibrationDataDeliverySupported` is structurally
+/// false — see the CHANGELOG). This type survives only as the return container
+/// of the still-present mono `PhotoCalibrationProbeExecutor.probe(deviceModel:)`
+/// path (`.ultrawide`), which is the same dead photo probe and is slated for
+/// later removal. It is no longer written to any on-device sidecar.
 ///
 /// Extends the mono `ProbedCameraCalibration` probe (which retains only the
 /// ultra-wide constituent) by also keeping the wide constituent, plus the
-/// rigid transform between them so downstream pipelines can reproject
-/// ultra-wide points into the wide camera frame (spec §5.1 `ego_to_wide`).
+/// rigid transform between them.
 public struct StereoProbedCalibration: Codable, Equatable, Sendable {
     public let ultrawide: ProbedCameraCalibration
     public let wide: ProbedCameraCalibration
@@ -60,14 +51,4 @@ public struct StereoProbedCalibration: Codable, Equatable, Sendable {
         let sumOfSquares = translation.reduce(Float(0)) { $0 + $1 * $1 }
         return sumOfSquares.squareRoot()
     }
-}
-
-/// Seam for the stereo (ultra-wide + wide) calibration probe. Mirrors
-/// `PhotoCalibrationProbeExecutor` for the mono path but is kept as its own
-/// protocol — `PhotoCalibrationProbeExecutor` has no `probeStereo` member
-/// yet — so `CameraCalibrationProber` stays fully unit-testable via a stub,
-/// without pulling in AVFoundation. `AVPhotoCalibrationProbeExecutor` (or a
-/// wrapper) conforms to this once the stereo photo probe lands.
-public protocol StereoCalibrationProbeExecutor: Sendable {
-    func probeStereo(deviceModel: String) async throws -> StereoProbedCalibration
 }

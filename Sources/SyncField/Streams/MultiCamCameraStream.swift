@@ -67,12 +67,6 @@ public final class MultiCamCameraStream: NSObject, SyncFieldStream, @unchecked S
         supportsPreciseTimestamps: true, providesAudioTrack: true)
 
     private let videoSettings: VideoSettings
-    private let _probedCalibration: StereoProbedCalibration?
-
-    /// Factory stereo calibration supplied at construction (from the one-time
-    /// stereo probe). Exposed read-only so the host can write
-    /// `cam_ego.calibration.json` (spec §5.1) — the SDK never writes it.
-    public var probedCalibration: StereoProbedCalibration? { _probedCalibration }
 
     /// Static device/format metadata for the ULTRA-WIDE (`cam_ego`) leg,
     /// mirroring `iPhoneCameraStream.activeCameraMetadata` exactly (device type,
@@ -99,6 +93,53 @@ public final class MultiCamCameraStream: NSObject, SyncFieldStream, @unchecked S
             fieldOfViewDegrees: fov,
             gdcEnabled: gdc
         )
+        #else
+        return nil
+        #endif
+    }
+
+    /// Static device/format metadata for the WIDE (`cam_ego_wide`) leg,
+    /// mirroring `activeCameraMetadata` exactly with the same post-configuration
+    /// semantics (device type, active-format dimensions, field of view, actual
+    /// GDC state). The host uses this to write the WIDE leg's FOV-estimate
+    /// intrinsics + honest per-leg `gdc_enabled` into `cam_ego.calibration.json`
+    /// (spec §5.1). `nil` before `connect()` and on non-iOS platforms.
+    public var wideActiveCameraMetadata: ActiveCameraMetadata? {
+        #if os(iOS) && canImport(AVFoundation)
+        guard let device = wideDevice else { return nil }
+        let dimensions = CMVideoFormatDescriptionGetDimensions(
+            device.activeFormat.formatDescription)
+        let fov = Double(device.activeFormat.videoFieldOfView)
+        let gdc = device.isGeometricDistortionCorrectionSupported
+            ? device.isGeometricDistortionCorrectionEnabled
+            : true
+        return ActiveCameraMetadata(
+            deviceTypeRawValue: device.deviceType.rawValue,
+            deviceLocalizedName: device.localizedName,
+            activeFormatWidth: Int(dimensions.width),
+            activeFormatHeight: Int(dimensions.height),
+            fieldOfViewDegrees: fov,
+            gdcEnabled: gdc
+        )
+        #else
+        return nil
+        #endif
+    }
+
+    /// Device-level factory extrinsics for the ultra-wide → wide physical pair,
+    /// decoded from `AVCaptureDevice.extrinsicMatrix(from: uwDevice, to: wideDevice)`
+    /// (iOS 13+). No photo capture and no running session — just the two
+    /// physical devices, resolved from this stream's connected constituents when
+    /// available, otherwise the default back UW/wide cameras (the same physical
+    /// devices the support gate checks), so this is callable pre-`connect()`
+    /// (e.g. the diagnostics harness). Returns `nil` when the SDK provides no
+    /// factory calibration (virtual cameras / devices without one) — an honest
+    /// "not available", never a substituted value. Always `nil` on non-iOS.
+    public func stereoExtrinsics() -> StereoExtrinsics? {
+        #if os(iOS) && canImport(AVFoundation)
+        let uw = uwDevice ?? Self.ultrawideDevice()
+        let wide = wideDevice ?? Self.wideDevice()
+        return Self.deviceStereoExtrinsics(uwDevice: uw, wideDevice: wide)
         #else
         return nil
         #endif
@@ -197,13 +238,11 @@ public final class MultiCamCameraStream: NSObject, SyncFieldStream, @unchecked S
     public init(
         streamId: String = "cam_ego",
         wideStreamId: String = "cam_ego_wide",
-        videoSettings: VideoSettings,
-        probedCalibration: StereoProbedCalibration?
+        videoSettings: VideoSettings
     ) {
         self.streamId = streamId
         self.wideStreamId = wideStreamId
         self.videoSettings = videoSettings
-        self._probedCalibration = probedCalibration
         super.init()
     }
 
@@ -252,6 +291,21 @@ public final class MultiCamCameraStream: NSObject, SyncFieldStream, @unchecked S
     }
     private static func wideDevice() -> AVCaptureDevice? {
         AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
+    }
+
+    /// Decodes the ultra-wide → wide device-level factory extrinsics for the
+    /// two given physical devices via `AVCaptureDevice.extrinsicMatrix(from:to:)`.
+    /// Public so a host-side diagnostics harness that already holds the two
+    /// devices can read the same value the recording path writes, without
+    /// reaching the module-internal decode math. Returns `nil` if either device
+    /// is missing or the SDK provides no factory matrix.
+    public static func deviceStereoExtrinsics(
+        uwDevice: AVCaptureDevice?, wideDevice: AVCaptureDevice?
+    ) -> StereoExtrinsics? {
+        guard let uwDevice, let wideDevice,
+              let matrixData = AVCaptureDevice.extrinsicMatrix(from: uwDevice, to: wideDevice)
+        else { return nil }
+        return StereoExtrinsicsMath.directExtrinsics(fromMatrixData: matrixData)
     }
 
     /// The multicam session, exposed for preview reuse (host wires it to an

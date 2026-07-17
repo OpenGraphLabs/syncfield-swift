@@ -9,9 +9,19 @@ import XCTest
 final class MultiCamCameraStreamTests: XCTestCase {
 
     private func makeStream() -> MultiCamCameraStream {
-        MultiCamCameraStream(
-            videoSettings: .egocentric1080p,
-            probedCalibration: nil)
+        MultiCamCameraStream(videoSettings: .egocentric1080p)
+    }
+
+    // MARK: Metadata + device extrinsics (nil off-device)
+
+    func test_wide_metadata_and_stereo_extrinsics_are_nil_without_a_session() {
+        // No capture session / devices on macOS `swift test`; both must report
+        // an honest nil rather than a fabricated value.
+        let cam = makeStream()
+        #if !os(iOS)
+        XCTAssertNil(cam.wideActiveCameraMetadata)
+        XCTAssertNil(cam.stereoExtrinsics())
+        #endif
     }
 
     // MARK: Manifest entries
