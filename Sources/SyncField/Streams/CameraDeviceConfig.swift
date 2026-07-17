@@ -63,6 +63,28 @@ enum CameraDeviceConfig {
         }
     }
 
+    /// Strict availability predicate for `MultiCamCameraStream`'s support
+    /// gate: does `device` expose at least one format that is
+    /// multicam-capable AND at least `minWidth`×`minHeight` AND covers
+    /// `fps`? Unlike `widestUsableFormat(requireMultiCam:)`, this does NOT
+    /// fall back to a smaller/slower format when nothing matches — the gate
+    /// must fail loud (Jerry's no-fallback rule) rather than silently
+    /// recording a stereo pair the hardware can't actually sustain at spec.
+    static func hasMultiCamFormat(
+        on device: AVCaptureDevice,
+        minWidth: Int,
+        minHeight: Int,
+        fps: Double
+    ) -> Bool {
+        device.formats.contains { format in
+            guard format.isMultiCamSupported else { return false }
+            let dimensions = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+            guard Int(dimensions.width) >= minWidth,
+                  Int(dimensions.height) >= minHeight else { return false }
+            return supports(format: format, fps: fps)
+        }
+    }
+
     private static func supports(format: AVCaptureDevice.Format, fps: Double) -> Bool {
         guard fps > 0 else { return true }
         return format.videoSupportedFrameRateRanges.contains { range in
