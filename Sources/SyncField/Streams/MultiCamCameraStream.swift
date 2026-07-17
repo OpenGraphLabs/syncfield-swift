@@ -74,6 +74,36 @@ public final class MultiCamCameraStream: NSObject, SyncFieldStream, @unchecked S
     /// `cam_ego.calibration.json` (spec §5.1) — the SDK never writes it.
     public var probedCalibration: StereoProbedCalibration? { _probedCalibration }
 
+    /// Static device/format metadata for the ULTRA-WIDE (`cam_ego`) leg,
+    /// mirroring `iPhoneCameraStream.activeCameraMetadata` exactly (device type,
+    /// active-format dimensions, field of view, GDC state). Available after
+    /// `connect()` has selected the constituent devices. The host uses this to
+    /// write the FOV-estimate tier of `camera_intrinsics.json` for the
+    /// ultra-wide leg when no factory probe is present, so the frozen intrinsics
+    /// contract is satisfied on stereo devices exactly as on mono ones. `nil`
+    /// before `connect()` and on non-iOS platforms (multicam is iOS-only).
+    public var activeCameraMetadata: ActiveCameraMetadata? {
+        #if os(iOS) && canImport(AVFoundation)
+        guard let device = uwDevice else { return nil }
+        let dimensions = CMVideoFormatDescriptionGetDimensions(
+            device.activeFormat.formatDescription)
+        let fov = Double(device.activeFormat.videoFieldOfView)
+        let gdc = device.isGeometricDistortionCorrectionSupported
+            ? device.isGeometricDistortionCorrectionEnabled
+            : true
+        return ActiveCameraMetadata(
+            deviceTypeRawValue: device.deviceType.rawValue,
+            deviceLocalizedName: device.localizedName,
+            activeFormatWidth: Int(dimensions.width),
+            activeFormatHeight: Int(dimensions.height),
+            fieldOfViewDegrees: fov,
+            gdcEnabled: gdc
+        )
+        #else
+        return nil
+        #endif
+    }
+
     // MARK: Reporting + degradation state (pure, cross-thread via stateLock)
 
     private let stateLock = NSLock()
