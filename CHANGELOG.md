@@ -2,6 +2,23 @@
 
 All notable changes to **syncfield-swift** are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.0] — 2026-07-26
+
+Makes a mid-recording camera self-stop (thermal, battery cutoff, storage, muxer error) detectable within ~20 seconds, with trustworthy left/right attribution, instead of being discovered minutes later at stop time. Field context: 10 min / 2 min / 10 min ego–wrist–wrist recordings where one wrist died early and nobody knew.
+
+### Added
+- **Capture watchdog.** While a recording is active (`startRemoteRecording` ACK → `stopRemoteRecordingReliably` entry), `Insta360BLEController` polls its own camera's capture state via `getCurrentCaptureStatus` every 10 s and emits `captureStoppedUnexpectedly` after two consecutive idle reads (`Insta360CaptureWatchdogPolicy`). This is the guaranteed detection path — it needs no SDK push delivery, and a failed probe (BLE drop) is deliberately NOT treated as a stop: the camera records standalone, and a reconnect reconciles on the next tick.
+- **`Insta360CaptureStopReason`** — decodes `INSCaptureStoppedError` (over_time_limit / storage_full / low_card_speed / muxer_stream_error / drop_frames / low_battery / …) from the capture-stopped push's `error_code`, previously discarded. Raw values are stable JS/PostHog discriminators.
+- **`Insta360ShutdownReason` + `willShutdown` warning.** Subscribes `INSCameraWillShutDownNotification` (battery run-out / temperature over limit) — the camera's last signal before BLE dies, previously not observed at all.
+- **`Insta360CaptureStopDetectionSource`** (`push_confirmed` / `push_unverified` / `watchdog`) so consumers and telemetry can see which path detected the stop.
+
+### Changed
+- **`Insta360CameraWarning.captureStoppedUnexpectedly` now carries `reason`, `cameraDurationSec` (camera-reported recorded length), and `source`** (breaking for exhaustive matchers; `if case` matchers are unaffected).
+- **Capture-stopped push is attribution-verified.** NotificationCenter delivery is process-global, so with two wrist cameras BOTH controllers receive every capture-stopped notification; previously each blindly attributed it to its own device (one camera's death showed banners on both wrists). Now each controller probes its own camera and emits only when that camera really stopped; if the probe can't run, it emits as `push_unverified`. Pushes with no active recording on the controller are ignored (also silences commanded-stop echoes).
+- **`onBatteryLow` reads the documented `battery_status` (`INSCameraBatteryStatus`) userInfo key** — the previous scalar `batteryLevel` key never matched, so the level always arrived nil. `onStorageStatus` no longer pretends to read a free-MB figure that the documented payload (`card_state` / `card_location`) doesn't carry.
+- All camera-notification handlers now log `object` + full `userInfo` so a real-device session can verify which pushes GO 3S actually delivers over BLE (never field-measured to date).
+- `SyncFieldVersion.current` bumped to `0.12.0`.
+
 ## [0.11.1] — 2026-07-17
 
 Removes the stereo photo-calibration probe and replaces it with the two inputs that actually work on dual-wide hardware: FOV-estimated intrinsics (host-side) and device-level factory extrinsics. The 0.11.0 stereo photo probe never delivered calibration in the field — `AVCapturePhotoOutput.isCameraCalibrationDataDeliverySupported` is true only when the source device's `geometricDistortionCorrectionEnabled == NO`, and the wide constituent of a dual-wide device cannot disable GDC, so calibration delivery is structurally unsupported (confirmed on-device; production has been 100% `fov_estimate`). The mono `iPhoneCameraStream` path and its `probe(deviceModel:)` are unchanged.

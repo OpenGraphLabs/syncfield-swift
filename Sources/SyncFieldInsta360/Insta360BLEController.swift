@@ -216,10 +216,23 @@ public enum Insta360CameraWarning: Sendable {
     /// "critical" (camera will self-stop imminently).
     case thermalElevated(deviceName: String, level: String)
 
-    /// `INSCameraCaptureStopped` fired without us issuing a stop command.
-    /// The clip on the SD is preserved; the next `stopRemoteRecording()`
-    /// call will fail. Surface this so the user knows.
-    case captureStoppedUnexpectedly(deviceName: String)
+    /// Recording halted without us issuing a stop command. The clip on the
+    /// SD is preserved; the next `stopRemoteRecording()` call will fail.
+    /// `reason` is the camera's own stop cause when the SDK push carried
+    /// one (watchdog detections have none), `cameraDurationSec` the
+    /// camera-reported recorded length, and `source` which detection path
+    /// confirmed the stop.
+    case captureStoppedUnexpectedly(
+        deviceName: String,
+        reason: Insta360CaptureStopReason?,
+        cameraDurationSec: UInt?,
+        source: Insta360CaptureStopDetectionSource)
+
+    /// Camera announced imminent power-off
+    /// (`INSCameraWillShutDownNotification`: battery run-out or thermal
+    /// limit). Last signal before the BLE link dies — actionable for the
+    /// operator (swap / rest the camera) even outside a recording.
+    case willShutdown(deviceName: String, reason: Insta360ShutdownReason)
 
     /// Stable string for the kind, used as the JS-side discriminator.
     public var kind: String {
@@ -228,6 +241,7 @@ public enum Insta360CameraWarning: Sendable {
         case .storageLow:                 return "storageLow"
         case .thermalElevated:            return "thermalElevated"
         case .captureStoppedUnexpectedly: return "captureStopped"
+        case .willShutdown:               return "willShutdown"
         }
     }
 
@@ -236,7 +250,8 @@ public enum Insta360CameraWarning: Sendable {
         case .batteryLow(let n, _),
              .storageLow(let n, _),
              .thermalElevated(let n, _),
-             .captureStoppedUnexpectedly(let n):
+             .captureStoppedUnexpectedly(let n, _, _, _),
+             .willShutdown(let n, _):
             return n
         }
     }
@@ -484,6 +499,120 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
     /// lifecycle) and the SDK enum lives in syncfield-swift.
     public var onWarning: (@Sendable (Insta360CameraWarning) -> Void)?
 
+    // MARK: - Capture watchdog
+    //
+    // The SDK's capture-stopped push is the fast path but has never been
+    // field-verified on GO 3S, and it needs a live BLE link at the exact
+    // moment the camera dies. The watchdog is the guaranteed path: while a
+    // recording is supposed to be active it polls the camera's own capture
+    // state (`getCurrentCaptureStatus`, proven on GO 3S in the stop path)
+    // and declares the recording dead after two consecutive idle reads.
+    // A failed probe is NOT evidence — a camera with a dropped BLE link
+    // keeps recording standalone — so only positive "idle" reads count,
+    // and a mid-recording reconnect reconciles on the next tick.
+
+    /// Guards `captureExpectedActive` / `captureWatchdogTask`: the push
+    /// handler (main thread), the watchdog task, and start/stop callers
+    /// all touch them.
+    private let captureWatchLock = NSLock()
+    /// True between a successful `startRemoteRecording` ACK and the entry
+    /// of `stopRemoteRecordingReliably` (or a confirmed self-stop).
+    private var captureExpectedActive = false
+    private var captureWatchdogTask: Task<Void, Never>?
+
+    var isCaptureExpectedActive: Bool {
+        captureWatchLock.lock()
+        defer { captureWatchLock.unlock() }
+        return captureExpectedActive
+    }
+
+    private func beginCaptureWatch() {
+        captureWatchLock.lock()
+        captureExpectedActive = true
+        captureWatchdogTask?.cancel()
+        captureWatchdogTask = Task { [weak self] in
+            await self?.runCaptureWatchdog()
+        }
+        captureWatchLock.unlock()
+        NSLog("[Insta360BLE.watchdog] started device=\(connectedDevice?.name ?? "(unknown)") intervalSec=\(Insta360CaptureWatchdogPolicy.pollIntervalSeconds)")
+    }
+
+    private func endCaptureWatch(reason: String) {
+        captureWatchLock.lock()
+        let wasActive = captureExpectedActive
+        captureExpectedActive = false
+        captureWatchdogTask?.cancel()
+        captureWatchdogTask = nil
+        captureWatchLock.unlock()
+        if wasActive {
+            NSLog("[Insta360BLE.watchdog] ended (\(reason)) device=\(connectedDevice?.name ?? "(unknown)")")
+        }
+    }
+
+    /// Claims the one-shot right to emit `captureStoppedUnexpectedly`.
+    /// False when no recording is supposed to be active — a commanded stop
+    /// already ran, or another detection path (push vs watchdog) claimed
+    /// the emission first.
+    private func claimCaptureStopEmission() -> Bool {
+        captureWatchLock.lock()
+        defer { captureWatchLock.unlock() }
+        guard captureExpectedActive else { return false }
+        captureExpectedActive = false
+        captureWatchdogTask?.cancel()
+        captureWatchdogTask = nil
+        return true
+    }
+
+    private func runCaptureWatchdog() async {
+        let intervalNs = UInt64(
+            Insta360CaptureWatchdogPolicy.pollIntervalSeconds * 1_000_000_000)
+        var idleStreak = 0
+        while !Task.isCancelled {
+            try? await Task.sleep(nanoseconds: intervalNs)
+            if Task.isCancelled || !isCaptureExpectedActive { return }
+            let deviceTag = connectedDevice?.name ?? "(unknown)"
+            do {
+                let state = try await currentCaptureState(timeout: 3)
+                if state.stateRaw == 0 {
+                    idleStreak += 1
+                    NSLog("[Insta360BLE.watchdog] idle read device=\(deviceTag) streak=\(idleStreak) captureTime=\(state.captureTime)")
+                    if Insta360CaptureWatchdogPolicy.shouldConfirmStop(
+                        consecutiveIdleReads: idleStreak) {
+                        emitCaptureStopped(
+                            source: .watchdog,
+                            reason: nil,
+                            cameraDurationSec: state.captureTime > 0 ? state.captureTime : nil)
+                        return
+                    }
+                } else {
+                    idleStreak = 0
+                    NSLog("[Insta360BLE.watchdog] capturing device=\(deviceTag) state=\(state.stateRaw) captureTime=\(state.captureTime)")
+                }
+            } catch {
+                idleStreak = 0
+                NSLog("[Insta360BLE.watchdog] probe failed device=\(deviceTag): \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func emitCaptureStopped(
+        source: Insta360CaptureStopDetectionSource,
+        reason: Insta360CaptureStopReason?,
+        cameraDurationSec: UInt?
+    ) {
+        guard claimCaptureStopEmission() else {
+            NSLog("[Insta360BLE.watchdog] capture-stop emission suppressed (already claimed or idle) source=\(source.rawValue)")
+            return
+        }
+        let device = connectedDevice?.name ?? lastKnownDeviceName ?? "(unknown)"
+        NSLog("[Insta360BLE] CAPTURE-STOP CONFIRMED device=\(device) source=\(source.rawValue) reason=\(reason?.rawValue ?? "unknown") durationSec=\(cameraDurationSec.map(String.init) ?? "?")")
+        onWarning?(.captureStoppedUnexpectedly(
+            deviceName: device,
+            reason: reason,
+            cameraDurationSec: cameraDurationSec,
+            source: source))
+    }
+
     // MARK: - Pure helpers (unit-tested)
 
     /// Returns true iff a scanned device should be paired with.
@@ -730,43 +859,109 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
             selector: #selector(onTemperatureStatus(_:)),
             name: Notification.Name("INSCameraTemperatureStatusNotification"),
             object: nil)
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(onWillShutDown(_:)),
+            name: Notification.Name("INSCameraWillShutDownNotification"),
+            object: nil)
     }
 
     deinit {
         NotificationCenter.default.removeObserver(self)
+        captureWatchdogTask?.cancel()
         Insta360BluetoothDelegateBroker.shared.unregister(self)
     }
 
     @objc private func onCaptureStopped(_ notification: Notification) {
-        // Camera halted recording unexpectedly (overheating, full storage,
-        // battery cutoff). Normal stop goes through `stopRemoteRecording()`;
-        // this observer is the only path for the unexpected case.
+        // Camera halted recording without us issuing a stop command
+        // (thermal, battery cutoff, storage, muxer error...). userInfo is
+        // {"error_code": INSCaptureStoppedError, "video": INSCameraVideoInfo}
+        // per `NSNotification+INSCamera.h`.
+        //
+        // NotificationCenter delivery is process-global: with two wrist
+        // cameras BOTH controllers receive this notification. Each
+        // controller therefore probes ITS OWN camera's capture state and
+        // only emits when that camera really stopped — this is what makes
+        // the left/right attribution trustworthy.
         let device = connectedDevice?.name ?? "(unknown)"
-        NSLog("[Insta360BLE] CaptureStopped device=\(device): \(notification.userInfo ?? [:])")
-        onWarning?(.captureStoppedUnexpectedly(deviceName: device))
+        let errorCode = (notification.userInfo?["error_code"] as? NSNumber)?.uintValue
+        let reason = errorCode.flatMap(Insta360CaptureStopReason.init(sdkErrorCode:))
+        let video = notification.userInfo?["video"] as? INSCameraVideoInfo
+        NSLog("[Insta360BLE] CaptureStopped push device=\(device) errorCode=\(errorCode.map(String.init) ?? "nil") reason=\(reason?.rawValue ?? "unknown") videoURI=\(video?.uri ?? "nil") videoTotalTime=\(video.map { String($0.totalTime) } ?? "nil") object=\(String(describing: notification.object)) userInfo=\(notification.userInfo ?? [:])")
+
+        guard isCaptureExpectedActive else {
+            NSLog("[Insta360BLE] CaptureStopped push ignored device=\(device): no active recording on this controller")
+            return
+        }
+        let pushDurationSec: UInt? = video.flatMap { $0.totalTime > 0 ? UInt($0.totalTime) : nil }
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let state = try await self.currentCaptureState(timeout: 3)
+                if state.stateRaw == 0 {
+                    self.emitCaptureStopped(
+                        source: .pushConfirmed,
+                        reason: reason,
+                        cameraDurationSec: state.captureTime > 0 ? state.captureTime : pushDurationSec)
+                } else {
+                    NSLog("[Insta360BLE] CaptureStopped push attribution rejected device=\(device): own camera still capturing (state=\(state.stateRaw)) — event belongs to another camera")
+                }
+            } catch {
+                // Command channel down, cannot verify attribution. Emit
+                // anyway: a missed interruption costs footage, a false
+                // banner costs a glance.
+                self.emitCaptureStopped(
+                    source: .pushUnverified,
+                    reason: reason,
+                    cameraDurationSec: pushDurationSec)
+            }
+        }
+    }
+
+    @objc private func onWillShutDown(_ notification: Notification) {
+        // Camera announces imminent power-off. userInfo is
+        // {"error_code": INSCameraShutdownErrorCode, "message": String}.
+        // This is the last signal before the BLE link dies, so it is
+        // surfaced even when idle. Attribution caveat: delivery is
+        // process-global and this payload carries no device identity we
+        // can verify against, so the name is this controller's device —
+        // the raw object/userInfo goes to the log for the field test.
+        let device = connectedDevice?.name ?? "(unknown)"
+        let code = (notification.userInfo?["error_code"] as? NSNumber)?.uintValue
+        let message = notification.userInfo?["message"] as? String ?? ""
+        let reason = Insta360ShutdownReason(sdkErrorCode: code)
+        NSLog("[Insta360BLE] WillShutDown device=\(device) code=\(code.map(String.init) ?? "nil") reason=\(reason.rawValue) message=\(message) object=\(String(describing: notification.object)) userInfo=\(notification.userInfo ?? [:])")
+        onWarning?(.willShutdown(deviceName: device, reason: reason))
     }
 
     @objc private func onBatteryLow(_ notification: Notification) {
         let device = connectedDevice?.name ?? "(unknown)"
-        let level = (notification.userInfo?["batteryLevel"] as? NSNumber)?.intValue
-        NSLog("[Insta360BLE] BatteryLow device=\(device) level=\(level.map(String.init) ?? "?")")
+        // Documented userInfo is {"battery_status": INSCameraBatteryStatus}
+        // (`NSNotification+INSCamera.h`) — the previous scalar
+        // "batteryLevel" key never matched, so level always arrived nil.
+        let status = notification.userInfo?["battery_status"] as? INSCameraBatteryStatus
+        let level = status.map { Int($0.batteryLevel) }
+        NSLog("[Insta360BLE] BatteryLow device=\(device) level=\(level.map(String.init) ?? "?") userInfo=\(notification.userInfo ?? [:])")
         onWarning?(.batteryLow(deviceName: device, level: level))
     }
 
     @objc private func onStorageStatus(_ notification: Notification) {
         let device = connectedDevice?.name ?? "(unknown)"
-        // SDK sends a status enum/code; we only care that storage is constrained.
-        let availableMB = (notification.userInfo?["freeSpaceMB"] as? NSNumber)?.intValue
-        NSLog("[Insta360BLE] StorageStatus device=\(device) availableMB=\(availableMB.map(String.init) ?? "?")")
-        onWarning?(.storageLow(deviceName: device, availableMB: availableMB))
+        // Documented userInfo is {"card_state", "card_location"} — no
+        // free-MB figure arrives over BLE. Log the raw payload so a
+        // real-device session shows what GO 3S actually sends.
+        NSLog("[Insta360BLE] StorageStatus device=\(device) userInfo=\(notification.userInfo ?? [:])")
+        onWarning?(.storageLow(deviceName: device, availableMB: nil))
     }
 
     @objc private func onTemperatureStatus(_ notification: Notification) {
         let device = connectedDevice?.name ?? "(unknown)"
         // Critical = camera will self-stop imminently; warning = elevated.
+        // The header documents no userInfo for this notification — the
+        // "level" read is speculative, so the raw payload goes to the log.
         let levelRaw = (notification.userInfo?["level"] as? NSNumber)?.intValue ?? 1
         let level = levelRaw >= 2 ? "critical" : "warning"
-        NSLog("[Insta360BLE] TemperatureStatus device=\(device) level=\(level)")
+        NSLog("[Insta360BLE] TemperatureStatus device=\(device) level=\(level) userInfo=\(notification.userInfo ?? [:])")
         onWarning?(.thermalElevated(deviceName: device, level: level))
     }
 
@@ -955,6 +1150,7 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
     public func unpair() async throws {
         guard let device = connectedDevice else { return }
         let uuid = device.identifierUUIDStringSafe
+        endCaptureWatch(reason: "unpair")
         stopHeartbeat()
         // Mark BEFORE disconnect so the inevitable
         // `didDisconnectWithError` callback is recognized as intentional.
@@ -1102,9 +1298,11 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
     /// the Insta360 SDK delivers it in the `stopCapture` completion block via `videoInfo.uri`.
     public func startRemoteRecording(clock: SessionClock) async throws -> UInt64 {
         try Task.checkCancellation()
-        return try await withControllerCommandGate(label: "startRemoteRecording") {
+        let ackNs = try await withControllerCommandGate(label: "startRemoteRecording") {
             try await self.startRemoteRecordingLocked(clock: clock)
         }
+        beginCaptureWatch()
+        return ackNs
     }
 
     private func startRemoteRecordingLocked(clock: SessionClock) async throws -> UInt64 {
@@ -1201,6 +1399,9 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
 
     func stopRemoteRecordingReliably() async throws -> Insta360StopCaptureResult {
         try Task.checkCancellation()
+        // A commanded stop is about to run — from here on, an idle capture
+        // state is expected, not an interruption.
+        endCaptureWatch(reason: "stop_requested")
         return try await withControllerCommandGate(label: "stopRemoteRecording") {
             try await self.stopRemoteRecordingLocked()
         }
