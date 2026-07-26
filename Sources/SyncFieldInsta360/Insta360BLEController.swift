@@ -519,6 +519,8 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
     /// of `stopRemoteRecordingReliably` (or a confirmed self-stop).
     private var captureExpectedActive = false
     private var captureWatchdogTask: Task<Void, Never>?
+    /// Set by `emitCaptureStopped`, consumed by the next commanded stop.
+    private var confirmedSelfStop: Insta360SelfStopRecord?
 
     var isCaptureExpectedActive: Bool {
         captureWatchLock.lock()
@@ -529,6 +531,7 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
     private func beginCaptureWatch() {
         captureWatchLock.lock()
         captureExpectedActive = true
+        confirmedSelfStop = nil
         captureWatchdogTask?.cancel()
         captureWatchdogTask = Task { [weak self] in
             await self?.runCaptureWatchdog()
@@ -604,6 +607,12 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
             NSLog("[Insta360BLE.watchdog] capture-stop emission suppressed (already claimed or idle) source=\(source.rawValue)")
             return
         }
+        captureWatchLock.lock()
+        confirmedSelfStop = Insta360SelfStopRecord(
+            reason: reason,
+            cameraDurationSec: cameraDurationSec,
+            wallClockMs: UInt64(Date().timeIntervalSince1970 * 1000))
+        captureWatchLock.unlock()
         let device = connectedDevice?.name ?? lastKnownDeviceName ?? "(unknown)"
         NSLog("[Insta360BLE] CAPTURE-STOP CONFIRMED device=\(device) source=\(source.rawValue) reason=\(reason?.rawValue ?? "unknown") durationSec=\(cameraDurationSec.map(String.init) ?? "?")")
         onWarning?(.captureStoppedUnexpectedly(
@@ -1399,12 +1408,31 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
 
     func stopRemoteRecordingReliably() async throws -> Insta360StopCaptureResult {
         try Task.checkCancellation()
+        if let selfStop = consumeConfirmedSelfStop() {
+            NSLog("[Insta360BLE] stopRemoteRecording short-circuit — capture already self-stopped reason=\(selfStop.reason?.rawValue ?? "unknown") durationSec=\(selfStop.cameraDurationSec.map(String.init) ?? "?")")
+            return Insta360StopCaptureResult(
+                cameraFileURI: nil,
+                confirmedStopped: true,
+                attempts: 0,
+                diagnostic: "camera_self_stopped: \(selfStop.reason?.rawValue ?? "unknown")",
+                cameraDurationSec: selfStop.cameraDurationSec,
+                cameraFileSize: nil,
+                stopWallClockMs: selfStop.wallClockMs)
+        }
         // A commanded stop is about to run — from here on, an idle capture
         // state is expected, not an interruption.
         endCaptureWatch(reason: "stop_requested")
         return try await withControllerCommandGate(label: "stopRemoteRecording") {
             try await self.stopRemoteRecordingLocked()
         }
+    }
+
+    private func consumeConfirmedSelfStop() -> Insta360SelfStopRecord? {
+        captureWatchLock.lock()
+        defer { captureWatchLock.unlock() }
+        let record = confirmedSelfStop
+        confirmedSelfStop = nil
+        return record
     }
 
     private func stopRemoteRecordingLocked() async throws -> Insta360StopCaptureResult {
@@ -1934,6 +1962,14 @@ public final class Insta360BLEController: NSObject, @unchecked Sendable {
             powerOn: device.powerOn,
             powerOnForQC: device.powerOnForQC
         ) else {
+            // Deliberately NOT capture-stop evidence: this gate also trips
+            // for an off ActionPod, a half-awake endpoint, and
+            // metadata-unavailable advertisements (which parse as
+            // powerOn=false) — and it sits ahead of the capture-state
+            // probe, so a false reading here would also starve the probe
+            // that could disprove it. A force power-off mid-recording
+            // therefore stays undetected by design; the NSLogs from the
+            // reconnect loop are the field evidence for revisiting.
             if device.powerForLowBatteryStatus {
                 throw Insta360Error.commandFailed("camera is in low battery power-off state")
             }

@@ -86,4 +86,5 @@ final class Insta360CaptureStopReasonTests: XCTestCase {
                 reason: .temperatureOverLimit).deviceName,
             "GO 3S 8E13B7")
     }
+
 }

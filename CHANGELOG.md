@@ -2,6 +2,19 @@
 
 All notable changes to **syncfield-swift** are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.1] — 2026-07-26
+
+First field measurement of 0.12.0 (dual GO 3S drained to death mid-recording) proved detection works — CaptureStopped push delivered with `error_code=7` (low_battery), attribution guard correct in both directions — and exposed two gaps this release closes. Field notes: no `WillShutDown` or `BatteryLow` push preceded the battery-death stop; the camera announced the capture stop and then died silently.
+
+### Fixed
+- **`pairStandalone` wired the warning channel to the wrong controller for resumed cameras.** It called `wireWarningChannel()` before the `bindingKey` branch swapped `ble` to the Scanner-owned controller, so on the auto-resume path (every reconnect of a known camera) `onWarning` stayed nil on the live controller — capture-stop/willShutdown warnings, the JS banner, telemetry, and the `streamDisconnected` mirror were all silently dropped. The channel is now wired after the controller is final, matching `connect(context:)`. Same bug class as the S3 disconnect-handler re-wire.
+
+### Non-goal (documented decision)
+- **Force power-off mid-recording stays undetected — by design.** Field test (2026-07-26 night): a GO 3S force-powered-off mid-recording emits no push, and the watchdog sees only probe failures, which are deliberately not evidence (a camera with a dropped BLE link keeps recording standalone). The tempting signal — the reconnect loop's "camera is not powered on" gate — is ambiguous: it also trips for an off ActionPod, half-awake endpoints, and metadata-unavailable advertisements that parse as powerOn=false, and it sits ahead of the capture-state probe that could disprove it. Wiring it to `captureStoppedUnexpectedly` (which the app now answers with an auto-stop) would risk killing healthy takes on ordinary BLE dropouts, to cover a scenario that does not occur operationally. The reconnect-loop NSLogs remain the field evidence for revisiting this.
+
+### Changed
+- **Commanded stop short-circuits after a confirmed self-stop.** `emitCaptureStopped` now records an `Insta360SelfStopRecord` (reason, camera duration, wall clock); `stopRemoteRecordingReliably` consumes it and returns immediately (`diagnostic: "camera_self_stopped: <reason>"`) instead of walking a dead camera through the 4-attempt BLE ladder (~52 s per camera, ~99 s observed for a dual-wrist stop against two dead cameras). The record is cleared on every `startRemoteRecording`.
+
 ## [0.12.0] — 2026-07-26
 
 Makes a mid-recording camera self-stop (thermal, battery cutoff, storage, muxer error) detectable within ~20 seconds, with trustworthy left/right attribution, instead of being discovered minutes later at stop time. Field context: 10 min / 2 min / 10 min ego–wrist–wrist recordings where one wrist died early and nobody knew.

@@ -50,6 +50,15 @@ public enum Insta360ShutdownReason: String, Sendable {
     }
 }
 
+/// Snapshot of a confirmed mid-recording self-stop, kept until the next
+/// commanded stop consumes it: a camera that already reported its capture
+/// dead must not be walked through the BLE stop-retry ladder.
+struct Insta360SelfStopRecord: Sendable {
+    let reason: Insta360CaptureStopReason?
+    let cameraDurationSec: UInt?
+    let wallClockMs: UInt64
+}
+
 /// Which detection path confirmed a mid-recording capture stop.
 public enum Insta360CaptureStopDetectionSource: String, Sendable {
     /// SDK push notification arrived AND this controller's own

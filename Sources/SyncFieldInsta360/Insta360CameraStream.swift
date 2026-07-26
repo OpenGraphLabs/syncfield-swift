@@ -239,12 +239,16 @@ public final class Insta360CameraStream: SyncFieldStream, SyncFieldRecordingPref
         }
         self.onHealthEvent = onHealthEvent
         self.onCameraWarning = onCameraWarning
-        wireWarningChannel()
         if bindingKey != nil {
             ble = try await Insta360Scanner.shared.bindController(
                 identity: Insta360KnownCameraIdentity(
                     uuid: boundUUID,
                     bleName: preferredBLEName))
+            // Wire AFTER the swap — `bindController` replaces `ble`, and a
+            // warning channel left on the discarded controller silently
+            // drops every capture-stop/shutdown warning (JS banner,
+            // telemetry, and the streamDisconnected mirror all go quiet).
+            wireWarningChannel()
             do {
                 try await ensurePhoneAuthorization()
                 await ble.syncCameraClock()
@@ -257,6 +261,7 @@ public final class Insta360CameraStream: SyncFieldStream, SyncFieldRecordingPref
                 throw error
             }
         } else {
+            wireWarningChannel()
             try await ble.pair(excludingUUIDs: excludingUUIDs)
             try await ensurePhoneAuthorization()
             await ble.syncCameraClock()
