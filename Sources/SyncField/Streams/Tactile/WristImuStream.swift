@@ -18,6 +18,7 @@ public final class WristImuStream: SyncFieldStream, @unchecked Sendable {
         supportsPreciseTimestamps: true, providesAudioTrack: false)
 
     private var writer: SensorWriter?
+    private var writerPump: SensorWriterPump?
     private var frameCount = 0
 
     public init(streamId: String) {
@@ -32,13 +33,16 @@ public final class WristImuStream: SyncFieldStream, @unchecked Sendable {
     public func startRecording(clock: SessionClock,
                                writerFactory: WriterFactory) async throws {
         self.writer = try writerFactory.makeSensorWriter(streamId: streamId)
+        self.writerPump = SensorWriterPump(label: "syncfield.\(streamId).writer")
         self.frameCount = 0
     }
 
     public func stopRecording() async throws -> StreamStopReport {
         let final = frameCount
+        writerPump?.flush()
         try await writer?.close()
         writer = nil
+        writerPump = nil
         return StreamStopReport(streamId: streamId, frameCount: final, kind: "sensor")
     }
 
@@ -55,15 +59,18 @@ public final class WristImuStream: SyncFieldStream, @unchecked Sendable {
     /// queue with the SAME timestamps it uses for the matching tactile row, so
     /// the two files stay aligned. No-op until `startRecording` creates a writer
     /// (preview-phase samples are dropped, matching the tactile stream).
+    ///
+    /// Writes go through `SensorWriterPump`, NOT a per-sample unstructured
+    /// Task: Tasks racing to the writer actor land out of order (field data:
+    /// ep_20260727_115106 had inverted rows) and rows in flight at stop time
+    /// were lost — the pump preserves append order and `stopRecording`'s
+    /// `flush()` drains it before close.
     func append(captureNs: UInt64, deviceTimestampNs: UInt64, channels: [String: Int]) {
-        guard let writer = writer else { return }
+        guard let writer = writer, let pump = writerPump else { return }
         let frame = frameCount
         frameCount += 1
         let channelsAny: [String: Any] = channels.mapValues { $0 as Any }
-        Task {
-            try? await writer.append(frame: frame, monotonicNs: captureNs,
-                                     channels: channelsAny,
-                                     deviceTimestampNs: deviceTimestampNs)
-        }
+        pump.append(writer: writer, frame: frame, monotonicNs: captureNs,
+                    channels: channelsAny, deviceTimestampNs: deviceTimestampNs)
     }
 }

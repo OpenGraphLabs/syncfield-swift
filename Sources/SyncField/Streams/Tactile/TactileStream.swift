@@ -37,6 +37,7 @@ public final class TactileStream: SyncFieldStream, @unchecked Sendable {
     public weak var wristImuSibling: WristImuStream?
 
     private var writer: SensorWriter?
+    private var writerPump: SensorWriterPump?
     private var clock: SessionClock?
     private var healthBus: HealthBus?
     private var manifest: DeviceManifest?
@@ -176,13 +177,16 @@ public final class TactileStream: SyncFieldStream, @unchecked Sendable {
                                writerFactory: WriterFactory) async throws {
         self.clock = clock
         self.writer = try writerFactory.makeSensorWriter(streamId: streamId)
+        self.writerPump = SensorWriterPump(label: "syncfield.\(streamId).writer")
         self.frameCount = 0
     }
 
     public func stopRecording() async throws -> StreamStopReport {
         let final = frameCount
+        writerPump?.flush()
         try await writer?.close()
         writer = nil
+        writerPump = nil
         return StreamStopReport(streamId: streamId, frameCount: final, kind: "sensor")
     }
 
@@ -258,6 +262,12 @@ public final class TactileStream: SyncFieldStream, @unchecked Sendable {
     }
 
     /// Fire the live handler (always) and persist to JSONL (only while recording).
+    ///
+    /// Writes go through `SensorWriterPump`, NOT a per-sample unstructured
+    /// Task: Tasks racing to the writer actor land out of order (field data:
+    /// ep_20260727_115106 shipped 18 inverted rows in tactile_left.jsonl) and
+    /// rows in flight at stop time were lost — the pump preserves append
+    /// order and `stopRecording`'s `flush()` drains it before close.
     private func emit(frame: Int, captureNs: UInt64, deviceTsNs: UInt64,
                       channels: [String: Int],
                       handler: (@Sendable (TactileSampleEvent) -> Void)?) {
@@ -266,12 +276,10 @@ public final class TactileStream: SyncFieldStream, @unchecked Sendable {
                 streamId: streamId, side: side, frame: frame,
                 monotonicNs: captureNs, deviceTimestampNs: deviceTsNs, channels: channels))
         }
-        if let writer = writer {
+        if let writer = writer, let pump = writerPump {
             let channelsAny: [String: Any] = channels.mapValues { $0 as Any }
-            Task {
-                try? await writer.append(frame: frame, monotonicNs: captureNs,
-                                         channels: channelsAny, deviceTimestampNs: deviceTsNs)
-            }
+            pump.append(writer: writer, frame: frame, monotonicNs: captureNs,
+                        channels: channelsAny, deviceTimestampNs: deviceTsNs)
         }
     }
 
