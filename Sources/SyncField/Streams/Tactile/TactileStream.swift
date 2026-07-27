@@ -104,6 +104,11 @@ public final class TactileStream: SyncFieldStream, @unchecked Sendable {
     ///    excluded on transient errors, permanently dropping the only glove.)
     private func runAcquireLoop() async {
         var excluded: Set<UUID> = []
+        // Failure visibility: publish acquire failures (deduped by reason)
+        // so the host UI can distinguish "still searching", "no glove in
+        // range", and "Bluetooth off" — the loop used to retry in total
+        // silence, leaving the discovery row permanently ambiguous.
+        var failures = TactileAcquireFailureDeduper()
         while !Task.isCancelled {
             do {
                 let claimedElsewhere = await TactileRoleRegistry.shared.claimedIds()
@@ -122,6 +127,7 @@ public final class TactileStream: SyncFieldStream, @unchecked Sendable {
                     }
                     if Task.isCancelled { client.disconnect(); return }
                     // Connected + claimed.
+                    failures.reset()
                     self.manifest = m
                     self.isSubscribed = true
                     try client.subscribe { [weak self] data, arrivalNs in
@@ -146,13 +152,24 @@ public final class TactileStream: SyncFieldStream, @unchecked Sendable {
                     client.disconnect()
                 } catch {
                     client.disconnect()               // transient — retry same glove
+                    await publishAcquireFailure(error, deduper: &failures)
                     try? await Task.sleep(nanoseconds: 1_500_000_000)
                 }
             } catch {
                 // scan timeout / BT not ready → brief backoff, keep trying.
+                await publishAcquireFailure(error, deduper: &failures)
                 try? await Task.sleep(nanoseconds: 1_500_000_000)
             }
         }
+    }
+
+    private func publishAcquireFailure(
+        _ error: Error, deduper: inout TactileAcquireFailureDeduper
+    ) async {
+        let reason = TactileAcquireFailure.reason(for: error)
+        guard deduper.shouldPublish(reason) else { return }
+        await healthBus?.publish(
+            .streamDisconnected(streamId: streamId, reason: reason))
     }
 
     public func startRecording(clock: SessionClock,

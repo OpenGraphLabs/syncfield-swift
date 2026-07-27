@@ -136,15 +136,26 @@ public final class TactileBLEClient: NSObject, @unchecked Sendable {
             }
         }
 
-        // Step 2: discover services + characteristics
+        // Step 2: discover services + characteristics. Like connect, discovery
+        // has no CoreBluetooth timeout — and a drop mid-discovery fires
+        // didDisconnectPeripheral without failing it. Bound it (and fail the
+        // continuation from the disconnect delegate) so the acquire loop
+        // retries instead of wedging on a leaked continuation forever.
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Swift.Error>) in
             queue.async {
                 self.servicesCont = cont
                 p.discoverServices([CBUUID(nsuuid: TactileConstants.serviceUUID)])
+                self.queue.asyncAfter(deadline: .now() + 8) {
+                    if let c = self.servicesCont {
+                        self.servicesCont = nil
+                        c.resume(throwing: Error.disconnected("service discovery timeout"))
+                    }
+                }
             }
         }
 
-        // Step 3: read config characteristic → raw manifest JSON
+        // Step 3: read config characteristic → raw manifest JSON. Same
+        // unbounded-wait hazard as step 2; same deadline.
         let configData = try await withCheckedThrowingContinuation {
             (cont: CheckedContinuation<Data, Swift.Error>) in
             queue.async {
@@ -153,6 +164,12 @@ public final class TactileBLEClient: NSObject, @unchecked Sendable {
                 }
                 self.configCont = cont
                 p.readValue(for: char)
+                self.queue.asyncAfter(deadline: .now() + 8) {
+                    if let c = self.configCont {
+                        self.configCont = nil
+                        c.resume(throwing: Error.disconnected("config read timeout"))
+                    }
+                }
             }
         }
 
@@ -248,6 +265,25 @@ public final class TactileBLEClient: NSObject, @unchecked Sendable {
     }
 
     #if canImport(CoreBluetooth)
+    /// Fail any continuation still pending for the in-flight connect/prepare
+    /// sequence. Runs on `queue`. A disconnect (or radio power-off) during
+    /// connectAndPrepare otherwise leaks these continuations — the awaiting
+    /// acquire loop then hangs forever and the glove never recovers.
+    private func failPendingPrepareContinuations(reason: String) {
+        if let c = connectCont {
+            connectCont = nil
+            c.resume(throwing: Error.disconnected(reason))
+        }
+        if let c = servicesCont {
+            servicesCont = nil
+            c.resume(throwing: Error.disconnected(reason))
+        }
+        if let c = configCont {
+            configCont = nil
+            c.resume(throwing: Error.disconnected(reason))
+        }
+    }
+
     private func waitForPoweredOn() async throws {
         // Kick lazy initialisation so the CBCentralManager is created before we poll.
         _ = central
@@ -366,7 +402,32 @@ public struct TactilePeripheralRef: @unchecked Sendable {
 #if canImport(CoreBluetooth)
 extension TactileBLEClient: CBCentralManagerDelegate, CBPeripheralDelegate {
     public func centralManagerDidUpdateState(_ central: CBCentralManager) {
-        // State changes are polled in waitForPoweredOn(); no action needed here.
+        // Initial power-up is handled by waitForPoweredOn()'s poll. This
+        // handler owns mid-session radio transitions, which otherwise leave
+        // continuations leaked (a powered-off radio drops their callbacks
+        // silently) and the reconnect chain dead — a connect() issued while
+        // powered off is discarded, so no didConnect/didFailToConnect ever
+        // revives the chain and `reconnecting` stays true forever.
+        switch central.state {
+        case .poweredOff, .resetting, .unauthorized:
+            if let c = scanCont {
+                scanCont = nil
+                c.resume(throwing: Error.bluetoothUnavailable)
+            }
+            failPendingPrepareContinuations(reason: "bluetooth_off")
+            if autoReconnect, notifyHandler != nil {
+                // Any in-flight chain is dead; clearing the flag lets the
+                // poweredOn branch below restart it cleanly.
+                reconnecting = false
+                onConnectionEvent?(false, "bluetooth_off")
+            }
+        case .poweredOn:
+            if autoReconnect, notifyHandler != nil, !isConnected, !reconnecting {
+                scheduleReconnect(reason: "bluetooth_restored")
+            }
+        default:
+            break
+        }
     }
 
     public func centralManager(_ central: CBCentralManager,
@@ -409,6 +470,11 @@ extension TactileBLEClient: CBCentralManagerDelegate, CBPeripheralDelegate {
                                error: Swift.Error?) {
         sensorChar = nil
         configChar = nil
+        // A drop during connectAndPrepare must fail the pending step (the
+        // delegate callbacks it was waiting on will never fire) so the
+        // acquire loop's catch path retries. No-op in steady state.
+        failPendingPrepareContinuations(
+            reason: error?.localizedDescription ?? "disconnected during prepare")
         // Unexpected drop while we want to stay connected → reconnect; else clean up.
         if autoReconnect {
             scheduleReconnect(reason: error?.localizedDescription ?? "disconnected")

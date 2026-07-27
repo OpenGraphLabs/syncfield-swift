@@ -2,6 +2,18 @@
 
 All notable changes to **syncfield-swift** are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.2] — 2026-07-27
+
+OGLO glove production hardening ahead of the ego+tactile 1,000 h+ collection run. Audit context: the BLE link layer (indefinite auto-reconnect, 3 s notify-stall watchdog, foreground resume) was already solid; what this release fixes is the two remaining wedge paths and the total silence of the acquire loop — an absent glove produced no event at all, so the host UI could not distinguish "searching", "no glove in range", and "Bluetooth off".
+
+### Added
+- **Acquire-loop failure events.** `TactileStream`'s background acquire loop now publishes `streamDisconnected(reason:)` on failure — `scan_timeout`, `bluetooth_unavailable`, `unsupported_schema_<n>`, `connect_failed` (`TactileAcquireFailure`) — deduped by reason change (`TactileAcquireFailureDeduper`) so an absent glove emits once per state, not once per 13.5 s scan cycle. The deduper resets on a successful connect. `wrongSide` stays silent: finding the other glove is normal dual-glove flow, not a failure.
+
+### Fixed
+- **Disconnect during `connectAndPrepare` wedged the glove forever.** Steps 2–3 (service discovery, config-characteristic read) had no timeout, and a drop mid-prepare left their continuations unresumed — the awaiting acquire loop hung permanently and the glove never recovered without a full session teardown. Both steps now carry an 8 s deadline, and `didDisconnectPeripheral` fails any pending prepare continuation so the loop's retry path runs.
+- **Bluetooth off → on killed the reconnect chain permanently.** `centralManagerDidUpdateState` was a no-op: a `connect()` issued while powered off is silently discarded by CoreBluetooth, so no delegate callback ever revived the chain and `reconnecting` stayed true forever (the stall watchdog is also gated on `!reconnecting`, so it couldn't help). Power-off now fails pending scan/prepare continuations, clears the dead chain, and emits a `bluetooth_off` connection event; power-on restarts the reconnect (`bluetooth_restored`).
+- `SyncFieldVersion.current` bumped to `0.12.2`.
+
 ## [0.12.1] — 2026-07-26
 
 First field measurement of 0.12.0 (dual GO 3S drained to death mid-recording) proved detection works — CaptureStopped push delivered with `error_code=7` (low_battery), attribution guard correct in both directions — and exposed two gaps this release closes. Field notes: no `WillShutDown` or `BatteryLow` push preceded the battery-death stop; the camera announced the capture stop and then died silently.
