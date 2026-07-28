@@ -11,18 +11,18 @@ import Foundation
 /// its own manifest entry, and its own timeline alignment downstream — while
 /// sharing the exact same per-sample timestamps as the tactile stream, so the
 /// two stay perfectly aligned.
-public final class WristImuStream: SyncFieldStream, @unchecked Sendable {
+public final class WristImuStream: SyncFieldStream, SyncFieldSegmentRotatableStream, @unchecked Sendable {
     public nonisolated let streamId: String
     public nonisolated let capabilities = StreamCapabilities(
         requiresIngest: false, producesFile: false,
         supportsPreciseTimestamps: true, providesAudioTrack: false)
 
-    private var writer: SensorWriter?
-    private var writerPump: SensorWriterPump?
+    private let rotatingWriter: RotatingSensorWriter
     private var frameCount = 0
 
     public init(streamId: String) {
         self.streamId = streamId
+        self.rotatingWriter = RotatingSensorWriter(label: "syncfield.\(streamId).writer")
     }
 
     public func prepare() async throws {}
@@ -32,18 +32,27 @@ public final class WristImuStream: SyncFieldStream, @unchecked Sendable {
 
     public func startRecording(clock: SessionClock,
                                writerFactory: WriterFactory) async throws {
-        self.writer = try writerFactory.makeSensorWriter(streamId: streamId)
-        self.writerPump = SensorWriterPump(label: "syncfield.\(streamId).writer")
+        try rotatingWriter.start(writerFactory: writerFactory, streamId: streamId)
         self.frameCount = 0
     }
 
     public func stopRecording() async throws -> StreamStopReport {
-        let final = frameCount
-        writerPump?.flush()
-        try await writer?.close()
-        writer = nil
-        writerPump = nil
+        let final = try await rotatingWriter.stop()
         return StreamStopReport(streamId: streamId, frameCount: final, kind: "sensor")
+    }
+
+    public func prepareSegmentRotation(writerFactory: WriterFactory) async throws {
+        try await rotatingWriter.prepare(writerFactory: writerFactory, streamId: streamId)
+    }
+
+    public func commitSegmentRotation() async throws -> StreamStopReport {
+        let n = try await rotatingWriter.commit()
+        frameCount = 0
+        return StreamStopReport(streamId: streamId, frameCount: n, kind: "sensor")
+    }
+
+    public func abortSegmentRotation() async {
+        await rotatingWriter.abortPrepared()
     }
 
     public func ingest(into dir: URL,
@@ -66,11 +75,11 @@ public final class WristImuStream: SyncFieldStream, @unchecked Sendable {
     /// were lost — the pump preserves append order and `stopRecording`'s
     /// `flush()` drains it before close.
     func append(captureNs: UInt64, deviceTimestampNs: UInt64, channels: [String: Int]) {
-        guard let writer = writer, let pump = writerPump else { return }
         let frame = frameCount
         frameCount += 1
         let channelsAny: [String: Any] = channels.mapValues { $0 as Any }
-        pump.append(writer: writer, frame: frame, monotonicNs: captureNs,
-                    channels: channelsAny, deviceTimestampNs: deviceTimestampNs)
+        _ = frame
+        rotatingWriter.append(monotonicNs: captureNs, channels: channelsAny,
+                              deviceTimestampNs: deviceTimestampNs)
     }
 }

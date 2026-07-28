@@ -20,7 +20,7 @@ public struct TactileSampleEvent: Sendable {
     public let channels: [String: Int]
 }
 
-public final class TactileStream: SyncFieldStream, @unchecked Sendable {
+public final class TactileStream: SyncFieldStream, SyncFieldSegmentRotatableStream, @unchecked Sendable {
     public nonisolated let streamId: String
     public nonisolated let capabilities = StreamCapabilities(
         requiresIngest: false, producesFile: false,
@@ -36,8 +36,7 @@ public final class TactileStream: SyncFieldStream, @unchecked Sendable {
     /// the SAME timestamps as the tactile rows. nil → IMU is omitted.
     public weak var wristImuSibling: WristImuStream?
 
-    private var writer: SensorWriter?
-    private var writerPump: SensorWriterPump?
+    private let rotatingWriter: RotatingSensorWriter
     private var clock: SessionClock?
     private var healthBus: HealthBus?
     private var manifest: DeviceManifest?
@@ -59,6 +58,7 @@ public final class TactileStream: SyncFieldStream, @unchecked Sendable {
     public init(streamId: String, side: TactileSide) {
         self.streamId = streamId
         self.side = side
+        self.rotatingWriter = RotatingSensorWriter(label: "syncfield.\(streamId).writer")
     }
 
     /// Attach (or detach with `nil`) a live sample handler. Safe to call at any
@@ -176,18 +176,27 @@ public final class TactileStream: SyncFieldStream, @unchecked Sendable {
     public func startRecording(clock: SessionClock,
                                writerFactory: WriterFactory) async throws {
         self.clock = clock
-        self.writer = try writerFactory.makeSensorWriter(streamId: streamId)
-        self.writerPump = SensorWriterPump(label: "syncfield.\(streamId).writer")
+        try rotatingWriter.start(writerFactory: writerFactory, streamId: streamId)
         self.frameCount = 0
     }
 
     public func stopRecording() async throws -> StreamStopReport {
-        let final = frameCount
-        writerPump?.flush()
-        try await writer?.close()
-        writer = nil
-        writerPump = nil
+        let final = try await rotatingWriter.stop()
         return StreamStopReport(streamId: streamId, frameCount: final, kind: "sensor")
+    }
+
+    public func prepareSegmentRotation(writerFactory: WriterFactory) async throws {
+        try await rotatingWriter.prepare(writerFactory: writerFactory, streamId: streamId)
+    }
+
+    public func commitSegmentRotation() async throws -> StreamStopReport {
+        let n = try await rotatingWriter.commit()
+        frameCount = 0
+        return StreamStopReport(streamId: streamId, frameCount: n, kind: "sensor")
+    }
+
+    public func abortSegmentRotation() async {
+        await rotatingWriter.abortPrepared()
     }
 
     public func ingest(into dir: URL,
@@ -276,11 +285,9 @@ public final class TactileStream: SyncFieldStream, @unchecked Sendable {
                 streamId: streamId, side: side, frame: frame,
                 monotonicNs: captureNs, deviceTimestampNs: deviceTsNs, channels: channels))
         }
-        if let writer = writer, let pump = writerPump {
-            let channelsAny: [String: Any] = channels.mapValues { $0 as Any }
-            pump.append(writer: writer, frame: frame, monotonicNs: captureNs,
-                        channels: channelsAny, deviceTimestampNs: deviceTsNs)
-        }
+        let channelsAny: [String: Any] = channels.mapValues { $0 as Any }
+        rotatingWriter.append(monotonicNs: captureNs, channels: channelsAny,
+                              deviceTimestampNs: deviceTsNs)
     }
 
     /// Wrist-IMU JSONL channel layout: raw 6-axis only (schema_ver 5). The firmware

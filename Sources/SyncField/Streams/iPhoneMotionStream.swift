@@ -4,7 +4,7 @@ import Foundation
 import CoreMotion
 #endif
 
-public final class iPhoneMotionStream: SyncFieldStream, @unchecked Sendable {
+public final class iPhoneMotionStream: SyncFieldStream, SyncFieldSegmentRotatableStream, @unchecked Sendable {
     public nonisolated let streamId: String
     public nonisolated let capabilities = StreamCapabilities(
         requiresIngest: false, producesFile: false, supportsPreciseTimestamps: true)
@@ -12,8 +12,7 @@ public final class iPhoneMotionStream: SyncFieldStream, @unchecked Sendable {
     private let rateHz: Double
     private let queue = DispatchQueue(label: "syncfield.motion", qos: .userInitiated)
 
-    private var writer: SensorWriter?
-    private var writerPump: SensorWriterPump?
+    private let rotatingWriter = RotatingSensorWriter(label: "syncfield.device-motion.writer")
     private var clock: SessionClock?
     private var frameCount = 0
     private var healthBus: HealthBus?
@@ -46,9 +45,7 @@ public final class iPhoneMotionStream: SyncFieldStream, @unchecked Sendable {
 
     public func startRecording(clock: SessionClock,
                                writerFactory: WriterFactory) async throws {
-        let writer = try writerFactory.makeSensorWriter(streamId: streamId)
-        self.writer = writer
-        self.writerPump = SensorWriterPump(label: "syncfield.device-motion.writer")
+        try rotatingWriter.start(writerFactory: writerFactory, streamId: streamId)
         self.clock = clock
         self.frameCount = 0
 
@@ -66,12 +63,22 @@ public final class iPhoneMotionStream: SyncFieldStream, @unchecked Sendable {
         #if os(iOS)
         manager.stopDeviceMotionUpdates()
         #endif
-        writerPump?.flush()
-        try await writer?.close()
-        let n = frameCount
-        writer = nil
-        writerPump = nil
+        let n = try await rotatingWriter.stop()
         return StreamStopReport(streamId: streamId, frameCount: n, kind: "sensor")
+    }
+
+    public func prepareSegmentRotation(writerFactory: WriterFactory) async throws {
+        try await rotatingWriter.prepare(writerFactory: writerFactory, streamId: streamId)
+    }
+
+    public func commitSegmentRotation() async throws -> StreamStopReport {
+        let n = try await rotatingWriter.commit()
+        frameCount = 0
+        return StreamStopReport(streamId: streamId, frameCount: n, kind: "sensor")
+    }
+
+    public func abortSegmentRotation() async {
+        await rotatingWriter.abortPrepared()
     }
 
     public func ingest(into dir: URL,
@@ -87,9 +94,7 @@ public final class iPhoneMotionStream: SyncFieldStream, @unchecked Sendable {
 
     #if os(iOS)
     private func handle(_ motion: CMDeviceMotion) {
-        guard let clock = clock, let writer = writer, let writerPump = writerPump else {
-            return
-        }
+        guard let clock = clock else { return }
         // CMDeviceMotion.timestamp is seconds since device boot (monotonic).
         // Multiply by 1e9 for ns.
         let ns = UInt64(motion.timestamp * 1_000_000_000)
@@ -108,11 +113,7 @@ public final class iPhoneMotionStream: SyncFieldStream, @unchecked Sendable {
             "gravity_y": motion.gravity.y,
             "gravity_z": motion.gravity.z,
         ]
-        writerPump.append(writer: writer,
-                          frame: frame,
-                          monotonicNs: ns,
-                          channels: channels,
-                          deviceTimestampNs: nil)
+        rotatingWriter.append(monotonicNs: ns, channels: channels)
     }
     #endif
 }

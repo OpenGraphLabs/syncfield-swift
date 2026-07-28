@@ -59,7 +59,7 @@ public struct StereoDegradationEvent: Codable, Equatable, Sendable {
 ///   onto `syncQueue`, but never mark truncation themselves, so a whole-session
 ///   stall can't produce a false wide truncation. The watchdog calls
 ///   `markWideDegraded`, which hops the wide-writer teardown onto `syncQueue`.
-public final class MultiCamCameraStream: NSObject, SyncFieldStream, @unchecked Sendable {
+public final class MultiCamCameraStream: NSObject, SyncFieldStream, SyncFieldSegmentRotatableStream, @unchecked Sendable {
     public nonisolated let streamId: String
     public nonisolated let wideStreamId: String
     public nonisolated let capabilities = StreamCapabilities(
@@ -152,6 +152,7 @@ public final class MultiCamCameraStream: NSObject, SyncFieldStream, @unchecked S
     private var wideFrameCount = 0
     private var wideDegraded = false
     private var wideTruncatedAtNs: UInt64?
+    private var completedManifestEntries: [Manifest.StreamEntry]?
     private var stereoDegradationHandler: ((StereoDegradationEvent) -> Void)?
 
     private var healthBus: HealthBus?
@@ -191,6 +192,22 @@ public final class MultiCamCameraStream: NSObject, SyncFieldStream, @unchecked S
     private var wideVideoInput: AVAssetWriterInput?
     private var uwStampWriter: StreamWriter?
     private var wideStampWriter: StreamWriter?
+    private var uwStampPump: StreamWriterPump?
+    private var wideStampPump: StreamWriterPump?
+    private struct PreparedMultiCamBundle {
+        let uwURL: URL
+        let uwWriter: AVAssetWriter
+        let uwVideoInput: AVAssetWriterInput
+        let uwAudioInput: AVAssetWriterInput?
+        let uwStampWriter: StreamWriter
+        let uwStampPump: StreamWriterPump
+        let wideURL: URL
+        let wideWriter: AVAssetWriter
+        let wideVideoInput: AVAssetWriterInput
+        let wideStampWriter: StreamWriter
+        let wideStampPump: StreamWriterPump
+    }
+    private var preparedWriterBundle: PreparedMultiCamBundle?
 
     private var isRecording = false
     private var uwStartPTS: CMTime = .zero
@@ -349,6 +366,10 @@ public final class MultiCamCameraStream: NSObject, SyncFieldStream, @unchecked S
 
     public nonisolated func manifestEntries(report: StreamIngestReport?) -> [Manifest.StreamEntry] {
         stateLock.lock()
+        if report != nil, let completed = completedManifestEntries {
+            stateLock.unlock()
+            return completed
+        }
         let uw = uwFrameCount
         let wide = wideFrameCount
         let degraded = wideDegraded
@@ -407,33 +428,7 @@ public final class MultiCamCameraStream: NSObject, SyncFieldStream, @unchecked S
         // no other code path needs a session clock off the syncQueue — so there
         // is no shared `clock` field for KVO/notification threads to race on.
 
-        // UW writer: video + audio, exactly like iPhoneCameraStream cam_ego.
-        let uwStamp = try writerFactory.makeStreamWriter(streamId: streamId)
-        let uwURL = writerFactory.videoURL(streamId: streamId)
-        try? FileManager.default.removeItem(at: uwURL)
-        let uwW = try AVAssetWriter(outputURL: uwURL, fileType: .mp4)
-        let uwVInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoOutputSettings())
-        uwVInput.expectsMediaDataInRealTime = true
-        uwW.add(uwVInput)
-        let audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioOutputSettings())
-        audioInput.expectsMediaDataInRealTime = true
-        let uwAInput: AVAssetWriterInput? =
-            uwW.canAdd(audioInput) ? { uwW.add(audioInput); return audioInput }() : nil
-        guard uwW.startWriting() else {
-            throw startWritingError(writer: uwW, streamId: streamId)
-        }
-
-        // Wide writer: video only (no audio track on cam_ego_wide).
-        let wideStamp = try writerFactory.makeStreamWriter(streamId: wideStreamId)
-        let wideURL = writerFactory.videoURL(streamId: wideStreamId)
-        try? FileManager.default.removeItem(at: wideURL)
-        let wideW = try AVAssetWriter(outputURL: wideURL, fileType: .mp4)
-        let wideVInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoOutputSettings())
-        wideVInput.expectsMediaDataInRealTime = true
-        wideW.add(wideVInput)
-        guard wideW.startWriting() else {
-            throw startWritingError(writer: wideW, streamId: wideStreamId)
-        }
+        let bundle = try makeWriterBundle(writerFactory: writerFactory)
 
         // Publish recording state on syncQueue so the synchronizer delegate
         // and watchdog (which run there) observe a fully-formed setup.
@@ -441,13 +436,15 @@ public final class MultiCamCameraStream: NSObject, SyncFieldStream, @unchecked S
             self.resetCountersForNewRecording()
             self.uwStartPTS = .zero
             self.wideStartPTS = .zero
-            self.uwWriter = uwW
-            self.uwVideoInput = uwVInput
-            self.uwAudioInput = uwAInput
-            self.uwStampWriter = uwStamp
-            self.wideWriter = wideW
-            self.wideVideoInput = wideVInput
-            self.wideStampWriter = wideStamp
+            self.uwWriter = bundle.uwWriter
+            self.uwVideoInput = bundle.uwVideoInput
+            self.uwAudioInput = bundle.uwAudioInput
+            self.uwStampWriter = bundle.uwStampWriter
+            self.uwStampPump = bundle.uwStampPump
+            self.wideWriter = bundle.wideWriter
+            self.wideVideoInput = bundle.wideVideoInput
+            self.wideStampWriter = bundle.wideStampWriter
+            self.wideStampPump = bundle.wideStampPump
             self.lastWideCaptureNs = 0
             self.pendingWideDegradeReasonHint = nil
             let now = CFAbsoluteTimeGetCurrent()
@@ -456,6 +453,84 @@ public final class MultiCamCameraStream: NSObject, SyncFieldStream, @unchecked S
             self.isRecording = true
             self.startWideWatchdogOnSyncQueue()
         }
+        #endif
+    }
+
+    public func prepareSegmentRotation(writerFactory: WriterFactory) async throws {
+        #if os(iOS) && canImport(AVFoundation)
+        let bundle = try makeWriterBundle(writerFactory: writerFactory)
+        var accepted = false
+        syncQueue.sync {
+            if self.isRecording && self.preparedWriterBundle == nil {
+                self.preparedWriterBundle = bundle
+                accepted = true
+            }
+        }
+        if !accepted {
+            await discardBundle(bundle)
+            throw NSError(domain: "SyncField.SegmentRotation", code: -5,
+                          userInfo: [NSLocalizedDescriptionKey: "multicam is not ready to rotate"])
+        }
+        #else
+        _ = writerFactory
+        #endif
+    }
+
+    public func commitSegmentRotation() async throws -> StreamStopReport {
+        #if os(iOS) && canImport(AVFoundation)
+        var old: PreparedMultiCamBundle?
+        var oldCount = 0
+        syncQueue.sync {
+            guard self.isRecording, let next = self.preparedWriterBundle,
+                  let uwW = self.uwWriter, let uwV = self.uwVideoInput,
+                  let uwStamp = self.uwStampWriter, let uwPump = self.uwStampPump,
+                  let wideW = self.wideWriter, let wideV = self.wideVideoInput,
+                  let wideStamp = self.wideStampWriter,
+                  let widePump = self.wideStampPump else { return }
+            old = PreparedMultiCamBundle(
+                uwURL: uwW.outputURL, uwWriter: uwW, uwVideoInput: uwV,
+                uwAudioInput: self.uwAudioInput, uwStampWriter: uwStamp,
+                uwStampPump: uwPump,
+                wideURL: wideW.outputURL, wideWriter: wideW,
+                wideVideoInput: wideV, wideStampWriter: wideStamp,
+                wideStampPump: widePump)
+            oldCount = self.peekUWFrameCount()
+            self.captureCompletedManifestSnapshot()
+            self.uwWriter = next.uwWriter
+            self.uwVideoInput = next.uwVideoInput
+            self.uwAudioInput = next.uwAudioInput
+            self.uwStampWriter = next.uwStampWriter
+            self.uwStampPump = next.uwStampPump
+            self.wideWriter = next.wideWriter
+            self.wideVideoInput = next.wideVideoInput
+            self.wideStampWriter = next.wideStampWriter
+            self.wideStampPump = next.wideStampPump
+            self.preparedWriterBundle = nil
+            self.uwStartPTS = .zero
+            self.wideStartPTS = .zero
+            self.lastWideCaptureNs = 0
+            self.pendingWideDegradeReasonHint = nil
+            self.resetCountersForNewRecording()
+        }
+        guard let old else {
+            throw NSError(domain: "SyncField.SegmentRotation", code: -6,
+                          userInfo: [NSLocalizedDescriptionKey: "multicam rotation was not prepared"])
+        }
+        try await finishBundle(old)
+        return StreamStopReport(streamId: streamId, frameCount: oldCount, kind: "video")
+        #else
+        return StreamStopReport(streamId: streamId, frameCount: 0, kind: "video")
+        #endif
+    }
+
+    public func abortSegmentRotation() async {
+        #if os(iOS) && canImport(AVFoundation)
+        var staged: PreparedMultiCamBundle?
+        syncQueue.sync {
+            staged = self.preparedWriterBundle
+            self.preparedWriterBundle = nil
+        }
+        if let staged { await discardBundle(staged) }
         #endif
     }
 
@@ -468,6 +543,9 @@ public final class MultiCamCameraStream: NSObject, SyncFieldStream, @unchecked S
         var wideVInput: AVAssetWriterInput?
         var uwStamp: StreamWriter?
         var wideStamp: StreamWriter?
+        var uwPump: StreamWriterPump?
+        var widePump: StreamWriterPump?
+        var staged: PreparedMultiCamBundle?
         var uwCount = 0
 
         // Flip isRecording off and transfer ownership of every writer out of
@@ -478,15 +556,19 @@ public final class MultiCamCameraStream: NSObject, SyncFieldStream, @unchecked S
             uwW = self.uwWriter; uwVInput = self.uwVideoInput; uwAInput = self.uwAudioInput
             wideW = self.wideWriter; wideVInput = self.wideVideoInput
             uwStamp = self.uwStampWriter; wideStamp = self.wideStampWriter
+            uwPump = self.uwStampPump; widePump = self.wideStampPump
             self.uwWriter = nil; self.uwVideoInput = nil; self.uwAudioInput = nil
             self.wideWriter = nil; self.wideVideoInput = nil
             self.uwStampWriter = nil; self.wideStampWriter = nil
+            self.uwStampPump = nil; self.wideStampPump = nil
+            staged = self.preparedWriterBundle; self.preparedWriterBundle = nil
             self.wideWatchdog?.cancel(); self.wideWatchdog = nil
             self.stateLock.lock()
             uwCount = self.uwFrameCount
             self.stateLock.unlock()
         }
         processorGate.drain()
+        if let staged { await discardBundle(staged) }
 
         uwAInput?.markAsFinished()
         uwVInput?.markAsFinished()
@@ -507,8 +589,11 @@ public final class MultiCamCameraStream: NSObject, SyncFieldStream, @unchecked S
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
             wideFinalizeGroup.notify(queue: syncQueue) { cont.resume() }
         }
+        uwPump?.flush()
+        widePump?.flush()
         try await uwStamp?.close()
         try await wideStamp?.close()
+        captureCompletedManifestSnapshot()
 
         return StreamStopReport(streamId: streamId, frameCount: uwCount, kind: "video")
         #else
@@ -558,6 +643,28 @@ public final class MultiCamCameraStream: NSObject, SyncFieldStream, @unchecked S
         wideFrameCount = 0
         wideDegraded = false
         wideTruncatedAtNs = nil
+        stateLock.unlock()
+    }
+
+    private func captureCompletedManifestSnapshot() {
+        stateLock.lock()
+        let uw = uwFrameCount
+        let wide = wideFrameCount
+        let degraded = wideDegraded
+        let truncatedAtNs = wideTruncatedAtNs
+        completedManifestEntries = [
+            Manifest.StreamEntry(
+                streamId: streamId,
+                filePath: SessionOrchestrator.defaultFilePath(streamId: streamId, kind: "video"),
+                frameCount: uw, kind: "video", capabilities: Self.uwCapabilities,
+                syncGroupId: streamId),
+            Manifest.StreamEntry(
+                streamId: wideStreamId,
+                filePath: SessionOrchestrator.defaultFilePath(streamId: wideStreamId, kind: "video"),
+                frameCount: wide, kind: "video", capabilities: Self.wideCapabilities,
+                syncGroupId: streamId, status: degraded ? "truncated" : nil,
+                truncatedAtNs: degraded ? truncatedAtNs : nil),
+        ]
         stateLock.unlock()
     }
 
@@ -771,6 +878,83 @@ extension MultiCamCameraStream {
         ]
     }
 
+    private func makeWriterBundle(writerFactory: WriterFactory) throws -> PreparedMultiCamBundle {
+        let uwStamp = try writerFactory.makeStreamWriter(streamId: streamId)
+        let uwURL = writerFactory.videoURL(streamId: streamId)
+        try? FileManager.default.removeItem(at: uwURL)
+        let uwW = try AVAssetWriter(outputURL: uwURL, fileType: .mp4)
+        uwW.movieFragmentInterval = CMTime(seconds: 10, preferredTimescale: 600)
+        let uwV = AVAssetWriterInput(mediaType: .video, outputSettings: videoOutputSettings())
+        uwV.expectsMediaDataInRealTime = true
+        uwW.add(uwV)
+        let audioCandidate = AVAssetWriterInput(
+            mediaType: .audio, outputSettings: audioOutputSettings())
+        audioCandidate.expectsMediaDataInRealTime = true
+        let uwA: AVAssetWriterInput? = uwW.canAdd(audioCandidate)
+            ? { uwW.add(audioCandidate); return audioCandidate }() : nil
+        guard uwW.startWriting() else {
+            throw startWritingError(writer: uwW, streamId: streamId)
+        }
+
+        let wideStamp = try writerFactory.makeStreamWriter(streamId: wideStreamId)
+        let wideURL = writerFactory.videoURL(streamId: wideStreamId)
+        try? FileManager.default.removeItem(at: wideURL)
+        let wideW = try AVAssetWriter(outputURL: wideURL, fileType: .mp4)
+        wideW.movieFragmentInterval = CMTime(seconds: 10, preferredTimescale: 600)
+        let wideV = AVAssetWriterInput(mediaType: .video, outputSettings: videoOutputSettings())
+        wideV.expectsMediaDataInRealTime = true
+        wideW.add(wideV)
+        guard wideW.startWriting() else {
+            uwW.cancelWriting()
+            throw startWritingError(writer: wideW, streamId: wideStreamId)
+        }
+        return PreparedMultiCamBundle(
+            uwURL: uwURL, uwWriter: uwW, uwVideoInput: uwV,
+            uwAudioInput: uwA, uwStampWriter: uwStamp,
+            uwStampPump: StreamWriterPump(
+                label: "SyncField.multicam.uw.timestamps.\(UUID().uuidString)"),
+            wideURL: wideURL, wideWriter: wideW, wideVideoInput: wideV,
+            wideStampWriter: wideStamp,
+            wideStampPump: StreamWriterPump(
+                label: "SyncField.multicam.wide.timestamps.\(UUID().uuidString)"))
+    }
+
+    private func finishBundle(_ bundle: PreparedMultiCamBundle) async throws {
+        bundle.uwAudioInput?.markAsFinished()
+        bundle.uwVideoInput.markAsFinished()
+        bundle.wideVideoInput.markAsFinished()
+        if bundle.uwWriter.status == .writing {
+            await withCheckedContinuation { cont in
+                bundle.uwWriter.finishWriting { cont.resume() }
+            }
+        }
+        if bundle.wideWriter.status == .writing {
+            await withCheckedContinuation { cont in
+                bundle.wideWriter.finishWriting { cont.resume() }
+            }
+        }
+        bundle.uwStampPump.flush()
+        bundle.wideStampPump.flush()
+        try await bundle.uwStampWriter.close()
+        try await bundle.wideStampWriter.close()
+        if bundle.uwWriter.status == .failed || bundle.wideWriter.status == .failed {
+            throw bundle.uwWriter.error ?? bundle.wideWriter.error ?? NSError(
+                domain: "SyncField.MultiCam", code: -7,
+                userInfo: [NSLocalizedDescriptionKey: "multicam writer finish failed"])
+        }
+    }
+
+    private func discardBundle(_ bundle: PreparedMultiCamBundle) async {
+        bundle.uwWriter.cancelWriting()
+        bundle.wideWriter.cancelWriting()
+        bundle.uwStampPump.flush()
+        bundle.wideStampPump.flush()
+        try? await bundle.uwStampWriter.close()
+        try? await bundle.wideStampWriter.close()
+        try? FileManager.default.removeItem(at: bundle.uwURL)
+        try? FileManager.default.removeItem(at: bundle.wideURL)
+    }
+
     private func addFailure(_ reason: String) -> StreamError {
         StreamError(streamId: streamId,
                     underlying: NSError(domain: "SyncField.MultiCam", code: -2,
@@ -915,9 +1099,11 @@ extension MultiCamCameraStream {
             guard let writer = self.wideWriter else { return }  // already finalized
             let input = self.wideVideoInput
             let stamp = self.wideStampWriter
+            let pump = self.wideStampPump
             self.wideWriter = nil
             self.wideVideoInput = nil
             self.wideStampWriter = nil
+            self.wideStampPump = nil
             input?.markAsFinished()
             if writer.status == .writing {
                 // Track completion so stopRecording can await it (fix 2): the
@@ -928,6 +1114,7 @@ extension MultiCamCameraStream {
                 }
             }
             if let stamp {
+                pump?.flush()
                 Task { try? await stamp.close() }
             }
         }
@@ -990,9 +1177,10 @@ extension MultiCamCameraStream: AVCaptureDataOutputSynchronizerDelegate {
             ptsSeconds: CMTimeGetSeconds(pts),
             exposureSeconds: uwDevice?.exposureDuration.seconds ?? 0)
         let frame = nextUWFrameIndex()
-        let w = uwStampWriter
-        Task {
-            try? await w?.append(frame: frame, monotonicNs: stamp.captureNs, uncertaintyNs: 1_000_000)
+        if let w = uwStampWriter, let pump = uwStampPump {
+            pump.append(
+                writer: w, frame: frame,
+                monotonicNs: stamp.captureNs, uncertaintyNs: 1_000_000)
         }
     }
 
@@ -1022,9 +1210,10 @@ extension MultiCamCameraStream: AVCaptureDataOutputSynchronizerDelegate {
         // at a real cam_ego_wide.timestamps.jsonl line (syncQueue-confined).
         lastWideCaptureNs = stamp.captureNs
         let frame = nextWideFrameIndex()
-        let w = wideStampWriter
-        Task {
-            try? await w?.append(frame: frame, monotonicNs: stamp.captureNs, uncertaintyNs: 1_000_000)
+        if let w = wideStampWriter, let pump = wideStampPump {
+            pump.append(
+                writer: w, frame: frame,
+                monotonicNs: stamp.captureNs, uncertaintyNs: 1_000_000)
         }
     }
 
@@ -1035,9 +1224,14 @@ extension MultiCamCameraStream: AVCaptureDataOutputSynchronizerDelegate {
         guard isRecording,
               let writer = uwWriter,
               writer.status == .writing,
-              uwStartPTS != .zero,
-              let audioInput = uwAudioInput,
-              audioInput.isReadyForMoreMediaData else { return }
+              let audioInput = uwAudioInput else { return }
+        if uwStartPTS == .zero {
+            let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+            guard writer.status == .writing else { return }
+            uwStartPTS = pts
+            writer.startSession(atSourceTime: pts)
+        }
+        guard audioInput.isReadyForMoreMediaData else { return }
         audioInput.append(sampleBuffer)
     }
 }

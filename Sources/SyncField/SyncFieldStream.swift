@@ -120,3 +120,14 @@ public protocol SyncFieldManualStopRecoveryStream: SyncFieldStream {
         reason: String
     ) async throws -> StreamStopReport
 }
+
+/// Optional two-phase contract for streams that can rotate their on-disk
+/// writer without stopping the underlying capture/transport. Two phases are
+/// deliberate: SessionOrchestrator prepares every stream first, and only
+/// commits after all writers opened successfully. A disk/encoder failure can
+/// therefore never leave half the modalities in the next episode directory.
+public protocol SyncFieldSegmentRotatableStream: SyncFieldStream {
+    func prepareSegmentRotation(writerFactory: WriterFactory) async throws
+    func commitSegmentRotation() async throws -> StreamStopReport
+    func abortSegmentRotation() async
+}

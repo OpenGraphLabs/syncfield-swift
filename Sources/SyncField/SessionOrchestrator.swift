@@ -296,6 +296,124 @@ public actor SessionOrchestrator {
         return anchor
     }
 
+    /// Seal the current episode directory and atomically move all continuous
+    /// local streams onto a fresh directory without stopping capture hardware,
+    /// CoreMotion, BLE subscriptions, or playing synchronization chirps.
+    ///
+    /// Only sessions whose every stream implements the two-phase rotation
+    /// contract are eligible. External-camera streams intentionally do not,
+    /// making wrist setups fail closed instead of silently producing
+    /// cross-clock chunks.
+    public func rotateRecordingSegment() async throws -> SegmentRotationReport {
+        guard state == .recording else {
+            throw SessionError.invalidTransition(from: state, to: .recording)
+        }
+        let rotatables = streams.compactMap { $0 as? any SyncFieldSegmentRotatableStream }
+        guard rotatables.count == streams.count else {
+            let unsupported = streams
+                .filter { !($0 is any SyncFieldSegmentRotatableStream) }
+                .map(\.streamId).joined(separator: ",")
+            throw NSError(
+                domain: "SyncField.SegmentRotation", code: -20,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "segment rotation unsupported by stream(s): \(unsupported)"])
+        }
+
+        let sealedDirectory = episodeDirectory
+        let nextDirectory = try makeEpisodeDirectory()
+        let nextFactory = WriterFactory(episodeDirectory: nextDirectory)
+
+        var prepareError: Error?
+        await withTaskGroup(of: Error?.self) { group in
+            for stream in rotatables {
+                group.addTask { [stream] in
+                    do {
+                        try await stream.prepareSegmentRotation(writerFactory: nextFactory)
+                        return nil
+                    } catch {
+                        return StreamError(streamId: stream.streamId, underlying: error)
+                    }
+                }
+            }
+            for await error in group {
+                if let error, prepareError == nil { prepareError = error }
+            }
+        }
+        if let prepareError {
+            await withTaskGroup(of: Void.self) { group in
+                for stream in rotatables {
+                    group.addTask { [stream] in await stream.abortSegmentRotation() }
+                }
+            }
+            try? FileManager.default.removeItem(at: nextDirectory)
+            throw prepareError
+        }
+
+        let boundaryNs = activeClock?.nowMonotonicNs() ?? DispatchTime.now().uptimeNanoseconds
+        var reportsById: [String: StreamStopReport] = [:]
+        var commitError: Error?
+        await withTaskGroup(of: (StreamStopReport?, Error?).self) { group in
+            for stream in rotatables {
+                group.addTask { [stream] in
+                    do {
+                        return (try await stream.commitSegmentRotation(), nil)
+                    } catch {
+                        return (nil, StreamError(streamId: stream.streamId, underlying: error))
+                    }
+                }
+            }
+            for await (report, error) in group {
+                if let report { reportsById[report.streamId] = report }
+                if let error, commitError == nil { commitError = error }
+            }
+        }
+
+        let orderedReports = streams.compactMap { reportsById[$0.streamId] }
+        try? writeManifest(from: orderedReports, to: sealedDirectory)
+
+        // Bound hand-quality state to the same raw segment. A state interval
+        // crossing the storage boundary is deliberately closed/truncated and
+        // may reopen in the next segment; session-level semantic clipping uses
+        // the global offsets to join context later.
+        if let monitor = handQualityMonitor {
+            let stats = await monitor.qualityStats(
+                recordingStartMonotonicNs: recordingStartMonotonicNs,
+                stopMonotonicNs: boundaryNs)
+            lastHandQualityStats = stats
+            await monitor.finalize(stopMonotonicNs: boundaryNs, stopFrame: -1)
+            let summary = HandQualitySummaryBuilder.build(stats: stats, config: handQualityConfig)
+            try? HandQualitySummaryBuilder.write(
+                summary, to: sealedDirectory.appendingPathComponent("hand_quality.json"))
+        }
+
+        if let writer = logWriter {
+            try? await writer.append(kind: "state", detail: "recording->segment-sealed")
+            try? await writer.close()
+        }
+
+        episodeDirectory = nextDirectory
+        let anchor = (activeClock ?? SessionClock()).anchor(hostId: hostId)
+        currentSyncPoint = anchor
+        try writeSyncPoint(anchor, to: nextDirectory)
+        logWriter = try SessionLogWriter(
+            url: nextDirectory.appendingPathComponent("session.log"))
+        try? await logWriter?.append(kind: "state", detail: "segment-opened->recording")
+        let nextEventWriter = nextFactory.makeEventWriter()
+        eventWriter = nextEventWriter
+        recordingStartMonotonicNs = boundaryNs
+        handQualityMonitor = HandQualityMonitor(
+            config: handQualityConfig,
+            recordingStartMonotonicNs: boundaryNs,
+            eventWriter: nextEventWriter)
+
+        if let commitError { throw commitError }
+        return SegmentRotationReport(
+            sealedEpisodeDirectory: sealedDirectory,
+            nextEpisodeDirectory: nextDirectory,
+            boundaryMonotonicNs: boundaryNs,
+            streamReports: orderedReports)
+    }
+
     public func stopRecording() async throws -> StopReport {
         let isRetryingStop: Bool
         switch state {
@@ -804,11 +922,11 @@ public actor SessionOrchestrator {
         return dir
     }
 
-    private func writeSyncPoint(_ sp: SyncPoint) throws {
+    private func writeSyncPoint(_ sp: SyncPoint, to directory: URL? = nil) throws {
         let enc = JSONEncoder()
         enc.outputFormatting = [.prettyPrinted, .sortedKeys]
         try enc.encode(sp).write(
-            to: episodeDirectory.appendingPathComponent("sync_point.json"),
+            to: (directory ?? episodeDirectory).appendingPathComponent("sync_point.json"),
             options: [.atomic])
     }
 
@@ -825,6 +943,24 @@ public actor SessionOrchestrator {
         try ManifestWriter.write(
             manifest,
             to: episodeDirectory.appendingPathComponent("manifest.json"))
+    }
+
+    private func writeManifest(from reports: [StreamStopReport], to directory: URL) throws {
+        let byId = Dictionary(uniqueKeysWithValues: reports.map { ($0.streamId, $0) })
+        let entries = streams.flatMap { stream -> [Manifest.StreamEntry] in
+            let report = byId[stream.streamId]
+            let ingest = report.map {
+                StreamIngestReport(
+                    streamId: $0.streamId,
+                    filePath: Self.defaultFilePath(streamId: $0.streamId, kind: $0.kind),
+                    frameCount: $0.frameCount)
+            }
+            return stream.manifestEntries(report: ingest)
+        }
+        let manifest = Manifest(
+            sdkVersion: SyncFieldVersion.current, hostId: hostId,
+            role: "single", streams: entries)
+        try ManifestWriter.write(manifest, to: directory.appendingPathComponent("manifest.json"))
     }
 
     /// Default file name for a stream's manifest entry when its ingest/stop
@@ -893,6 +1029,13 @@ extension SessionOrchestrator {
 }
 
 public struct StopReport: Sendable {
+    public let streamReports: [StreamStopReport]
+}
+
+public struct SegmentRotationReport: Sendable {
+    public let sealedEpisodeDirectory: URL
+    public let nextEpisodeDirectory: URL
+    public let boundaryMonotonicNs: UInt64
     public let streamReports: [StreamStopReport]
 }
 

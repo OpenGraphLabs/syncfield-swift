@@ -11,14 +11,13 @@ private func makeRawIMUOperationQueue(name: String) -> OperationQueue {
     return queue
 }
 
-public final class iPhoneRawAccelStream: SyncFieldStream, @unchecked Sendable {
+public final class iPhoneRawAccelStream: SyncFieldStream, SyncFieldSegmentRotatableStream, @unchecked Sendable {
     public nonisolated let streamId: String
     public nonisolated let capabilities = StreamCapabilities(
         requiresIngest: false, producesFile: false, supportsPreciseTimestamps: true)
 
     private let rateHz: Double
-    private var writer: SensorWriter?
-    private var writerPump: SensorWriterPump?
+    private let rotatingWriter = RotatingSensorWriter(label: "syncfield.raw-accel.writer")
     private var opQueue: OperationQueue?
     private var frameCount = 0
     private var healthBus: HealthBus?
@@ -51,9 +50,7 @@ public final class iPhoneRawAccelStream: SyncFieldStream, @unchecked Sendable {
 
     public func startRecording(clock: SessionClock,
                                writerFactory: WriterFactory) async throws {
-        let writer = try writerFactory.makeSensorWriter(streamId: streamId)
-        self.writer = writer
-        self.writerPump = SensorWriterPump(label: "syncfield.raw-accel.writer")
+        try rotatingWriter.start(writerFactory: writerFactory, streamId: streamId)
         self.frameCount = 0
         _ = clock
 
@@ -73,14 +70,19 @@ public final class iPhoneRawAccelStream: SyncFieldStream, @unchecked Sendable {
         manager.stopAccelerometerUpdates()
         opQueue?.waitUntilAllOperationsAreFinished()
         #endif
-        writerPump?.flush()
-        try await writer?.close()
-        let n = frameCount
-        writer = nil
-        writerPump = nil
+        let n = try await rotatingWriter.stop()
         opQueue = nil
         return StreamStopReport(streamId: streamId, frameCount: n, kind: "sensor")
     }
+
+    public func prepareSegmentRotation(writerFactory: WriterFactory) async throws {
+        try await rotatingWriter.prepare(writerFactory: writerFactory, streamId: streamId)
+    }
+    public func commitSegmentRotation() async throws -> StreamStopReport {
+        let n = try await rotatingWriter.commit(); frameCount = 0
+        return StreamStopReport(streamId: streamId, frameCount: n, kind: "sensor")
+    }
+    public func abortSegmentRotation() async { await rotatingWriter.abortPrepared() }
 
     public func ingest(into dir: URL,
                        progress: @Sendable (Double) -> Void) async throws -> StreamIngestReport {
@@ -95,7 +97,6 @@ public final class iPhoneRawAccelStream: SyncFieldStream, @unchecked Sendable {
 
     #if os(iOS)
     private func handle(_ data: CMAccelerometerData) {
-        guard let writer = writer, let writerPump = writerPump else { return }
         let ns = UInt64(data.timestamp * 1_000_000_000)
         let frame = frameCount
         frameCount += 1
@@ -104,22 +105,19 @@ public final class iPhoneRawAccelStream: SyncFieldStream, @unchecked Sendable {
             "accel_y": data.acceleration.y,
             "accel_z": data.acceleration.z,
         ]
-        writerPump.append(writer: writer,
-                          frame: frame,
-                          monotonicNs: ns,
-                          channels: channels)
+        _ = frame
+        rotatingWriter.append(monotonicNs: ns, channels: channels)
     }
     #endif
 }
 
-public final class iPhoneRawGyroStream: SyncFieldStream, @unchecked Sendable {
+public final class iPhoneRawGyroStream: SyncFieldStream, SyncFieldSegmentRotatableStream, @unchecked Sendable {
     public nonisolated let streamId: String
     public nonisolated let capabilities = StreamCapabilities(
         requiresIngest: false, producesFile: false, supportsPreciseTimestamps: true)
 
     private let rateHz: Double
-    private var writer: SensorWriter?
-    private var writerPump: SensorWriterPump?
+    private let rotatingWriter = RotatingSensorWriter(label: "syncfield.raw-gyro.writer")
     private var opQueue: OperationQueue?
     private var frameCount = 0
     private var healthBus: HealthBus?
@@ -152,9 +150,7 @@ public final class iPhoneRawGyroStream: SyncFieldStream, @unchecked Sendable {
 
     public func startRecording(clock: SessionClock,
                                writerFactory: WriterFactory) async throws {
-        let writer = try writerFactory.makeSensorWriter(streamId: streamId)
-        self.writer = writer
-        self.writerPump = SensorWriterPump(label: "syncfield.raw-gyro.writer")
+        try rotatingWriter.start(writerFactory: writerFactory, streamId: streamId)
         self.frameCount = 0
         _ = clock
 
@@ -174,14 +170,19 @@ public final class iPhoneRawGyroStream: SyncFieldStream, @unchecked Sendable {
         manager.stopGyroUpdates()
         opQueue?.waitUntilAllOperationsAreFinished()
         #endif
-        writerPump?.flush()
-        try await writer?.close()
-        let n = frameCount
-        writer = nil
-        writerPump = nil
+        let n = try await rotatingWriter.stop()
         opQueue = nil
         return StreamStopReport(streamId: streamId, frameCount: n, kind: "sensor")
     }
+
+    public func prepareSegmentRotation(writerFactory: WriterFactory) async throws {
+        try await rotatingWriter.prepare(writerFactory: writerFactory, streamId: streamId)
+    }
+    public func commitSegmentRotation() async throws -> StreamStopReport {
+        let n = try await rotatingWriter.commit(); frameCount = 0
+        return StreamStopReport(streamId: streamId, frameCount: n, kind: "sensor")
+    }
+    public func abortSegmentRotation() async { await rotatingWriter.abortPrepared() }
 
     public func ingest(into dir: URL,
                        progress: @Sendable (Double) -> Void) async throws -> StreamIngestReport {
@@ -196,7 +197,6 @@ public final class iPhoneRawGyroStream: SyncFieldStream, @unchecked Sendable {
 
     #if os(iOS)
     private func handle(_ data: CMGyroData) {
-        guard let writer = writer, let writerPump = writerPump else { return }
         let ns = UInt64(data.timestamp * 1_000_000_000)
         let frame = frameCount
         frameCount += 1
@@ -205,22 +205,19 @@ public final class iPhoneRawGyroStream: SyncFieldStream, @unchecked Sendable {
             "gyro_y": data.rotationRate.y,
             "gyro_z": data.rotationRate.z,
         ]
-        writerPump.append(writer: writer,
-                          frame: frame,
-                          monotonicNs: ns,
-                          channels: channels)
+        _ = frame
+        rotatingWriter.append(monotonicNs: ns, channels: channels)
     }
     #endif
 }
 
-public final class iPhoneRawMagStream: SyncFieldStream, @unchecked Sendable {
+public final class iPhoneRawMagStream: SyncFieldStream, SyncFieldSegmentRotatableStream, @unchecked Sendable {
     public nonisolated let streamId: String
     public nonisolated let capabilities = StreamCapabilities(
         requiresIngest: false, producesFile: false, supportsPreciseTimestamps: true)
 
     private let rateHz: Double
-    private var writer: SensorWriter?
-    private var writerPump: SensorWriterPump?
+    private let rotatingWriter = RotatingSensorWriter(label: "syncfield.raw-mag.writer")
     private var opQueue: OperationQueue?
     private var frameCount = 0
     private var healthBus: HealthBus?
@@ -253,9 +250,7 @@ public final class iPhoneRawMagStream: SyncFieldStream, @unchecked Sendable {
 
     public func startRecording(clock: SessionClock,
                                writerFactory: WriterFactory) async throws {
-        let writer = try writerFactory.makeSensorWriter(streamId: streamId)
-        self.writer = writer
-        self.writerPump = SensorWriterPump(label: "syncfield.raw-mag.writer")
+        try rotatingWriter.start(writerFactory: writerFactory, streamId: streamId)
         self.frameCount = 0
         _ = clock
 
@@ -275,14 +270,19 @@ public final class iPhoneRawMagStream: SyncFieldStream, @unchecked Sendable {
         manager.stopMagnetometerUpdates()
         opQueue?.waitUntilAllOperationsAreFinished()
         #endif
-        writerPump?.flush()
-        try await writer?.close()
-        let n = frameCount
-        writer = nil
-        writerPump = nil
+        let n = try await rotatingWriter.stop()
         opQueue = nil
         return StreamStopReport(streamId: streamId, frameCount: n, kind: "sensor")
     }
+
+    public func prepareSegmentRotation(writerFactory: WriterFactory) async throws {
+        try await rotatingWriter.prepare(writerFactory: writerFactory, streamId: streamId)
+    }
+    public func commitSegmentRotation() async throws -> StreamStopReport {
+        let n = try await rotatingWriter.commit(); frameCount = 0
+        return StreamStopReport(streamId: streamId, frameCount: n, kind: "sensor")
+    }
+    public func abortSegmentRotation() async { await rotatingWriter.abortPrepared() }
 
     public func ingest(into dir: URL,
                        progress: @Sendable (Double) -> Void) async throws -> StreamIngestReport {
@@ -297,7 +297,6 @@ public final class iPhoneRawMagStream: SyncFieldStream, @unchecked Sendable {
 
     #if os(iOS)
     private func handle(_ data: CMMagnetometerData) {
-        guard let writer = writer, let writerPump = writerPump else { return }
         let ns = UInt64(data.timestamp * 1_000_000_000)
         let frame = frameCount
         frameCount += 1
@@ -306,10 +305,8 @@ public final class iPhoneRawMagStream: SyncFieldStream, @unchecked Sendable {
             "mag_y": data.magneticField.y,
             "mag_z": data.magneticField.z,
         ]
-        writerPump.append(writer: writer,
-                          frame: frame,
-                          monotonicNs: ns,
-                          channels: channels)
+        _ = frame
+        rotatingWriter.append(monotonicNs: ns, channels: channels)
     }
     #endif
 }

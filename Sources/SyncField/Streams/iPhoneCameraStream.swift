@@ -116,7 +116,7 @@ public struct VideoSettings: Sendable {
     public static let uhd4K = VideoSettings(width: 3840, height: 2160, fps: 30)
 }
 
-public final class iPhoneCameraStream: NSObject, SyncFieldStream, AudioReattachableStream, @unchecked Sendable {
+public final class iPhoneCameraStream: NSObject, SyncFieldStream, AudioReattachableStream, SyncFieldSegmentRotatableStream, @unchecked Sendable {
     public nonisolated let streamId: String
     public nonisolated let capabilities = StreamCapabilities(
         requiresIngest: false, producesFile: true,
@@ -143,9 +143,19 @@ public final class iPhoneCameraStream: NSObject, SyncFieldStream, AudioReattacha
     private var assetWriter: AVAssetWriter?
     private var assetWriterInput: AVAssetWriterInput?
     private var assetWriterAudioInput: AVAssetWriterInput?
+    private struct PreparedWriterBundle {
+        let url: URL
+        let writer: AVAssetWriter
+        let videoInput: AVAssetWriterInput
+        let audioInput: AVAssetWriterInput?
+        let stampWriter: StreamWriter
+        let stampPump: StreamWriterPump
+    }
+    private var preparedWriterBundle: PreparedWriterBundle?
     private var isRecording = false
 
     private var stampWriter: StreamWriter?
+    private var stampPump: StreamWriterPump?
     private var clock: SessionClock?
     private var frameCount = 0
     private var startPTS: CMTime = .zero
@@ -460,50 +470,7 @@ public final class iPhoneCameraStream: NSObject, SyncFieldStream, AudioReattacha
         disableGeometricDistortionCorrection()
 
         self.clock = clock
-        self.stampWriter = try writerFactory.makeStreamWriter(streamId: streamId)
-
-        let url = writerFactory.videoURL(streamId: streamId)
-        try? FileManager.default.removeItem(at: url)
-        let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
-
-        var settings: [String: Any] = [
-            AVVideoCodecKey: AVVideoCodecType(rawValue: videoSettings.codec.rawValue),
-            AVVideoWidthKey: videoSettings.width,
-            AVVideoHeightKey: videoSettings.height,
-        ]
-        if let bitrate = videoSettings.bitrate {
-            settings[AVVideoCompressionPropertiesKey] = [
-                AVVideoAverageBitRateKey: bitrate,
-            ]
-        }
-        let input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
-        input.expectsMediaDataInRealTime = true
-        writer.add(input)
-
-        let audioSettings: [String: Any] = [
-            AVFormatIDKey: kAudioFormatMPEG4AAC,
-            AVNumberOfChannelsKey: 1,
-            AVSampleRateKey: 44100,
-            AVEncoderBitRateKey: 64000,
-        ]
-        let audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
-        audioInput.expectsMediaDataInRealTime = true
-        let newAudioInput: AVAssetWriterInput? =
-            writer.canAdd(audioInput) ? { writer.add(audioInput); return audioInput }() : nil
-
-        // Transition the writer to .writing BEFORE publishing state to the
-        // sample-buffer delegate. Doing this on the writer's configuration
-        // thread is fine — startWriting is synchronous and status flips before
-        // it returns.
-        guard writer.startWriting() else {
-            let reason = writer.error?.localizedDescription ?? "unknown"
-            throw StreamError(
-                streamId: streamId,
-                underlying: NSError(
-                    domain: "SyncField.Camera", code: -2,
-                    userInfo: [NSLocalizedDescriptionKey:
-                        "AVAssetWriter.startWriting() failed: \(reason)"]))
-        }
+        let bundle = try makeWriterBundle(writerFactory: writerFactory)
 
         // Publish all recording state to the delegate in one go, ON videoQueue.
         // The delegate runs on this queue, so any callback dispatched here is
@@ -514,9 +481,11 @@ public final class iPhoneCameraStream: NSObject, SyncFieldStream, AudioReattacha
         videoQueue.sync {
             self.frameCount = 0
             self.startPTS = .zero
-            self.assetWriter = writer
-            self.assetWriterInput = input
-            self.assetWriterAudioInput = newAudioInput
+            self.assetWriter = bundle.writer
+            self.assetWriterInput = bundle.videoInput
+            self.assetWriterAudioInput = bundle.audioInput
+            self.stampWriter = bundle.stampWriter
+            self.stampPump = bundle.stampPump
             self.isRecording = true
             // Seed the watchdog so the first tick (at +stallThreshold) has
             // a non-zero baseline. Without this, t=0 would itself look
@@ -525,6 +494,74 @@ public final class iPhoneCameraStream: NSObject, SyncFieldStream, AudioReattacha
             self.audioRecoveryAttempted = false
             self.startAudioWatchdogOnVideoQueue()
         }
+        #endif
+    }
+
+    public func prepareSegmentRotation(writerFactory: WriterFactory) async throws {
+        #if canImport(AVFoundation)
+        let bundle = try makeWriterBundle(writerFactory: writerFactory)
+        var accepted = false
+        videoQueue.sync {
+            if self.isRecording && self.preparedWriterBundle == nil {
+                self.preparedWriterBundle = bundle
+                accepted = true
+            }
+        }
+        if !accepted {
+            await discardPreparedBundle(bundle)
+            throw StreamError(streamId: streamId, underlying: NSError(
+                domain: "SyncField.SegmentRotation", code: -2,
+                userInfo: [NSLocalizedDescriptionKey: "camera is not ready to prepare rotation"]))
+        }
+        #else
+        _ = writerFactory
+        #endif
+    }
+
+    public func commitSegmentRotation() async throws -> StreamStopReport {
+        #if canImport(AVFoundation)
+        var old: PreparedWriterBundle?
+        var oldCount = 0
+        var didCommit = false
+        videoQueue.sync {
+            guard self.isRecording, let next = self.preparedWriterBundle,
+                  let writer = self.assetWriter, let video = self.assetWriterInput,
+                  let stamps = self.stampWriter, let pump = self.stampPump else { return }
+            old = PreparedWriterBundle(
+                url: writer.outputURL, writer: writer, videoInput: video,
+                audioInput: self.assetWriterAudioInput, stampWriter: stamps,
+                stampPump: pump)
+            oldCount = self.frameCount
+            self.assetWriter = next.writer
+            self.assetWriterInput = next.videoInput
+            self.assetWriterAudioInput = next.audioInput
+            self.stampWriter = next.stampWriter
+            self.stampPump = next.stampPump
+            self.preparedWriterBundle = nil
+            self.frameCount = 0
+            self.startPTS = .zero
+            didCommit = true
+        }
+        guard didCommit, let old else {
+            throw StreamError(streamId: streamId, underlying: NSError(
+                domain: "SyncField.SegmentRotation", code: -3,
+                userInfo: [NSLocalizedDescriptionKey: "camera rotation was not prepared"]))
+        }
+        try await finishBundle(old)
+        return StreamStopReport(streamId: streamId, frameCount: oldCount, kind: "video")
+        #else
+        return StreamStopReport(streamId: streamId, frameCount: 0, kind: "video")
+        #endif
+    }
+
+    public func abortSegmentRotation() async {
+        #if canImport(AVFoundation)
+        var staged: PreparedWriterBundle?
+        videoQueue.sync {
+            staged = self.preparedWriterBundle
+            self.preparedWriterBundle = nil
+        }
+        if let staged { await discardPreparedBundle(staged) }
         #endif
     }
 
@@ -603,19 +640,26 @@ public final class iPhoneCameraStream: NSObject, SyncFieldStream, AudioReattacha
         // Flip isRecording off on videoQueue so any in-flight delegate call
         // either sees it true and completes cleanly, or sees it false and
         // returns — never a torn read between isRecording and the writer.
-        var capturedWriter: AVAssetWriter?
-        var capturedAudioInput: AVAssetWriterInput?
-        var capturedVideoInput: AVAssetWriterInput?
+        var capturedBundle: PreparedWriterBundle?
+        var stagedBundle: PreparedWriterBundle?
         var capturedCount = 0
         videoQueue.sync {
             self.isRecording = false
-            capturedWriter = self.assetWriter
-            capturedAudioInput = self.assetWriterAudioInput
-            capturedVideoInput = self.assetWriterInput
+            if let writer = self.assetWriter, let video = self.assetWriterInput,
+               let stamps = self.stampWriter, let pump = self.stampPump {
+                capturedBundle = PreparedWriterBundle(
+                    url: writer.outputURL, writer: writer, videoInput: video,
+                    audioInput: self.assetWriterAudioInput, stampWriter: stamps,
+                    stampPump: pump)
+            }
+            stagedBundle = self.preparedWriterBundle
             capturedCount = self.frameCount
             self.assetWriter = nil
             self.assetWriterInput = nil
             self.assetWriterAudioInput = nil
+            self.stampWriter = nil
+            self.stampPump = nil
+            self.preparedWriterBundle = nil
             self.audioWatchdog?.cancel()
             self.audioWatchdog = nil
         }
@@ -627,20 +671,83 @@ public final class iPhoneCameraStream: NSObject, SyncFieldStream, AudioReattacha
         // callbacks will fire" for its own teardown (the og-skill
         // bridge releases `handDetection` immediately after).
         processorGate.drain()
-        capturedAudioInput?.markAsFinished()
-        capturedVideoInput?.markAsFinished()
-        if let w = capturedWriter, w.status == .writing {
-            await withCheckedContinuation { cont in
-                w.finishWriting { cont.resume() }
-            }
-        }
-        try await stampWriter?.close()
-        stampWriter = nil
+        if let stagedBundle { await discardPreparedBundle(stagedBundle) }
+        if let capturedBundle { try await finishBundle(capturedBundle) }
         return StreamStopReport(streamId: streamId, frameCount: capturedCount, kind: "video")
         #else
         return StreamStopReport(streamId: streamId, frameCount: 0, kind: "video")
         #endif
     }
+
+    #if canImport(AVFoundation)
+    private func makeWriterBundle(writerFactory: WriterFactory) throws -> PreparedWriterBundle {
+        let stampWriter = try writerFactory.makeStreamWriter(streamId: streamId)
+        let url = writerFactory.videoURL(streamId: streamId)
+        try? FileManager.default.removeItem(at: url)
+        let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
+        // Fragmented MP4 bounds loss in the one currently-open segment after
+        // process/power failure; sealed segments still receive a normal final
+        // moov from finishWriting().
+        writer.movieFragmentInterval = CMTime(seconds: 10, preferredTimescale: 600)
+
+        var settings: [String: Any] = [
+            AVVideoCodecKey: AVVideoCodecType(rawValue: videoSettings.codec.rawValue),
+            AVVideoWidthKey: videoSettings.width,
+            AVVideoHeightKey: videoSettings.height,
+        ]
+        if let bitrate = videoSettings.bitrate {
+            settings[AVVideoCompressionPropertiesKey] = [AVVideoAverageBitRateKey: bitrate]
+        }
+        let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
+        videoInput.expectsMediaDataInRealTime = true
+        writer.add(videoInput)
+        let audioSettings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatMPEG4AAC,
+            AVNumberOfChannelsKey: 1,
+            AVSampleRateKey: 44100,
+            AVEncoderBitRateKey: 64000,
+        ]
+        let candidate = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
+        candidate.expectsMediaDataInRealTime = true
+        let audioInput: AVAssetWriterInput? = writer.canAdd(candidate)
+            ? { writer.add(candidate); return candidate }() : nil
+        guard writer.startWriting() else {
+            let reason = writer.error?.localizedDescription ?? "unknown"
+            throw StreamError(streamId: streamId, underlying: NSError(
+                domain: "SyncField.Camera", code: -2,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "AVAssetWriter.startWriting() failed: \(reason)"]))
+        }
+        return PreparedWriterBundle(url: url, writer: writer, videoInput: videoInput,
+                                    audioInput: audioInput, stampWriter: stampWriter,
+                                    stampPump: StreamWriterPump(
+                                        label: "SyncField.camera.timestamps.\(UUID().uuidString)"))
+    }
+
+    private func finishBundle(_ bundle: PreparedWriterBundle) async throws {
+        bundle.audioInput?.markAsFinished()
+        bundle.videoInput.markAsFinished()
+        if bundle.writer.status == .writing {
+            await withCheckedContinuation { cont in
+                bundle.writer.finishWriting { cont.resume() }
+            }
+        }
+        bundle.stampPump.flush()
+        try await bundle.stampWriter.close()
+        if bundle.writer.status == .failed {
+            throw bundle.writer.error ?? NSError(
+                domain: "SyncField.Camera", code: -4,
+                userInfo: [NSLocalizedDescriptionKey: "AVAssetWriter finish failed"])
+        }
+    }
+
+    private func discardPreparedBundle(_ bundle: PreparedWriterBundle) async {
+        bundle.writer.cancelWriting()
+        bundle.stampPump.flush()
+        try? await bundle.stampWriter.close()
+        try? FileManager.default.removeItem(at: bundle.url)
+    }
+    #endif
 
     public func ingest(into dir: URL,
                        progress: @Sendable (Double) -> Void) async throws -> StreamIngestReport {
@@ -756,9 +863,14 @@ extension iPhoneCameraStream: AVCaptureVideoDataOutputSampleBufferDelegate,
             guard isRecording,
                   let writer = assetWriter,
                   writer.status == .writing,
-                  startPTS != .zero,
-                  let audioInput = assetWriterAudioInput,
-                  audioInput.isReadyForMoreMediaData else { return }
+                  let audioInput = assetWriterAudioInput else { return }
+            if startPTS == .zero {
+                let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+                guard writer.status == .writing else { return }
+                startPTS = pts
+                writer.startSession(atSourceTime: pts)
+            }
+            guard audioInput.isReadyForMoreMediaData else { return }
             audioInput.append(sampleBuffer)
             return
         }
@@ -822,11 +934,10 @@ extension iPhoneCameraStream: AVCaptureVideoDataOutputSampleBufferDelegate,
             )
             let frame = frameCount
             frameCount += 1
-            let w = stampWriter
-            Task {
-                try? await w?.append(frame: frame,
-                                     monotonicNs: stamp.captureNs,
-                                     uncertaintyNs: 1_000_000)
+            if let w = stampWriter, let pump = stampPump {
+                pump.append(
+                    writer: w, frame: frame,
+                    monotonicNs: stamp.captureNs, uncertaintyNs: 1_000_000)
             }
         }
     }
